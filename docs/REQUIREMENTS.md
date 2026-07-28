@@ -10,7 +10,7 @@
 | [0001 技术选型固化](adr/0001-technology-selection.md) | §3（mDNS 选型）、§6.2（iroh 术语） |
 | [0002 Android 先行](adr/0002-android-first.md) | §8（G4 / G6 互换） |
 | [0003 OBJ-1 三级语义](adr/0003-agent-attach-semantics.md) | §1.1 OBJ-1、§4.5、§9（新增 R-9 / R-10） |
-| [0004 ACP 版本钉定](adr/0004-acp-version-pinning.md) | **提案中，尚未生效** |
+| [0004 ACP 版本钉定](adr/0004-acp-version-pinning.md) | §4.2（包名）、§4.5（新增 `Elicitation` 变体）、§9 R-2 |
 
 ---
 
@@ -151,8 +151,10 @@ Adapter 必须通过 `capabilities()` 显式声明自己支持哪些可选能力
 
 ### 4.2 Claude Code（Tier B）
 
-- 接入方式：hostd spawn `npx @zed-industries/claude-code-acp` 子进程，走 ACP JSON-RPC over stdio
-- Rust 侧使用官方 `agent-client-protocol` crate
+- 接入方式：hostd spawn `npx @agentclientprotocol/claude-agent-acp` 子进程，走 ACP JSON-RPC over stdio
+  （旧包 `@zed-industries/claude-code-acp` 已废弃改名，见 ADR-0004）
+- Rust 侧使用官方 `agent-client-protocol` crate，**钉定 1.x（ACP 协议 v1）**，不跟进 v2 Draft
+- 版本号必须钉死确切值，不用 `latest` / `^`；升级走 ADR
 - **不要**直接对接 `claude --output-format stream-json`：该协议未公开承诺稳定，Zed 的适配器帮你扛住上游变更
 - 依赖：宿主机需有 Node（Claude Code 本身即 npm 分发，通常已具备）；hostd 启动时探测并在缺失时给出明确指引
 
@@ -212,9 +214,16 @@ pub trait AgentAdapter: Send + Sync {
 }
 ```
 
-`SessionEvent` 至少必须覆盖：
+`SessionEvent` 至少必须覆盖以下 **12 个**变体：
 `MessageChunk` / `ThoughtChunk` / `ToolCallStart` / `ToolCallUpdate` / `ToolCallEnd` /
-`PermissionRequest` / `PlanUpdate` / `DiffProduced` / `TurnStart` / `TurnEnd` / `Error`
+`PermissionRequest` / `Elicitation` / `PlanUpdate` / `DiffProduced` / `TurnStart` / `TurnEnd` / `Error`
+
+> `Elicitation`（agent 要求结构化表单输入）由 ADR-0004 P-5 加入 v1。Codex 侧对应
+> `mcpServer/elicitation/request`，ACP 侧对应 `elicitation/create`。缺少它会导致
+> MCP server 走 OAuth 或要求填参数时手机端卡死。
+>
+> **判别字符串使用 UACP 自己的取值，不复用 ACP 的字符串**（ADR-0004 P-3），
+> adapter 层负责映射，使上游改名只影响单个 adapter crate。
 
 ---
 
@@ -315,7 +324,7 @@ pub trait AgentAdapter: Send + Sync {
 | ID | 风险 | 影响 | 缓解 |
 |---|---|---|---|
 | R-1 | iroh 在运营商级 NAT / 对称 NAT 下打洞失败率高 | 核心体验不可用 | G0 提前验证；保留 L2 relay 与 L3 隧道 |
-| R-2 | Claude Code 的 ACP 适配器落后于 CLI 更新 | Claude Code 功能缺失 | 锁定 adapter 版本；capabilities 优雅降级；预留直连 stream-json 的 plan B |
+| R-2 | **ACP 规范自身处于 v1→v2 过渡**（crate 已发 2.0.0 而协议 v2 仍为 Draft，`session/update` 判别字符串已改名），且 Claude Code 适配器迭代频繁 | UACP 事件语义漂移；adapter 编译失败；Claude Code 功能缺失 | ACP 与适配器双钉定（ADR-0004 P-1/P-2）；UACP 判别值与 ACP 解耦（P-3）；schema 快照 + CI 每日 diff（P-4）；capabilities 优雅降级；预留直连 stream-json 的 plan B |
 | R-3 | iOS/Android 后台被杀导致连接不可靠 | 推送不及时 | 推送为唯一唤醒真源；App 冷启后按 cursor 重放 |
 | R-4 | Codex / OpenCode 协议 breaking change | adapter 编译失败 | 类型从官方 schema 自动生成；CI 每日跑一次生成 + 编译检查 |
 | R-5 | UniFFI 类型表达能力受限（泛型、async 流） | 核心 API 被迫妥协 | 在 G1 阶段就用真实类型验证绑定生成，不要等到 G4 |
