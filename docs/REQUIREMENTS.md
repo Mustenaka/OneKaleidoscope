@@ -11,6 +11,7 @@
 | [0002 Android 先行](adr/0002-android-first.md) | §8（G4 / G6 互换） |
 | [0003 OBJ-1 三级语义](adr/0003-agent-attach-semantics.md) | §1.1 OBJ-1、§4.5、§9（新增 R-9 / R-10） |
 | [0004 ACP 版本钉定](adr/0004-acp-version-pinning.md) | §4.2（包名）、§4.5（新增 `Elicitation` 变体）、§9 R-2 |
+| [0005 schema 规范化层](adr/0005-schema-normalization-layer.md) | §4.3 / §4.4（生成器选型）、§9 R-4 |
 
 ---
 
@@ -170,7 +171,8 @@ Adapter 必须通过 `capabilities()` 显式声明自己支持哪些可选能力
 
 - 接入方式：`codex app-server`，双向 JSON-RPC 2.0
 - 传输：v1 用 stdio（本机）；预留 `--listen ws://` + bearer token 以支持 hostd 与 agent 不同机的场景
-- **类型不要手写**：用 `codex app-server generate-json-schema` 导出，再经 `typify` 生成 Rust 类型，纳入构建流程
+- **类型不要手写**：用 `codex app-server generate-json-schema` 导出，经规范化层后由生成器产出 Rust 类型，纳入构建流程。
+  生成器选型见 [ADR-0005](adr/0005-schema-normalization-layer.md) —— `typify` 已实测无法消化完整 schema（嵌套 `definitions`），最终工具由 T-005 以证据决定
 - 核心原语：Thread → Turn → Item
 
 **文档**
@@ -182,7 +184,9 @@ Adapter 必须通过 `capabilities()` 显式声明自己支持哪些可选能力
 ### 4.4 OpenCode（Tier A）
 
 - 接入方式：`opencode serve --port <p>`，REST + SSE
-- **客户端不要手写**：从 `http://localhost:4096/doc` 的 OpenAPI 3.1 spec 用 `progenitor` 生成 Rust 客户端
+- **客户端不要手写**：从 `http://localhost:4096/doc` 的 OpenAPI 3.1 spec 生成 Rust 客户端。
+  **`progenitor` 只支持 OpenAPI 3.0.x，无法直接消化 3.1 spec**（实测 `exclusiveMinimum` 数值/布尔冲突）。
+  最终工具由 T-005 以证据决定，见 [ADR-0005](adr/0005-schema-normalization-layer.md)
 - 自带 mDNS 局域网发现，可复用
 
 **文档**
@@ -326,7 +330,7 @@ pub trait AgentAdapter: Send + Sync {
 | R-1 | iroh 在运营商级 NAT / 对称 NAT 下打洞失败率高 | 核心体验不可用 | G0 提前验证；保留 L2 relay 与 L3 隧道 |
 | R-2 | **ACP 规范自身处于 v1→v2 过渡**（crate 已发 2.0.0 而协议 v2 仍为 Draft，`session/update` 判别字符串已改名），且 Claude Code 适配器迭代频繁 | UACP 事件语义漂移；adapter 编译失败；Claude Code 功能缺失 | ACP 与适配器双钉定（ADR-0004 P-1/P-2）；UACP 判别值与 ACP 解耦（P-3）；schema 快照 + CI 每日 diff（P-4）；capabilities 优雅降级；预留直连 stream-json 的 plan B |
 | R-3 | iOS/Android 后台被杀导致连接不可靠 | 推送不及时 | 推送为唯一唤醒真源；App 冷启后按 cursor 重放 |
-| R-4 | Codex / OpenCode 协议 breaking change | adapter 编译失败 | 类型从官方 schema 自动生成；CI 每日跑一次生成 + 编译检查 |
+| R-4 | **【已发生】**上游 schema 无法被指定生成器消化：progenitor 只支持 OpenAPI 3.0.x 而 OpenCode 输出 3.1.0；typify 无法解析 Codex schema 的嵌套 `definitions`。此外仍存在 Codex / OpenCode 协议 breaking change 的持续风险 | 自动生成链在写第一行 adapter 前即断裂；adapter 编译失败 | 引入受纪律约束的**规范化层**（[ADR-0005](adr/0005-schema-normalization-layer.md)）；生成器选型改为以证据决定（T-005）；`schemas/` 原样快照 + 每日语义 diff 监控漂移（T-003） |
 | R-5 | UniFFI 类型表达能力受限（泛型、async 流） | 核心 API 被迫妥协 | 在 G1 阶段就用真实类型验证绑定生成，不要等到 G4 |
 | R-6 | Windows 上 npx/Node 子进程管理坑多 | Claude Code adapter 不稳 | Windows 作为首要测试平台；显式处理 `.cmd` 与进程树终止 |
 | R-7 | 需求被 AI 实现方悄悄偏离 | 交付物不符预期 | 门禁 + 契约测试 + 主管审核；`kaleido-proto` 为不可擅改的合同 |

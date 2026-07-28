@@ -62,14 +62,42 @@ Agent 的输出必须来自其结构化协议（ACP / JSON-RPC / HTTP+SSE）。
 
 ### 3.2 类型生成 —— 不要手写
 
+**手写上游类型 = 引入静默漂移 = 打回。这条不变。**
+
 | 来源 | 工具 |
 |---|---|
-| Codex app-server | `codex app-server generate-json-schema` → `typify` |
-| OpenCode | `/doc` 的 OpenAPI 3.1 → `progenitor` |
-| ACP | 官方 `agent-client-protocol` crate |
+| Codex app-server | `codex app-server generate-json-schema` → 规范化层 → 生成器（**首选候选** `typify`，最终以 T-005 结论为准） |
+| OpenCode | `/doc` 的 OpenAPI 3.1 → 规范化层 → 生成器（**首选候选** `progenitor`，但它只支持 3.0.x，见下） |
+| ACP | 官方 `agent-client-protocol` crate，钉定 **1.3.0**（协议 v1） |
 | 移动端绑定 | `kaleido-core` → UniFFI → Swift / Kotlin |
 
-手写这些类型 = 引入静默漂移 = 打回。
+#### 规范化层（[ADR-0005](docs/adr/0005-schema-normalization-layer.md)）
+
+实测证明上游 schema 无法被生成器直接消化，因此允许在两者之间插入一个**规范化层**：
+
+```
+上游 schema（schemas/ 下的原样快照，只读）
+        ↓  规范化：确定性、可测试、逐条记录的机械变换
+规范化产物（构建产物，不提交）
+        ↓  生成器
+Rust 类型
+```
+
+**纪律（违反即打回）**
+
+1. `schemas/` 下的原样快照**永不修改** —— 它是漂移监控的基准
+2. 规范化产物不提交进仓库
+3. 每条变换规则必须**有名字、有单元测试、有 before/after 断言**，并登记进 `docs/UPSTREAM.md`
+4. 规则必须是**纯机械变换**（重命名 / 移位 / 等价改写）。**禁止删字段、放宽约束、猜测语义**
+5. 每次运行报告每条规则的**实际命中次数**；命中为 0 的规则要删掉
+6. **规则超过 10 条即视为该生成链不健康**，停下来报告主管重新评估工具，不许无限堆规则
+
+#### 只生成用得到的子集
+
+允许只对 UACP 实际需要的类型子集做生成，子集清单必须显式列出并说明理由。
+
+**但子集必须由 `PROTOCOL.md` 的需要推导，不许由「哪个能生成成功」倒推。**
+发现某类型生成不了就把它移出子集 = 用工具能力裁剪协议 = 打回。
 
 ### 3.3 Swift（iOS）
 

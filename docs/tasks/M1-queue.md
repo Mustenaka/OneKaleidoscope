@@ -2,7 +2,9 @@
 
 > 里程碑：**M1 地基与实测材料**（见 [MILESTONES.md](../MILESTONES.md)）
 > 用法：按顺序执行。**每一条等 Codex 交付完再发下一条**，因为后一张卡依赖前一张的产物。
-> 全部四条完成后整批交回主管审核。
+> 全部五条完成后整批交回主管审核。
+>
+> **队列已于 2026-07-28 修订**：T-003 阻塞后拆分，Prompt 3 重写、新增 Prompt 5。
 
 **共同前提**：Codex 每次动手前都必须重读 `AGENTS.md`。四条 prompt 里都写了，不要删。
 
@@ -90,38 +92,51 @@ aarch64-linux-android 交叉编译结果、新增依赖及理由、偏离说明�
 
 ---
 
-## Prompt 3 / 4 —— T-003 上游 schema 快照与漂移监控
+## Prompt 3 / 5 —— T-003（修订版 R1）schema 快照与漂移监控
+
+> **本条已按 T-003 阻塞报告重写。** 原卡的生成器部分已移出为 T-005（Prompt 5）。
+> 如果 Codex 之前已经收到过旧版 Prompt 3，请直接发这条新的。
 
 ```
 继续 OneKaleidoscope 项目，你仍是实现方（Implementer）。
 
+你上一轮就 T-003 提交的阻塞报告已被主管受理，诊断被独立核实为正确：
+progenitor 官方只支持 OpenAPI 3.0.x 而 OpenCode 输出 3.1.0；typify 无法解析
+Codex schema 的嵌套 definitions。你没改 schema、没手写类型、没动仓库，处置正确。
+
+主管据此签发了 docs/adr/0005-schema-normalization-layer.md：
+- 「类型不许手写」的铁律保留
+- 允许在 schema 与生成器之间插入受纪律约束的规范化层
+- typify / progenitor 从「必须使用」降级为「首选候选」
+- 生成链部分从 T-003 移出，独立为 T-005，顺延到 T-004 之后执行
+
 动手前必读：
-1. AGENTS.md —— 全文重读，尤其 §3.2（类型生成，不要手写）
-2. docs/tasks/T-003.md —— 本次任务卡
-3. docs/REQUIREMENTS.md §4（三家接入规格）、§9 R-4
-4. docs/adr/0004-acp-version-pinning.md —— ACP 钉 v1 / crate 1.x，不跟 v2 Draft
+1. docs/adr/0005-schema-normalization-layer.md —— 新签发，全文
+2. AGENTS.md §3.2 —— 已按 ADR-0005 修订，重新读一遍
+3. docs/tasks/T-003.md —— 已降范围，注意顶部的「修订 R1」说明
+4. docs/adr/0004-acp-version-pinning.md —— ACP 的确切钉定值已写进去了，直接用
 
-本次任务：执行 docs/tasks/T-003.md。
+本次任务：执行修订后的 docs/tasks/T-003.md。
 
-需要特别注意的：
+范围已经变小，现在只做三件事：抓快照、记版本、做语义 diff。
 
-1. 版本号一律钉死确切值，不许写 latest 或 ^。schemas/VERSIONS.md 必须记录
+1. 本卡不做任何类型生成。如果你发现自己在装 typify 或 progenitor，说明走错卡了。
+
+2. 版本号一律钉死确切值，不许写 latest 或 ^。schemas/VERSIONS.md 必须记录
    每份 schema 的确切版本号与逐字可复制的抓取命令 —— 别人照着敲要能复现出同一份文件。
 
-2. diff 必须是语义化的（解析 JSON 后比较），键顺序变化不算漂移。
+3. ACP 的来源已经核实过并写进任务卡（commit 48b2abf...、schema/v1/schema.json）。
+   取完请核对 commit hash 是否一致，不一致要报告。
+
+4. diff 必须是语义化的（解析 JSON 后比较），键顺序变化不算漂移。
    DoD 要求你人为改一个字段验证它会被检出并指出 JSON 路径，把输出粘出来。
 
-3. 生成器冒烟是这张卡最重要的部分。如果 typify 吃不下 Codex 的 schema，
-   或 progenitor 吃不下 OpenCode 的 spec，或生成物编译不过 ——
-   这是必须上报的重大发现，它意味着 AGENTS.md §3.2 在该家 agent 上不成立。
-   按 AGENTS.md §5 报告，不要自己改成手写类型绕过去。
-
-4. 生成的代码不要提交进仓库。
+5. schemas/ 下的快照从此是只读基准，后续任何任务都不许改它 —— 它是判断
+   「上游改了什么」vs「我们改了什么」的唯一凭证。
 
 人类前置条件：本机需已安装并可运行 codex 与 opencode。缺失请立即报告阻塞，不要跳过该家。
 
-交付时按 AGENTS.md §4.2 附带全部要求项，并额外报告三家的确切版本号
-与对 R-4 缓解可行性的结论。
+交付时按 AGENTS.md §4.2 附带全部要求项。
 
 边界：任务卡「边界」一节列出的文件一律不许碰。本任务不创建 crates/ 下的任何东西。
 
@@ -130,10 +145,10 @@ aarch64-linux-android 交叉编译结果、新增依赖及理由、偏离说明�
 
 ---
 
-## Prompt 4 / 4 —— T-004 三家 agent 真实事件录制
+## Prompt 4 / 5 —— T-004 三家 agent 真实事件录制
 
 ```
-继续 OneKaleidoscope 项目，你仍是实现方（Implementer）。这是 M1 的最后一张卡。
+继续 OneKaleidoscope 项目，你仍是实现方（Implementer）。
 
 动手前必读：
 1. AGENTS.md —— 全文重读，尤其 §2.3（契约测试必须用真实录制的 fixture，不许手工编造）
@@ -178,13 +193,68 @@ aarch64-linux-android 交叉编译结果、新增依赖及理由、偏离说明�
 
 ---
 
-## 四条跑完之后
+## Prompt 5 / 5 —— T-005 生成链落地（规范化层与生成器选型）
 
-请把四次交付的完整输出一起给我，我按 `CLAUDE.md §3` 的 Checklist 逐条审核，重点：
+```
+继续 OneKaleidoscope 项目，你仍是实现方（Implementer）。这是 M1 的最后一张卡。
+
+这张卡直接来自你在 T-003 提交的阻塞报告。主管受理了，并签发了 ADR-0005。
+现在回来把这件事做完 —— 但规则变了，先读清楚再动手。
+
+动手前必读：
+1. docs/adr/0005-schema-normalization-layer.md —— 全文。本卡的全部纪律都在里面
+2. AGENTS.md §3.2 —— 已按 ADR-0005 修订
+3. docs/tasks/T-005.md —— 本次任务卡，按其「执行顺序」逐步做，不要跳步
+4. tests/fixtures/README.md —— T-004 的覆盖度表，第 4 步要用
+
+本次任务：执行 docs/tasks/T-005.md。
+
+五件事需要你特别注意：
+
+1. 第 0 步先补证据，不要跳过。
+   你上次说「单独生成官方 ServerRequest.json 同样触发 typify 的未实现分支」，
+   但没给出那个分支的具体错误。先补上完整 panic 消息、RUST_BACKTRACE=1 的关键帧、
+   以及触发它的 schema 片段。这条决定后续走向：如果 typify 只是不认嵌套 definitions，
+   规范化层能解决；如果它对 ServerRequest 这类结构本身就不支持，规则写再多也没用。
+
+2. OpenCode 两条路线都要评估，不许只试一条。
+   路线 A 是 3.1→3.0 降级 + progenitor；路线 B 是换用原生支持 3.1 的生成器
+   （已知候选 openapi-to-rust，注意它 pre-1.0、star 数低、官方声明生成 API 可能变）。
+   两条都跑到能下结论为止，证据填进 docs/gates/T-005-evidence.md。
+   另外请明确回答：progenitor 不处理 SSE，而 /event SSE 流是 OpenCode 的主数据通路，
+   走路线 A 的话 SSE 侧的类型从哪来？
+
+3. 规范化规则的纪律是硬的：纯机械变换，禁止删字段、放宽约束、猜测语义。
+   每条规则要有名字、单元测试、before/after 断言。规则数超过 10 条就停下来报告，
+   那说明这条生成链不健康，该换工具而不是继续堆规则。
+
+4. 第 4 步的 fixture 往返验证是本卡最有价值的部分。
+   用生成的类型反序列化 T-004 的真实报文再序列化回去，跟原始 payload 做语义比较。
+   能编译不代表能用 —— 字段可选性错了、枚举变体缺了，只有真实报文能暴露。
+   失败条目逐条列出。不许改成 serde_json::Value 蒙混过关。
+
+5. 结论是「做不到」也是合格交付，只要证据充分。
+   主管会据此另开 ADR 决定换工具、缩子集、还是接受人工维护+漂移告警的妥协。
+   不合格的是：为了打勾而放宽类型、删定义、把生成不了的东西悄悄移出子集。
+
+交付时按 AGENTS.md §4.2 附带全部要求项。
+
+边界：任务卡「边界」一节列出的文件一律不许碰。
+特别注意 schemas/** 与 tests/fixtures/** 都是只读，一个字节都不许改。
+
+现在开始。
+```
+
+---
+
+## 五条跑完之后
+
+请把五次交付的完整输出一起给我，我按 `CLAUDE.md §3` 的 Checklist 逐条审核，重点：
 
 1. **测试真实性** —— 我会挑几处让 Codex 演示「把实现改坏，测试变红」
 2. **fixture 是否真实** —— 对照 `schemas/` 校验，检查有没有手工编造的痕迹
-3. **是否越界建了 `crates/`** —— 产品 crate 的划分是 M2 的事
-4. **fixture 里有没有敏感信息泄漏**
+3. **规范化规则是否越界** —— 逐条查有没有删字段、放宽约束、猜语义的变换
+4. **是否越界建了 `crates/`** —— 产品 crate 的划分是 M2 的事
+5. **fixture 里有没有敏感信息泄漏**
 
 同时请把 G0 的 20 轮实测结果给我（T-001 交付后就可以开始跑，不必等 T-004）。

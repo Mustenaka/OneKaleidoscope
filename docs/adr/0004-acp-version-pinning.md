@@ -48,6 +48,19 @@ Codex 与 ACP 双方都有**结构化表单输入**能力：
 
 ### P-2 ACP 版本钉定在 v1，Rust crate 钉在 1.x
 
+**确切钉定值（T-003 核实，2026-07-28）**
+
+| 项 | 值 |
+|---|---|
+| Rust crate | `agent-client-protocol` **1.3.0** |
+| wire protocol | **v1** |
+| schema artifact | `agent-client-protocol-json-schema-v1` **1.18.0** |
+| 对应 commit | `48b2abf1ac750fece26e03e92e773ccbd4754f5d`（tag `v1.3.0` 与 `schema-v1.18.0` 同一提交） |
+| schema 路径 | `schema/v1/schema.json`、`schema/v1/meta.json` |
+
+`agent-client-protocol` 2.0.0 已发布但对应 v2 Draft，**不采用**。
+
+
 **理由**：v2 仍是 Draft；`claude-agent-acp` 当前依赖的是 `@agentclientprotocol/sdk` 0.x 线。在上游未稳定前跟进 v2 会让我们同时承担规范变更与适配器变更两份风险。
 
 **待 v2 转 stable 后另开 ADR 评估迁移。**
