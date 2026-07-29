@@ -2,9 +2,23 @@
 
 > 里程碑：**M1 地基与实测材料**（见 [MILESTONES.md](../MILESTONES.md)）
 > 用法：按顺序执行。**每一条等 Codex 交付完再发下一条**，因为后一张卡依赖前一张的产物。
-> 全部五条完成后整批交回主管审核。
->
-> **队列已于 2026-07-28 修订**：T-003 阻塞后拆分，Prompt 3 重写、新增 Prompt 5。
+> 全部完成后整批交回主管审核。
+
+## 当前执行顺序（2026-07-28 二次修订）
+
+T-003 阻塞 → 拆出 T-005；T-004 阻塞（Windows 可执行文件解析）→ 顺序调整为：
+
+| # | 卡 | 状态 |
+|---|---|---|
+| 1 | T-001 iroh spike | ✅ 已交付（待审） |
+| 2 | T-002 工程守卫 | ✅ 已交付（待审） |
+| 3 | T-003 schema 快照（修订 R1） | ✅ 已交付（待审） |
+| 4 | **T-005 阶段一**（生成链评估，第 0~3 步） | ⏩ **下一条发这个** |
+| 5 | **T-004（修订 R1）** 真实录制 | 待 Windows 解析问题修正 |
+| 6 | **T-005 阶段二**（fixture 往返验证，第 4 步） | 待 T-004 |
+
+理由：T-005 前三步只需 `schemas/`（已就绪），不需要三家 agent 跑起来。
+先做它可以在 T-004 环境问题解决期间拿到生成链的选型证据，队列不停摆。
 
 **共同前提**：Codex 每次动手前都必须重读 `AGENTS.md`。四条 prompt 里都写了，不要删。
 
@@ -145,7 +159,63 @@ Codex schema 的嵌套 definitions。你没改 schema、没手写类型、没动
 
 ---
 
-## Prompt 4 / 5 —— T-004 三家 agent 真实事件录制
+## Prompt 4（修订 R1）—— T-004 三家 agent 真实事件录制
+
+> **本条已重写。** 首次执行时报告环境阻塞，但经核对与 T-003 自己的交付物矛盾 ——
+> 根因是 Windows 上的可执行文件解析（R-6），不是环境缺失。
+> **在 Prompt 5-阶段一 交付之后再发这条。**
+
+```
+继续 OneKaleidoscope 项目，你仍是实现方（Implementer）。
+
+关于你上一轮就 T-004 提交的环境阻塞：主管核对后判定根因不是环境缺失。
+
+你在 T-003 交付的 schemas/VERSIONS.md 里，自己记录了在同一环境下成功执行过：
+    codex.cmd app-server generate-json-schema --out schemas/codex
+    opencode.cmd serve --pure --hostname 127.0.0.1 --port 4096 --log-level ERROR
+
+也就是说 codex 与 opencode 装好了、能跑，只是不能用裸名字启动。
+
+根因是 Windows 上 npm 全局安装会生成三个文件：codex（无扩展名的 POSIX sh 脚本）、
+codex.cmd、codex.ps1。直接 exec 那个无扩展名的 sh 脚本，Windows 返回的就是
+"Access is denied"。「不可发现」是同一现象的另一面。
+
+这正是 REQUIREMENTS §9 的 R-6 与 AGENTS.md §3.5 点名的陷阱。
+
+动手前必读：
+1. docs/tasks/T-004.md —— 注意新增的「Windows 上的可执行文件解析」一节
+2. AGENTS.md §3.5（跨平台纪律）、§2.3（fixture 必须真实）
+3. docs/REQUIREMENTS.md §4.5（12 个事件变体）、§6.3（安全红线）、§9 R-6
+
+本次任务：执行修订后的 docs/tasks/T-004.md。
+
+先做这四件事，再判断环境：
+
+1. 写一个平台感知的可执行文件解析：Windows 上按 PATHEXT 顺序查找
+   （.cmd / .exe / .bat），命中 .cmd 时按 Windows 方式启动；非 Windows 用裸名字。
+   逻辑收敛在 spikes/kaleido-recorder/src/platform/ 下，配单元测试。
+   这段代码不是一次性的 —— hostd 将来 spawn 三家 agent 用的就是同一套逻辑。
+
+2. 用修好的解析重新探测三家。如果再报找不到，报告里必须包含：
+   查了哪些候选名、每个候选的解析结果、以及 where.exe <name> 的原始输出。
+   只说「不可发现」信息量不够。
+
+3. claude 有可能是真的没装。若确认只有它缺失，不要整卡阻塞 ——
+   先把 codex 与 opencode 两家的 fixture 录完，claude 那一列在覆盖度表里
+   如实标注「未安装」。部分交付比零交付有价值。
+
+4. 其余要求不变：不许编造报文、payload 原样保留、必须在
+   tests/fixtures/sandbox/ 里录、schema 校验失败要原样上报。
+
+交付时按 AGENTS.md §4.2 附带全部要求项。
+
+边界：任务卡「边界」一节列出的文件一律不许碰。schemas/** 只读。
+
+现在开始。
+```
+
+<details>
+<summary>Prompt 4 原始版本（已被上面替代，仅存档）</summary>
 
 ```
 继续 OneKaleidoscope 项目，你仍是实现方（Implementer）。
@@ -191,9 +261,104 @@ Codex schema 的嵌套 definitions。你没改 schema、没手写类型、没动
 现在开始。
 ```
 
+</details>
+
 ---
 
-## Prompt 5 / 5 —— T-005 生成链落地（规范化层与生成器选型）
+## Prompt 5 · 阶段一 —— T-005 生成链评估（第 0~3 步）⏩ 现在发这条
+
+```
+继续 OneKaleidoscope 项目，你仍是实现方（Implementer）。
+
+T-004 因 Windows 可执行文件解析问题暂缓，主管调整了执行顺序：先做 T-005 的前三步。
+这三步只需要 T-003 已交付的 schemas/，不需要三家 agent 跑起来，所以现在就能做。
+
+这张卡直接来自你在 T-003 提交的阻塞报告。主管受理了，并签发了 ADR-0005。
+
+动手前必读：
+1. docs/adr/0005-schema-normalization-layer.md —— 全文。本卡的全部纪律都在里面
+2. AGENTS.md §3.2 —— 已按 ADR-0005 修订
+3. docs/tasks/T-005.md —— 注意顶部「修订 R1」的阶段划分
+
+本次任务：执行 docs/tasks/T-005.md 的第 0 步到第 3 步。
+第 4 步（fixture 往返验证）属于阶段二，等 T-004 交付后再回来做 ——
+相关 DoD 条目标注「待阶段二」即可，不算未完成。
+
+但请注意：阶段一不得下最终结论。工具选型的最终拍板必须等第 4 步的证据。
+证据表里该列先留空，不要用「能编译」代替「能用」。
+
+五件事需要特别注意：
+
+1. 第 0 步先补证据，不要跳过。
+   你上次说「单独生成官方 ServerRequest.json 同样触发 typify 的未实现分支」，
+   但没给出那个分支的具体错误。先补上完整 panic 消息、RUST_BACKTRACE=1 的关键帧、
+   以及触发它的 schema 片段。这条决定后续走向：如果 typify 只是不认嵌套 definitions，
+   规范化层能解决；如果它对 ServerRequest 这类结构本身就不支持，规则写再多也没用。
+
+2. OpenCode 两条路线都要评估，不许只试一条。
+   路线 A 是 3.1→3.0 降级 + progenitor；路线 B 是换用原生支持 3.1 的生成器
+   （已知候选 openapi-to-rust，注意它 pre-1.0、star 数低、官方声明生成 API 可能变）。
+   两条都跑到能下结论为止，证据填进 docs/gates/T-005-evidence.md。
+   另外请明确回答：progenitor 不处理 SSE，而 /event SSE 流是 OpenCode 的主数据通路，
+   走路线 A 的话 SSE 侧的类型从哪来？
+
+3. 规范化规则的纪律是硬的：纯机械变换，禁止删字段、放宽约束、猜测语义。
+   每条规则要有名字、单元测试、before/after 断言。规则数超过 10 条就停下来报告，
+   那说明这条生成链不健康，该换工具而不是继续堆规则。
+
+4. schemas/ 是只读基准，一个字节都不许改。规范化产物写进 target/ 或已 gitignore
+   的目录，不提交。
+
+5. 结论是「做不到」也是合格交付，只要证据充分。
+   不合格的是：为了打勾而放宽类型、删定义、把生成不了的东西悄悄移出子集。
+
+交付时按 AGENTS.md §4.2 附带全部要求项。
+
+边界：任务卡「边界」一节列出的文件一律不许碰。
+
+现在开始。
+```
+
+---
+
+## Prompt 5 · 阶段二 —— T-005 fixture 往返验证（第 4 步）
+
+> **T-004 交付之后再发。**
+
+```
+继续 OneKaleidoscope 项目，你仍是实现方（Implementer）。这是 M1 的最后一步。
+
+T-004 已交付，tests/fixtures/ 下现在有真实录制的报文。回来把 T-005 的第 4 步做完。
+
+动手前必读：
+1. docs/tasks/T-005.md 第 4 步与 DoD
+2. tests/fixtures/README.md —— T-004 的覆盖度表
+3. docs/gates/T-005-evidence.md —— 你在阶段一填的证据表
+
+本次任务：执行 T-005 第 4 步，并据此给出最终选型结论。
+
+这一步是本卡最有价值的部分：
+用生成的类型反序列化 T-004 的真实报文，再序列化回去，与原始 payload 做语义比较
+（键顺序无关）。能编译不代表能用 —— 字段可选性错了、枚举变体缺了、untagged 用错了，
+只有真实报文能暴露。
+
+要求：
+1. 失败条目逐条列出：哪个文件哪一行、哪个类型、差异在哪
+2. 不要求 100% 通过，要求诚实。不许改成 serde_json::Value 蒙混过关，
+   那等于放弃类型安全
+3. 把往返通过率填进证据表，然后给出最终建议 —— 直说你倾向哪条路线以及为什么
+4. 若结论是某家无法自动生成，说明你建议的替代方案与其漂移检测手段
+
+交付时按 AGENTS.md §4.2 附带全部要求项，并声明规范化规则中没有删字段、
+放宽约束、猜测语义的变换。
+
+边界：schemas/** 与 tests/fixtures/** 都是只读。
+
+现在开始。
+```
+
+<details>
+<summary>Prompt 5 合并版原文（已被上面两阶段替代，仅存档）</summary>
 
 ```
 继续 OneKaleidoscope 项目，你仍是实现方（Implementer）。这是 M1 的最后一张卡。
@@ -245,9 +410,11 @@ Codex schema 的嵌套 definitions。你没改 schema、没手写类型、没动
 现在开始。
 ```
 
+</details>
+
 ---
 
-## 五条跑完之后
+## 全部跑完之后
 
 请把五次交付的完整输出一起给我，我按 `CLAUDE.md §3` 的 Checklist 逐条审核，重点：
 

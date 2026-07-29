@@ -1,0 +1,44 @@
+name: Schema drift
+
+'on':
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  schema-drift:
+    name: semantic schema diff
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+          rustflags: ""
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22.13.1
+          package-manager-cache: false
+
+      - name: Install pinned upstream CLIs
+        run: npm install --global @openai/codex@0.144.6 opencode-ai@1.18.8
+
+      - name: Verify upstream CLI versions
+        shell: bash
+        run: |
+          test "$(codex --version)" = "codex-cli 0.144.6"
+          test "$(opencode --version)" = "1.18.8"
+
+      - name: Check semantic schema drift
+        run: cargo xtask schema diff

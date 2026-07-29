@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus};
 
 use forbidden::scan_repository;
+use xtask::schema::{self, SchemaCommand};
 
 #[derive(Debug)]
 enum Task {
@@ -16,6 +17,7 @@ enum Task {
     Clippy,
     Test,
     LintForbidden,
+    Schema(SchemaCommand),
 }
 
 #[derive(Debug)]
@@ -28,6 +30,7 @@ enum XtaskError {
         status: ExitStatus,
     },
     ForbiddenFound(usize),
+    Schema(schema::SchemaError),
 }
 
 impl fmt::Display for XtaskError {
@@ -35,7 +38,7 @@ impl fmt::Display for XtaskError {
         match self {
             Self::Usage => write!(
                 formatter,
-                "usage: cargo xtask <ci|fmt|clippy|test|lint-forbidden>"
+                "usage: cargo xtask <ci|fmt|clippy|test|lint-forbidden|schema <refresh|diff>>"
             ),
             Self::WorkspaceRoot => write!(formatter, "could not resolve the workspace root"),
             Self::Io(error) => write!(formatter, "I/O failure: {error}"),
@@ -45,6 +48,7 @@ impl fmt::Display for XtaskError {
             Self::ForbiddenFound(count) => {
                 write!(formatter, "lint-forbidden found {count} violation(s)")
             }
+            Self::Schema(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -53,6 +57,7 @@ impl std::error::Error for XtaskError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
+            Self::Schema(error) => Some(error),
             _ => None,
         }
     }
@@ -64,12 +69,27 @@ impl From<io::Error> for XtaskError {
     }
 }
 
+impl From<schema::SchemaError> for XtaskError {
+    fn from(error: schema::SchemaError) -> Self {
+        Self::Schema(error)
+    }
+}
+
+impl XtaskError {
+    const fn exit_code(&self) -> u8 {
+        match self {
+            Self::Schema(error) => error.exit_code(),
+            _ => 1,
+        }
+    }
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("xtask: {error}");
-            ExitCode::FAILURE
+            ExitCode::from(error.exit_code())
         }
     }
 }
@@ -80,13 +100,20 @@ fn run() -> Result<(), XtaskError> {
 
     match task {
         Task::Ci => {
-            run_cargo_step(&root, "fmt-check", &["fmt", "--all", "--", "--check"])?;
-            run_cargo_step(
+            let target = root.join("target").join("xtask-ci");
+            run_cargo_step_in_target(
                 &root,
+                &target,
+                "fmt-check",
+                &["fmt", "--all", "--", "--check"],
+            )?;
+            run_cargo_step_in_target(
+                &root,
+                &target,
                 "clippy",
                 &["clippy", "--all-targets", "--", "-D", "warnings"],
             )?;
-            run_cargo_step(&root, "test", &["test", "--workspace"])?;
+            run_cargo_step_in_target(&root, &target, "test", &["test", "--workspace"])?;
             run_forbidden_step(&root)
         }
         Task::Fmt => run_cargo_step(&root, "fmt-check", &["fmt", "--all", "--", "--check"]),
@@ -97,6 +124,7 @@ fn run() -> Result<(), XtaskError> {
         ),
         Task::Test => run_cargo_step(&root, "test", &["test", "--workspace"]),
         Task::LintForbidden => run_forbidden_step(&root),
+        Task::Schema(command) => schema::run(command, &root).map_err(Into::into),
     }
 }
 
@@ -105,17 +133,36 @@ fn parse_task() -> Result<Task, XtaskError> {
     let Some(command) = arguments.next() else {
         return Err(XtaskError::Usage);
     };
-    if arguments.next().is_some() {
-        return Err(XtaskError::Usage);
-    }
 
     match command.to_str() {
-        Some("ci") => Ok(Task::Ci),
-        Some("fmt") => Ok(Task::Fmt),
-        Some("clippy") => Ok(Task::Clippy),
-        Some("test") => Ok(Task::Test),
-        Some("lint-forbidden") => Ok(Task::LintForbidden),
+        Some("ci") => parse_without_extra_arguments(Task::Ci, arguments),
+        Some("fmt") => parse_without_extra_arguments(Task::Fmt, arguments),
+        Some("clippy") => parse_without_extra_arguments(Task::Clippy, arguments),
+        Some("test") => parse_without_extra_arguments(Task::Test, arguments),
+        Some("lint-forbidden") => parse_without_extra_arguments(Task::LintForbidden, arguments),
+        Some("schema") => {
+            let Some(subcommand) = arguments.next() else {
+                return Err(XtaskError::Usage);
+            };
+            let schema_command = match subcommand.to_str() {
+                Some("refresh") => SchemaCommand::Refresh,
+                Some("diff") => SchemaCommand::Diff,
+                _ => return Err(XtaskError::Usage),
+            };
+            parse_without_extra_arguments(Task::Schema(schema_command), arguments)
+        }
         _ => Err(XtaskError::Usage),
+    }
+}
+
+fn parse_without_extra_arguments(
+    task: Task,
+    mut arguments: impl Iterator<Item = OsString>,
+) -> Result<Task, XtaskError> {
+    if arguments.next().is_some() {
+        Err(XtaskError::Usage)
+    } else {
+        Ok(task)
     }
 }
 
@@ -127,12 +174,32 @@ fn workspace_root() -> Result<PathBuf, XtaskError> {
 }
 
 fn run_cargo_step(root: &Path, step: &'static str, arguments: &[&str]) -> Result<(), XtaskError> {
+    run_cargo_step_with_target(root, None, step, arguments)
+}
+
+fn run_cargo_step_in_target(
+    root: &Path,
+    target: &Path,
+    step: &'static str,
+    arguments: &[&str],
+) -> Result<(), XtaskError> {
+    run_cargo_step_with_target(root, Some(target), step, arguments)
+}
+
+fn run_cargo_step_with_target(
+    root: &Path,
+    target: Option<&Path>,
+    step: &'static str,
+    arguments: &[&str],
+) -> Result<(), XtaskError> {
     announce(step)?;
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
-    let status = Command::new(cargo)
-        .args(arguments)
-        .current_dir(root)
-        .status()?;
+    let mut command = Command::new(cargo);
+    command.args(arguments).current_dir(root);
+    if let Some(target) = target {
+        command.env("CARGO_TARGET_DIR", target);
+    }
+    let status = command.status()?;
     if !status.success() {
         return Err(XtaskError::StepFailed { step, status });
     }
