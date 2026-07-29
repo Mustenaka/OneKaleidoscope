@@ -187,18 +187,24 @@ codex.cmd、codex.ps1。直接 exec 那个无扩展名的 sh 脚本，Windows �
 "Access is denied"。「不可发现」是同一现象的另一面。
 这正是 REQUIREMENTS §9 的 R-6 与 AGENTS.md §3.5 点名的陷阱。
 
-【根因二：Claude Code 根本不需要 CLI】
+【根因二：环境继承，不是安装缺失】
 
-负责人的实际安装形态是：Claude Code 只装了 GUI、Codex 装了 CLI+GUI、OpenCode 只装了 CLI。
-并明确要求同时支持 GUI 与 CLI 形态的协议识别。
+三家 CLI 在负责人机器上全都装了，而且在他自己的 PowerShell 里都能跑
+（他已实测 claude 可正常启动）。你找不到它们，是因为环境继承。
 
-核实结果：@anthropic-ai/claude-agent-sdk 通过 npm optionalDependencies
-自带各平台的 Claude Code 原生二进制。官方文档原文：
-"The SDK bundles a native Claude Code binary for your platform as an optional
-dependency… You don't need to install Claude Code separately."
+线索：他的提示符是 "(base) PS C:\Users\Mumte>"，交互式 shell 加载了 conda 的 profile。
+shell profile 注入的 PATH 只存在于交互式会话中，被 spawn 出来的非交互进程拿不到。
 
-所以 Claude Code 的录制方式是：用钉定版本的 @agentclientprotocol/claude-agent-acp
-经 npm/npx 起 ACP 进程。不要去找用户的 claude 命令，它不存在也不需要存在。
+这不是调试细节，是 hostd 的架构约束：hostd 将以托盘程序 / LaunchAgent /
+systemd user unit 启动，环境比你现在还贫瘠，同样不执行用户的 shell profile。
+你在本卡写的发现逻辑，就是 hostd 将来要用的那套。已记为风险 R-12。
+
+另外核实到：Claude Code 的接入本来就不依赖用户的 CLI。
+@anthropic-ai/claude-agent-sdk 通过 npm optionalDependencies 自带各平台的
+Claude Code 原生二进制，官方文档原文："The SDK bundles a native Claude Code binary
+for your platform as an optional dependency… You don't need to install Claude Code
+separately." 所以走 @agentclientprotocol/claude-agent-acp 起 ACP 进程是首选路径，
+它不依赖用户环境；用户的 claude CLI 只作逃生舱与录制 08-session-load 的辅助。
 
 主管据此签发了 docs/adr/0006-agent-discovery.md。
 
@@ -217,11 +223,18 @@ dependency… You don't need to install Claude Code separately."
    逻辑收敛在 spikes/kaleido-recorder/src/platform/ 下，配单元测试。
    这段代码不是一次性的 —— hostd 将来 spawn 三家 agent 用的就是同一套逻辑。
 
-2. 禁止「PATH 上没有 CLI ⇒ 该 agent 不可用」的推断。探测报告必须区分四种情况：
-   没装 / 装了但解析方式不对 / 装了 GUI 没装 CLI（多数情况下仍可用）/ 装了但未登录。
+2. 发现必须多源，按此优先级实现并逐层报告：
+   ① 显式配置（环境变量或 CLI 参数给绝对路径）
+   ② 继承的 PATH（平台感知解析）
+   ③ 平台持久化环境变量（Windows 用户/系统 PATH，不是 profile 注入的那部分）
+   ④ 已知安装位置（npm 全局 prefix、GUI 应用安装目录）
+   ⑤ hostd 自备（仅 Claude Code）
+   探测报告必须逐层列出「在这 5 处分别看到了什么」，并附上进程自身 PATH 的值。
+   禁止「PATH 上没有 CLI ⇒ 该 agent 不可用」的推断 ——
+   用户在终端里明明能跑却被告知未安装，是最糟糕的用户体验。
 
-3. 必须回答一个问题（对应新增风险 R-11）：负责人的 Claude Code 是 GUI 登录的，
-   GUI 写入 ~/.claude 的登录态能否被 npm 自备的二进制直接复用？
+3. 必须回答一个问题（对应新增风险 R-11）：~/.claude 下已有的登录态，
+   能否被 npm 自备的那个二进制直接复用？
    能复用就说明验证方式；不能就说明用户还需要做什么。如实报告，这影响开箱体验。
 
 4. 其余要求不变：不许编造报文、payload 原样保留、必须在 tests/fixtures/sandbox/ 里录、

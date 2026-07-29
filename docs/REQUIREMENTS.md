@@ -340,7 +340,8 @@ pub trait AgentAdapter: Send + Sync {
 | R-8 | 三家的权限模型不同构：ACP 是「agent 提供动态选项数组 + 客户端回 optionId」，Codex 是两个分开的服务端请求 + 固定字符串枚举 | 无法无损归一化，UACP 设计一旦选错方向需推倒重来 | UACP 采用「选项列表 + 选项 id」形状（表达力更强的一侧），由 Codex adapter 合成固定选项集；G1 定稿前必须用三家真实录制 fixture 验证一遍 |
 | R-9 | hostd 与用户的 CLI/GUI 并发读写同一份会话存储（`~/.claude/projects`、Codex thread 目录） | 会话损坏或事件错乱 | v1 内加载即独占，UI 明示「已被手机接管」；G2 必须实测并把实际行为记入 `docs/gates/G2-result.md`，不许假设安全（ADR-0003） |
 | R-10 | `loadSession` / `sessionCapabilities` 是能力位而非保证，适配器升级可能撤销 | 会话列表功能突然消失 | 握手时检查能力位，为 false 时降级为「只能新建」并在 UI 明示原因；禁止崩溃或静默隐藏（ADR-0003） |
-| R-11 | 仅装 GUI 的机器上，GUI 写入的登录态能否被 npm 自备的 Claude Code 二进制复用，尚未实测 | 若不能复用，Claude Code 路径需要用户额外登录一次，影响 OBJ-1 的开箱体验 | T-004 必须实测并给出结论；不能复用时在 UI 明示并给出可操作指引（ADR-0006） |
+| R-11 | GUI 写入的登录态能否被 npm 自备的 Claude Code 二进制复用，尚未实测 | 若不能复用，Claude Code 路径需要用户额外登录一次，影响 OBJ-1 的开箱体验 | T-004 必须实测并给出结论；不能复用时在 UI 明示并给出可操作指引（ADR-0006） |
+| R-12 | **【已发生】**hostd 以托盘 / LaunchAgent / systemd user unit 启动时**不执行用户的 shell profile**，拿不到 conda / nvm / profile 注入的 PATH。用户在终端里跑得好好的 agent，hostd 找不到 | 三家 agent 全部「未安装」，OBJ-1 直接失效 | 多源发现：显式配置 → 继承 PATH → 平台持久化环境变量 → 已知安装位置 → hostd 自备；失败时报告「在 5 处分别看到什么」而非「未安装」（[ADR-0006](adr/0006-agent-discovery.md) D-8） |
 
 ---
 

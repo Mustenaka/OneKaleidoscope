@@ -14,9 +14,15 @@
 
 | Agent | CLI | GUI |
 |---|---|---|
-| Claude Code | ❌ | ✅ |
+| Claude Code | ✅（**修订：初报为无，后经负责人实测确认存在**） | ✅ |
 | Codex | ✅ | ✅ |
 | OpenCode | ✅ | ❌ |
+
+> **修订记录（同日）**：负责人最初表述为「Claude Code 只装了 GUI」，随后在自己的 PowerShell 里
+> 实测 `claude` 可正常启动。三家 CLI 实际上**都在**。
+>
+> 这反而让本 ADR 更重要 —— 因为 Codex 的执行环境里确实找不到它们。
+> 说明问题出在**环境继承**，而不是安装，见 D-8。
 
 并明确要求：**「你应该同时支持 GUI 和 CLI 版本的协议识别」**。
 
@@ -56,7 +62,7 @@ T-004 首次执行时的推断链是「PATH 上找不到 `claude` ⇒ Claude Cod
 
 | Agent | 运行时来源（按优先级） | 会话存储（A-2） | 认证 |
 |---|---|---|---|
-| **Claude Code** | 1. hostd 自备 `@agentclientprotocol/claude-agent-acp`（npm，自带二进制）<br>2. 逃生舱：`pathToClaudeCodeExecutable` 指向用户 GUI 内的二进制 | `~/.claude/projects/<encoded-cwd>/*.jsonl`（GUI 与 CLI 共用） | 复用 `~/.claude` 下的登录态。**GUI 登录能否被 bundled 二进制复用，由 T-004 实测确认** |
+| **Claude Code** | 1. hostd 自备 `@agentclientprotocol/claude-agent-acp`（npm，自带二进制）—— **首选，因为它不依赖用户环境**<br>2. 逃生舱：`pathToClaudeCodeExecutable` 指向用户已装的 `claude`（CLI 或 GUI 内的二进制） | `~/.claude/projects/<encoded-cwd>/*.jsonl`（GUI 与 CLI 共用） | 复用 `~/.claude` 下的登录态。**能否被 bundled 二进制复用，由 T-004 实测确认** |
 | **Codex** | 1. PATH（Windows 上是 `codex.cmd`）<br>2. GUI 应用安装目录内置的 codex 可执行 | Codex 的 thread 存储目录（确切路径由 T-004 确认） | 复用 Codex 自身登录态 |
 | **OpenCode** | 1. attach 已运行的 server（mDNS 或显式 URL）<br>2. spawn PATH 上的 CLI | 服务端持有 | 服务端持有 |
 
@@ -93,6 +99,32 @@ Agent 列表必须显示每一家的**发现来源**（PATH / GUI 安装目录 /
 与**状态**（就绪 / 未登录 / 缺 Node / 未安装）。缺失时给出可操作的下一步。
 
 一个布尔的「不可用」对用户毫无帮助，也让我们收不到有用的故障报告。
+
+### D-8 发现逻辑不得只依赖继承来的 PATH
+
+三家 CLI 都装在负责人机器上，且在他自己的 PowerShell 里都能跑，
+**但 Codex 的执行环境里找不到它们**。这不是安装问题，是**环境继承**问题。
+
+线索：负责人的提示符是 `(base) PS C:\Users\Mumte>` —— 说明其交互式 shell 加载了
+conda 的 profile（自述「加载个人及系统配置文件用了 704 毫秒」）。
+**shell profile 注入的 PATH 只存在于交互式会话中**，被 spawn 出来的非交互进程拿不到。
+
+这对 hostd 是**直接的架构约束**，而不只是 T-004 的调试细节：
+
+> hostd 会以托盘程序 / LaunchAgent / systemd user unit 的形式启动（`REQUIREMENTS.md §2` 端 A），
+> **它的环境比 Codex 的执行环境还要贫瘠** —— 完全不会执行用户的 shell profile。
+> 如果 agent 发现只靠继承的 PATH，用户在终端里跑得好好的 agent，hostd 就是找不到。
+
+因此发现逻辑必须多源，按此优先级：
+
+1. **显式配置**（用户在 hostd 配置里指定的绝对路径）—— 永远最高优先级
+2. **继承的 PATH**（做平台感知解析，Windows 按 `PATHEXT`）
+3. **平台的持久化环境变量**（Windows 用户/系统 PATH，非 shell profile 注入的那部分）
+4. **已知安装位置**（npm 全局 prefix、GUI 应用安装目录）
+5. **hostd 自备**（仅 Claude Code 适用）
+
+**并且：找不到时必须能告诉用户「我在这 5 个地方都找过了，分别看到什么」**，
+而不是一句「未安装」。用户在终端里明明能跑，却被告知未安装，是最糟糕的用户体验。
 
 ### D-7 平台专属探测收敛在 `platform/`
 
