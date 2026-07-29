@@ -74,6 +74,17 @@
         }
       ]
     },
+    "BrowserUseRequirements": {
+      "type": "object",
+      "properties": {
+        "disableAutoReview": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
     "ComputerUseRequirements": {
       "type": "object",
       "properties": {
@@ -89,6 +100,12 @@
       "type": "object",
       "properties": {
         "allowAppshots": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "allowLoginShell": {
           "type": [
             "boolean",
             "null"
@@ -115,14 +132,10 @@
             "$ref": "#/definitions/AskForApproval"
           }
         },
-        "models": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ModelsRequirements"
-            },
-            {
-              "type": "null"
-            }
+        "sqliteHome": {
+          "type": [
+            "string",
+            "null"
           ]
         },
         "allowedPermissionProfiles": {
@@ -161,6 +174,22 @@
             "$ref": "#/definitions/WindowsSandboxSetupMode"
           }
         },
+        "browserUse": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BrowserUseRequirements"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "checkForUpdateOnStartup": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "computerUse": {
           "anyOf": [
             {
@@ -195,6 +224,44 @@
           "additionalProperties": {
             "type": "boolean"
           }
+        },
+        "feedback": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FeedbackRequirements"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "windowsSandboxPrivateDesktop": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "logDir": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "modelCatalogJson": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "models": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ModelsRequirements"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -208,6 +275,15 @@
             "type"
           ],
           "properties": {
+            "additionalContextLimit": {
+              "description": "Approximate token threshold for spilling this hook's `additionalContext` to disk. `null` uses 2,500 tokens; `0` disables spilling for this hook. The threshold is evaluated against the original context; a spilled preview also includes recovery metadata.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint",
+              "minimum": 0.0
+            },
             "async": {
               "type": "boolean"
             },
@@ -298,6 +374,17 @@
         }
       }
     },
+    "FeedbackRequirements": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
     "ManagedHooksRequirements": {
       "type": "object",
       "required": [
@@ -338,6 +425,13 @@
           }
         },
         "PreToolUse": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ConfiguredHookMatcherGroup"
+          }
+        },
+        "SessionEnd": {
+          "default": [],
           "type": "array",
           "items": {
             "$ref": "#/definitions/ConfiguredHookMatcherGroup"

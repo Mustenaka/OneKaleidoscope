@@ -1,5 +1,9 @@
 # Offline Rust sources
 
+> **Temporary offline override:** exact versions, rationale, and the mandatory
+> removal condition are tracked in
+> [`docs/UPSTREAM.md` — Temporary offline Rust vendoring](../docs/UPSTREAM.md#temporary-offline-rust-vendoring).
+
 This directory contains unmodified upstream source needed to build the T-004
 recorder in the repository's network-restricted verification environment.
 

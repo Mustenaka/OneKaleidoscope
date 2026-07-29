@@ -1,20 +1,22 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "ExternalAgentConfigImportCompletedNotification",
+  "title": "ExternalAgentConfigImportHistoryRecordParams",
   "type": "object",
   "required": [
-    "importId",
-    "itemTypeResults"
+    "itemTypeResults",
+    "providerId"
   ],
   "properties": {
-    "importId": {
-      "type": "string"
-    },
     "itemTypeResults": {
+      "description": "Completed results grouped by imported item type.",
       "type": "array",
       "items": {
         "$ref": "#/definitions/ExternalAgentConfigImportTypeResult"
       }
+    },
+    "providerId": {
+      "description": "Opaque provider identifier for the externally completed import.",
+      "type": "string"
     }
   },
   "definitions": {

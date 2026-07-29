@@ -3,10 +3,15 @@
   "title": "ThreadStartParams",
   "type": "object",
   "properties": {
-    "serviceName": {
-      "type": [
-        "string",
-        "null"
+    "threadSource": {
+      "description": "Optional client-supplied analytics source classification for this thread.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ThreadSource"
+        },
+        {
+          "type": "null"
+        }
       ]
     },
     "approvalPolicy": {
@@ -65,18 +70,6 @@
         }
       ]
     },
-    "serviceTier": {
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "ephemeral": {
-      "type": [
-        "boolean",
-        "null"
-      ]
-    },
     "sessionStartSource": {
       "anyOf": [
         {
@@ -87,15 +80,10 @@
         }
       ]
     },
-    "threadSource": {
-      "description": "Optional client-supplied analytics source classification for this thread.",
-      "anyOf": [
-        {
-          "$ref": "#/definitions/ThreadSource"
-        },
-        {
-          "type": "null"
-        }
+    "ephemeral": {
+      "type": [
+        "boolean",
+        "null"
       ]
     },
     "personality": {
@@ -106,6 +94,18 @@
         {
           "type": "null"
         }
+      ]
+    },
+    "serviceTier": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "serviceName": {
+      "type": [
+        "string",
+        "null"
       ]
     },
     "model": {
@@ -407,6 +407,16 @@
         },
         "environmentId": {
           "type": "string"
+        },
+        "runtimeWorkspaceRoots": {
+          "description": "Environment-native runtime workspace roots. Omitted defaults to `cwd`.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/LegacyAppPathString"
+          }
         }
       }
     }

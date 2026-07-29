@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -728,6 +729,85 @@ pub enum ProcessError {
     UnsafeScriptArgument,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ProcessEntry {
+    pub(super) pid: u32,
+    pub(super) parent_pid: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SpawnedProcessFamily {
+    root_pid: u32,
+    members: BTreeSet<u32>,
+}
+
+impl SpawnedProcessFamily {
+    pub(super) fn capture(root_pid: u32, snapshot: &[ProcessEntry]) -> Self {
+        let mut members = BTreeSet::from([root_pid]);
+        loop {
+            let before = members.len();
+            for process in snapshot {
+                if members.contains(&process.parent_pid) {
+                    members.insert(process.pid);
+                }
+            }
+            if members.len() == before {
+                break;
+            }
+        }
+        Self { root_pid, members }
+    }
+
+    fn remaining<'a>(&self, snapshot: &'a [ProcessEntry]) -> Vec<&'a ProcessEntry> {
+        snapshot
+            .iter()
+            .filter(|process| self.members.contains(&process.pid))
+            .collect()
+    }
+
+    #[cfg(windows)]
+    fn descendant_pids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.members
+            .iter()
+            .copied()
+            .filter(|process_id| *process_id != self.root_pid)
+    }
+}
+
+pub(super) fn wait_for_spawned_process_family_exit(
+    family: &SpawnedProcessFamily,
+    timeout: Duration,
+    mut snapshot: impl FnMut() -> io::Result<Vec<ProcessEntry>>,
+) -> Result<(), ProcessError> {
+    let started = Instant::now();
+    loop {
+        let current = snapshot().map_err(|error| {
+            ProcessError::Terminate(io::Error::new(
+                error.kind(),
+                format!(
+                    "could not verify cleanup of spawned root PID {}: {error}",
+                    family.root_pid
+                ),
+            ))
+        })?;
+        let remaining = family.remaining(&current);
+        if remaining.is_empty() {
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            return Err(ProcessError::Terminate(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "{} member(s) of spawned root PID {} family remained after cleanup",
+                    remaining.len(),
+                    family.root_pid
+                ),
+            )));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 pub fn resolve(program: &OsStr) -> Result<ResolvedExecutable, ResolutionFailure> {
     let report = platform_probe_path(
         DiscoveryLayer::InheritedPath,
@@ -828,6 +908,10 @@ pub fn validate_fixture_sandbox_root(
 
 pub fn path_is_link_or_reparse(path: &Path) -> io::Result<bool> {
     platform_fixture_sandbox_root_is_link(path)
+}
+
+pub fn quarantine_sandbox_working_copy(source: &Path, quarantine: &Path) -> io::Result<()> {
+    platform_quarantine_sandbox_working_copy(source, quarantine)
 }
 
 pub fn canonical_permission_path(path: &Path) -> io::Result<PathBuf> {
@@ -1087,6 +1171,16 @@ fn platform_fixture_sandbox_root_is_link(path: &Path) -> io::Result<bool> {
 }
 
 #[cfg(windows)]
+fn platform_quarantine_sandbox_working_copy(source: &Path, quarantine: &Path) -> io::Result<()> {
+    windows::quarantine_sandbox_working_copy(source, quarantine)
+}
+
+#[cfg(unix)]
+fn platform_quarantine_sandbox_working_copy(source: &Path, quarantine: &Path) -> io::Result<()> {
+    unix::quarantine_sandbox_working_copy(source, quarantine)
+}
+
+#[cfg(windows)]
 fn platform_canonical_permission_path(path: &Path) -> io::Result<PathBuf> {
     windows::canonical_permission_path(path)
 }
@@ -1176,6 +1270,90 @@ pub(super) fn resolved(path: PathBuf, launcher: Launcher) -> ResolvedExecutable 
         path,
         launcher,
         child_path_entries: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod process_family_tests {
+    use std::io;
+    use std::time::Duration;
+
+    use super::{
+        wait_for_spawned_process_family_exit, ProcessEntry, ProcessError, SpawnedProcessFamily,
+    };
+
+    #[test]
+    fn unrelated_same_name_gui_process_is_not_part_of_the_spawned_pid_family() {
+        let spawned_cli = (
+            ProcessEntry {
+                pid: 100,
+                parent_pid: 10,
+            },
+            "claude.exe",
+        );
+        let spawned_descendant = ProcessEntry {
+            pid: 101,
+            parent_pid: spawned_cli.0.pid,
+        };
+        let unrelated_same_name_gui = (
+            ProcessEntry {
+                pid: 900,
+                parent_pid: 9,
+            },
+            "claude.exe",
+        );
+        let family = SpawnedProcessFamily::capture(
+            spawned_cli.0.pid,
+            &[spawned_cli.0, spawned_descendant, unrelated_same_name_gui.0],
+        );
+
+        let result = wait_for_spawned_process_family_exit(&family, Duration::ZERO, || {
+            Ok(vec![unrelated_same_name_gui.0])
+        });
+
+        assert_eq!(spawned_cli.1, unrelated_same_name_gui.1);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn remaining_spawned_descendant_is_reported_as_cleanup_failure(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let root = ProcessEntry {
+            pid: 100,
+            parent_pid: 10,
+        };
+        let descendant = ProcessEntry {
+            pid: 101,
+            parent_pid: root.pid,
+        };
+        let family = SpawnedProcessFamily::capture(root.pid, &[root, descendant]);
+
+        let Err(error) =
+            wait_for_spawned_process_family_exit(&family, Duration::ZERO, || Ok(vec![descendant]))
+        else {
+            return Err(io::Error::other("spawned descendant residual was not detected").into());
+        };
+
+        assert!(matches!(error, ProcessError::Terminate(_)));
+        assert!(error.to_string().contains("1 member(s)"));
+        assert!(error.to_string().contains("root PID 100"));
+        Ok(())
+    }
+
+    #[test]
+    fn process_snapshot_failure_is_reported_instead_of_claiming_cleanup(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let family = SpawnedProcessFamily::capture(100, &[]);
+
+        let Err(error) = wait_for_spawned_process_family_exit(&family, Duration::ZERO, || {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "forced"))
+        }) else {
+            return Err(io::Error::other("snapshot failure was not detected").into());
+        };
+
+        assert!(matches!(error, ProcessError::Terminate(_)));
+        assert!(error.to_string().contains("could not verify cleanup"));
+        Ok(())
     }
 }
 

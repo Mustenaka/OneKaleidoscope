@@ -1,46 +1,35 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "ThreadTokenUsageUpdatedNotification",
+  "title": "RawResponseCompletedNotification",
+  "description": "Internal-only notification containing the exact usage from one upstream Responses API completion.",
   "type": "object",
   "required": [
+    "responseId",
     "threadId",
-    "tokenUsage",
     "turnId"
   ],
   "properties": {
+    "responseId": {
+      "type": "string"
+    },
     "threadId": {
       "type": "string"
     },
-    "tokenUsage": {
-      "$ref": "#/definitions/ThreadTokenUsage"
-    },
     "turnId": {
       "type": "string"
+    },
+    "usage": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/TokenUsageBreakdown"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "definitions": {
-    "ThreadTokenUsage": {
-      "type": "object",
-      "required": [
-        "last",
-        "total"
-      ],
-      "properties": {
-        "last": {
-          "$ref": "#/definitions/TokenUsageBreakdown"
-        },
-        "modelContextWindow": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "int64"
-        },
-        "total": {
-          "$ref": "#/definitions/TokenUsageBreakdown"
-        }
-      }
-    },
     "TokenUsageBreakdown": {
       "type": "object",
       "required": [

@@ -2,7 +2,7 @@ use std::env;
 use std::error::Error;
 use std::path::Path;
 
-use kaleido_recorder::redact::{detect_leaks, LeakKind, Redactor};
+use kaleido_recorder::redact::{detect_leaks, LeakKind, RedactionError, Redactor};
 use serde_json::Value;
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -52,6 +52,58 @@ fn replacement_is_deterministic() {
 
     assert_eq!(first, second);
     assert_eq!(first, r#"{"first":"<HOME>","second":"<USER>"}"#);
+}
+
+#[test]
+fn available_commands_update_is_replaced_with_a_deterministic_count_summary() {
+    let redactor = Redactor::from_pairs([]);
+    let before = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-session","update":{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"private-one","description":"first","input":{"hint":"[one]"}},{"name":"private-two","description":"second","input":{"hint":"[two]"}}],"tail":"unchanged"}}}"#;
+    let after = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fixture-session","update":{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"<REDACTED_COMMAND>","description":"<REDACTED_COMMAND>","_meta":{"kaleidoRedaction":"available_commands_update","originalCount":2}}],"tail":"unchanged"}}}"#;
+
+    let first = redactor.redact(before);
+    let second = redactor.redact(before);
+
+    assert_eq!(first, after);
+    assert_eq!(second, after);
+    assert_eq!(redactor.redact(after), after);
+}
+
+#[test]
+fn legacy_command_summary_migrates_without_losing_the_original_count() {
+    let redactor = Redactor::from_pairs([]);
+    let legacy = r#"{"method":"session/update","params":{"update":{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"<REDACTED_COMMAND>","count":58}]}}}"#;
+    let expected = r#"{"method":"session/update","params":{"update":{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"<REDACTED_COMMAND>","description":"<REDACTED_COMMAND>","_meta":{"kaleidoRedaction":"available_commands_update","originalCount":58}}]}}}"#;
+
+    assert_eq!(redactor.redact(legacy), expected);
+}
+
+#[test]
+fn available_commands_redaction_does_not_escape_its_approved_protocol_scope() {
+    let redactor = Redactor::from_pairs([]);
+    let different_update = r#"{"method":"session/update","params":{"update":{"sessionUpdate":"plan","availableCommands":[{"name":"must-stay"}]}}}"#;
+    let different_method = r#"{"method":"fixture/example","params":{"update":{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"must-stay"}]}}}"#;
+    let sibling = r#"{"method":"session/update","params":{"other":{"availableCommands":[{"name":"sibling-must-stay"}]},"update":{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"private-one","description":"first"}]}}}"#;
+    let sibling_expected = r#"{"method":"session/update","params":{"other":{"availableCommands":[{"name":"sibling-must-stay"}]},"update":{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"<REDACTED_COMMAND>","description":"<REDACTED_COMMAND>","_meta":{"kaleidoRedaction":"available_commands_update","originalCount":1}}]}}}"#;
+
+    assert_eq!(redactor.redact(different_update), different_update);
+    assert_eq!(redactor.redact(different_method), different_method);
+    assert_eq!(redactor.redact(sibling), sibling_expected);
+}
+
+#[test]
+fn malformed_available_commands_update_fails_closed() {
+    let redactor = Redactor::from_pairs([]);
+    for malformed in [
+        r#"{"method":"session/update","params":{"update":{"sessionUpdate":"available_commands_update"}}}"#,
+        r#"{"method":"session/update","params":{"update":{"sessionUpdate":"available_commands_update","availableCommands":{"name":"wrong"}}}}"#,
+        r#"{"method":"session/update","params":{"update":{"sessionUpdate":"available_commands_update","availableCommands":[],"availableCommands":[]}}}"#,
+    ] {
+        assert_eq!(
+            redactor.try_redact(malformed),
+            Err(RedactionError::AvailableCommandsShape)
+        );
+        assert_eq!(redactor.redact(malformed), "<REDACTION_ERROR>");
+    }
 }
 
 #[test]

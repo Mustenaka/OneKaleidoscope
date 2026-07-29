@@ -1,12 +1,13 @@
 use std::fmt;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::redact::{detect_leaks, Redactor};
+use crate::redact::{detect_leaks, RedactionError, Redactor};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -46,6 +47,8 @@ impl fmt::Display for Transport {
 pub enum FixtureError {
     #[error("payload is not valid JSON: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("payload redaction failed: {0}")]
+    Redaction(#[from] RedactionError),
     #[error("payload must be a JSON object")]
     PayloadShape,
     #[error("redacted payload still contains {count} prohibited value(s): {categories}")]
@@ -54,6 +57,26 @@ pub enum FixtureError {
     TimestampRange,
     #[error("failed to write fixture: {0}")]
     Write(#[from] io::Error),
+}
+
+#[derive(Debug, Error)]
+pub enum FixtureReprocessError {
+    #[error("failed to read fixture input: {0}")]
+    Read(#[source] io::Error),
+    #[error("fixture line {line} is invalid JSON: {source}")]
+    LineJson {
+        line: usize,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("fixture line {line} payload failed redaction: {source}")]
+    Payload {
+        line: usize,
+        #[source]
+        source: FixtureError,
+    },
+    #[error("failed to write reprocessed fixture: {0}")]
+    Write(#[source] io::Error),
 }
 
 #[derive(Debug)]
@@ -88,23 +111,7 @@ impl<W: Write> FixtureSink<W> {
         transport: Transport,
         payload: &str,
     ) -> Result<(), FixtureError> {
-        let redacted = self.redactor.redact(payload);
-        let value: Value = serde_json::from_str(&redacted)?;
-        if !value.is_object() {
-            return Err(FixtureError::PayloadShape);
-        }
-        let leaks = detect_leaks(&redacted, &value);
-        if !leaks.is_empty() {
-            let categories = leaks
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(FixtureError::Leak {
-                count: leaks.len(),
-                categories,
-            });
-        }
+        let redacted = redact_and_validate(&self.redactor, payload)?;
         let timestamp =
             u64::try_from(elapsed.as_millis()).map_err(|_| FixtureError::TimestampRange)?;
         writeln!(
@@ -119,6 +126,77 @@ impl<W: Write> FixtureSink<W> {
     pub fn into_inner(self) -> W {
         self.writer
     }
+}
+
+pub fn reprocess_jsonl<R: BufRead, W: Write>(
+    mut reader: R,
+    mut writer: W,
+    redactor: &Redactor,
+) -> Result<usize, FixtureReprocessError> {
+    let mut line = String::new();
+    let mut line_number = 0_usize;
+    loop {
+        line.clear();
+        let bytes = reader
+            .read_line(&mut line)
+            .map_err(FixtureReprocessError::Read)?;
+        if bytes == 0 {
+            break;
+        }
+        line_number += 1;
+        let record_text = line.trim_end_matches(['\r', '\n']);
+        let record: RawFixtureRecord<'_> = serde_json::from_str(record_text).map_err(|source| {
+            FixtureReprocessError::LineJson {
+                line: line_number,
+                source,
+            }
+        })?;
+        let payload = redact_and_validate(redactor, record.payload.get()).map_err(|source| {
+            FixtureReprocessError::Payload {
+                line: line_number,
+                source,
+            }
+        })?;
+        writeln!(
+            writer,
+            "{{\"ts_ms\":{},\"dir\":\"{}\",\"transport\":\"{}\",\"payload\":{}}}",
+            record.ts_ms, record.dir, record.transport, payload
+        )
+        .map_err(FixtureReprocessError::Write)?;
+    }
+    writer.flush().map_err(FixtureReprocessError::Write)?;
+    Ok(line_number)
+}
+
+fn redact_and_validate(redactor: &Redactor, payload: &str) -> Result<String, FixtureError> {
+    let redacted = redactor.try_redact(payload)?;
+    let value: Value = serde_json::from_str(&redacted)?;
+    if !value.is_object() {
+        return Err(FixtureError::PayloadShape);
+    }
+    let leaks = detect_leaks(&redacted, &value);
+    if !leaks.is_empty() {
+        let categories = leaks
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(FixtureError::Leak {
+            count: leaks.len(),
+            categories,
+        });
+    }
+    Ok(redacted)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFixtureRecord<'a> {
+    ts_ms: u64,
+    dir: Direction,
+    transport: Transport,
+    #[serde(borrow)]
+    payload: &'a RawValue,
 }
 
 pub fn http_request_payload(

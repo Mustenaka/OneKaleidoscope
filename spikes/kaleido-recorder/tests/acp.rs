@@ -84,6 +84,76 @@ fn create_session(machine: &mut AcpStateMachine) -> Result<Value, Box<dyn std::e
     Ok(prompt)
 }
 
+fn create_terminal_test_project(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(path.join("src"))?;
+    std::fs::write(
+        path.join("Cargo.toml"),
+        r#"[package]
+name = "kaleido-acp-terminal-test"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+"#,
+    )?;
+    std::fs::write(
+        path.join("src/main.rs"),
+        r#"use std::env;
+use std::process::ExitCode;
+use std::thread;
+use std::time::Duration;
+
+fn main() -> ExitCode {
+    match env::args().nth(1).as_deref() {
+        Some("fail") => {
+            eprintln!("intentional terminal failure");
+            ExitCode::from(7)
+        }
+        Some("wait") => {
+            thread::sleep(Duration::from_secs(30));
+            ExitCode::SUCCESS
+        }
+        _ => {
+            println!("terminal success");
+            ExitCode::SUCCESS
+        }
+    }
+}
+"#,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn initialize_advertises_the_exact_implemented_client_capabilities(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut machine = AcpStateMachine::new(sandbox(), AcpScenario::SimpleTurn);
+    let initialize = one_message(machine.start()?)?;
+    assert_eq!(
+        initialize,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": 1,
+                "clientCapabilities": {
+                    "fs": {
+                        "readTextFile": true,
+                        "writeTextFile": true
+                    },
+                    "terminal": true
+                },
+                "clientInfo": {
+                    "name": "OneKaleidoscope fixture recorder",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }
+        })
+    );
+    Ok(())
+}
+
 #[test]
 fn simple_turn_runs_initialize_new_and_prompt() -> Result<(), Box<dyn std::error::Error>> {
     let mut machine = AcpStateMachine::new(sandbox(), AcpScenario::SimpleTurn);
@@ -146,6 +216,375 @@ fn simple_turn_counts_only_nonempty_chunks_from_the_active_session(
         ),
         Err(AcpError::SessionIdMismatch)
     ));
+    Ok(())
+}
+
+#[test]
+fn filesystem_client_methods_read_ranges_and_write_only_inside_the_sandbox(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+    let sandbox = temporary.path().join("sandbox");
+    std::fs::create_dir(&sandbox)?;
+    let notes = sandbox.join("notes.txt");
+    let editable = sandbox.join("editable.txt");
+    std::fs::write(&notes, "first\nsecond\nthird\n")?;
+    std::fs::write(&editable, "ORIGINAL\n")?;
+
+    let mut machine = AcpStateMachine::new(sandbox.clone(), AcpScenario::SimpleTurn);
+    let _ = create_session(&mut machine)?;
+    let read = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "read-1",
+        "method": "fs/read_text_file",
+        "params": {
+            "sessionId": "session-1",
+            "path": notes,
+            "line": 2,
+            "limit": 1
+        }
+    })
+    .to_string();
+    let read_response = one_message(machine.accept_raw(&read)?)?;
+    assert_eq!(
+        read_response,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "read-1",
+            "result": {"content": "second\n"}
+        })
+    );
+
+    let write = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "write-1",
+        "method": "fs/write_text_file",
+        "params": {
+            "sessionId": "session-1",
+            "path": editable,
+            "content": "CHANGED\n"
+        }
+    })
+    .to_string();
+    let write_response = one_message(machine.accept_raw(&write)?)?;
+    assert_eq!(
+        write_response,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "write-1",
+            "result": {}
+        })
+    );
+    assert_eq!(std::fs::read_to_string(editable)?, "CHANGED\n");
+
+    let missing = sandbox.join("missing.txt");
+    let missing_request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "read-missing",
+        "method": "fs/read_text_file",
+        "params": {
+            "sessionId": "session-1",
+            "path": missing
+        }
+    })
+    .to_string();
+    let missing_response = one_message(machine.accept_raw(&missing_request)?)?;
+    assert_eq!(
+        missing_response
+            .pointer("/error/code")
+            .and_then(Value::as_i64),
+        Some(-32002)
+    );
+    Ok(())
+}
+
+#[test]
+fn filesystem_client_methods_reject_outside_relative_and_foreign_session_paths(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+    let sandbox = temporary.path().join("sandbox");
+    std::fs::create_dir(&sandbox)?;
+    std::fs::write(sandbox.join("notes.txt"), "inside\n")?;
+    let outside = temporary.path().join("outside.txt");
+    std::fs::write(&outside, "outside\n")?;
+
+    let mut machine = AcpStateMachine::new(sandbox, AcpScenario::SimpleTurn);
+    let _ = create_session(&mut machine)?;
+    for request in [
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "outside",
+            "method": "fs/write_text_file",
+            "params": {
+                "sessionId": "session-1",
+                "path": outside,
+                "content": "OVERWRITTEN\n"
+            }
+        }),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "relative",
+            "method": "fs/read_text_file",
+            "params": {
+                "sessionId": "session-1",
+                "path": "notes.txt"
+            }
+        }),
+    ] {
+        assert!(matches!(
+            machine.accept_raw(&request.to_string()),
+            Err(AcpError::UnsafeClientMethodScope)
+        ));
+    }
+    assert_eq!(std::fs::read_to_string(&outside)?, "outside\n");
+
+    let foreign = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "foreign",
+        "method": "fs/read_text_file",
+        "params": {
+            "sessionId": "session-foreign",
+            "path": outside
+        }
+    })
+    .to_string();
+    assert!(matches!(
+        machine.accept_raw(&foreign),
+        Err(AcpError::SessionIdMismatch)
+    ));
+    Ok(())
+}
+
+#[test]
+fn terminal_client_methods_cover_create_wait_output_kill_and_release(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+    let sandbox = temporary.path().join("sandbox");
+    create_terminal_test_project(&sandbox)?;
+
+    let mut error_machine = AcpStateMachine::new(sandbox.clone(), AcpScenario::Error);
+    let _ = create_session(&mut error_machine)?;
+    let create = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "create-fail",
+        "method": "terminal/create",
+        "params": {
+            "sessionId": "session-1",
+            "command": "cargo",
+            "args": ["run", "--", "fail"],
+            "env": [],
+            "cwd": sandbox,
+            "outputByteLimit": 65536
+        }
+    })
+    .to_string();
+    let create_response = one_message(error_machine.accept_raw(&create)?)?;
+    let terminal_id = create_response
+        .pointer("/result/terminalId")
+        .and_then(Value::as_str)
+        .ok_or("terminal/create response did not contain terminalId")?
+        .to_owned();
+
+    let wait = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "wait-fail",
+        "method": "terminal/wait_for_exit",
+        "params": {
+            "sessionId": "session-1",
+            "terminalId": terminal_id
+        }
+    })
+    .to_string();
+    let wait_response = one_message(error_machine.accept_raw(&wait)?)?;
+    assert_eq!(
+        wait_response
+            .pointer("/result/exitCode")
+            .and_then(Value::as_u64),
+        Some(7)
+    );
+
+    let output = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "output-fail",
+        "method": "terminal/output",
+        "params": {
+            "sessionId": "session-1",
+            "terminalId": terminal_id
+        }
+    })
+    .to_string();
+    let output_response = one_message(error_machine.accept_raw(&output)?)?;
+    assert!(output_response
+        .pointer("/result/output")
+        .and_then(Value::as_str)
+        .is_some_and(|output| output.contains("intentional terminal failure")));
+    assert_eq!(
+        output_response
+            .pointer("/result/exitStatus/exitCode")
+            .and_then(Value::as_u64),
+        Some(7)
+    );
+
+    let kill = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "kill-finished",
+        "method": "terminal/kill",
+        "params": {
+            "sessionId": "session-1",
+            "terminalId": terminal_id
+        }
+    })
+    .to_string();
+    let kill_response = one_message(error_machine.accept_raw(&kill)?)?;
+    assert_eq!(kill_response.get("result"), Some(&serde_json::json!({})));
+
+    let release = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "release-fail",
+        "method": "terminal/release",
+        "params": {
+            "sessionId": "session-1",
+            "terminalId": terminal_id
+        }
+    })
+    .to_string();
+    let release_response = one_message(error_machine.accept_raw(&release)?)?;
+    assert_eq!(release_response.get("result"), Some(&serde_json::json!({})));
+    let missing_response = one_message(error_machine.accept_raw(&output)?)?;
+    assert_eq!(
+        missing_response
+            .pointer("/error/code")
+            .and_then(Value::as_i64),
+        Some(-32002)
+    );
+    Ok(())
+}
+
+#[test]
+fn terminal_kill_terminates_a_running_command_without_releasing_it(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+    let sandbox = temporary.path().join("sandbox");
+    create_terminal_test_project(&sandbox)?;
+
+    let mut machine = AcpStateMachine::new(sandbox.clone(), AcpScenario::Cancel);
+    let _ = create_session(&mut machine)?;
+    let create = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "create-running",
+        "method": "terminal/create",
+        "params": {
+            "sessionId": "session-1",
+            "command": "cargo",
+            "args": ["run", "--", "wait"],
+            "cwd": sandbox
+        }
+    })
+    .to_string();
+    let create_response = one_message(machine.accept_raw(&create)?)?;
+    let terminal_id = create_response
+        .pointer("/result/terminalId")
+        .and_then(Value::as_str)
+        .ok_or("terminal/create response did not contain terminalId")?
+        .to_owned();
+
+    let kill = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "kill-running",
+        "method": "terminal/kill",
+        "params": {
+            "sessionId": "session-1",
+            "terminalId": terminal_id
+        }
+    })
+    .to_string();
+    let kill_response = one_message(machine.accept_raw(&kill)?)?;
+    assert_eq!(kill_response.get("result"), Some(&serde_json::json!({})));
+
+    let output = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "output-killed",
+        "method": "terminal/output",
+        "params": {
+            "sessionId": "session-1",
+            "terminalId": terminal_id
+        }
+    })
+    .to_string();
+    let output_response = one_message(machine.accept_raw(&output)?)?;
+    assert!(output_response.pointer("/result/exitStatus").is_some());
+
+    let release = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "release-killed",
+        "method": "terminal/release",
+        "params": {
+            "sessionId": "session-1",
+            "terminalId": terminal_id
+        }
+    })
+    .to_string();
+    let release_response = one_message(machine.accept_raw(&release)?)?;
+    assert_eq!(release_response.get("result"), Some(&serde_json::json!({})));
+    Ok(())
+}
+
+#[test]
+fn terminal_create_rejects_unsafe_command_cwd_environment_and_output_limit(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempfile::tempdir()?;
+    let sandbox = temporary.path().join("sandbox");
+    let outside = temporary.path().join("outside");
+    create_terminal_test_project(&sandbox)?;
+    std::fs::create_dir(&outside)?;
+    let mut machine = AcpStateMachine::new(sandbox.clone(), AcpScenario::PermissionApprove);
+    let _ = create_session(&mut machine)?;
+
+    for params in [
+        serde_json::json!({
+            "sessionId": "session-1",
+            "command": "powershell",
+            "args": ["-Command", "Get-Content", "secret.txt"],
+            "cwd": sandbox
+        }),
+        serde_json::json!({
+            "sessionId": "session-1",
+            "command": "cargo",
+            "args": ["run", "--", "fail"],
+            "cwd": sandbox
+        }),
+        serde_json::json!({
+            "sessionId": "session-1",
+            "command": "cargo",
+            "args": ["run"],
+            "cwd": outside
+        }),
+        serde_json::json!({
+            "sessionId": "session-1",
+            "command": "cargo",
+            "args": ["run"],
+            "env": [{"name": "RUSTC_WRAPPER", "value": "outside"}],
+            "cwd": sandbox
+        }),
+        serde_json::json!({
+            "sessionId": "session-1",
+            "command": "cargo",
+            "args": ["run"],
+            "cwd": sandbox,
+            "outputByteLimit": 1048577
+        }),
+    ] {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "unsafe-terminal",
+            "method": "terminal/create",
+            "params": params
+        })
+        .to_string();
+        assert!(matches!(
+            machine.accept_raw(&request),
+            Err(AcpError::UnsafeClientMethodScope)
+        ));
+    }
     Ok(())
 }
 

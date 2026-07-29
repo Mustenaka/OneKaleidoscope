@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 use directories::BaseDirs;
 
 use super::{
-    read_user_npm_prefix, resolved, Candidate, CandidateStatus, DiscoveryLayer, DiscoveryTarget,
-    Launcher, LayerReport, ProbeStatus, ProcessError, ResolvedExecutable,
+    read_user_npm_prefix, resolved, wait_for_spawned_process_family_exit, Candidate,
+    CandidateStatus, DiscoveryLayer, DiscoveryTarget, Launcher, LayerReport, ProbeStatus,
+    ProcessEntry, ProcessError, ResolvedExecutable, SpawnedProcessFamily,
 };
 
 const FALLBACK_EXTENSIONS: [&str; 3] = [".CMD", ".EXE", ".BAT"];
@@ -25,6 +26,236 @@ const NVM_HOME_VALUE: &str = "NVM_HOME";
 const NVM_SYMLINK_VALUE: &str = "NVM_SYMLINK";
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+// npm adapters can take several seconds to finish native descendants after their launcher is
+// reaped. Keep the verification bounded, but do not report a false residue while the exact
+// captured PID family is still completing forced shutdown.
+const PROCESS_FAMILY_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
+const SANDBOX_RENAME_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
+const SANDBOX_RENAME_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+const ERROR_SHARING_VIOLATION: i32 = 32;
+const DESCENDANT_FORCE_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+// Toolhelp32 is the only FFI boundary in the recorder. It enumerates numeric PID/PPID
+// relationships and intentionally never reads or compares executable names.
+#[allow(unsafe_code)]
+mod process_snapshot_ffi {
+    use std::ffi::c_void;
+    use std::io;
+    use std::mem;
+
+    use super::ProcessEntry;
+
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+    const ERROR_NO_MORE_FILES: i32 = 18;
+    const MAX_PATH: usize = 260;
+    const INVALID_HANDLE_VALUE: *mut c_void = -1_isize as *mut c_void;
+
+    #[repr(C)]
+    struct ProcessEntry32W {
+        size: u32,
+        usage: u32,
+        process_id: u32,
+        default_heap_id: usize,
+        module_id: u32,
+        thread_count: u32,
+        parent_process_id: u32,
+        base_priority: i32,
+        flags: u32,
+        executable_file: [u16; MAX_PATH],
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> *mut c_void;
+        fn Process32FirstW(snapshot: *mut c_void, entry: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(snapshot: *mut c_void, entry: *mut ProcessEntry32W) -> i32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+
+    struct SnapshotHandle(*mut c_void);
+
+    impl Drop for SnapshotHandle {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is a live snapshot handle returned by
+            // `CreateToolhelp32Snapshot`; this owner closes it exactly once.
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    pub(super) fn snapshot_processes() -> io::Result<Vec<ProcessEntry>> {
+        // SAFETY: The flags request a system process snapshot and the PID argument is
+        // required to be zero for this snapshot kind. No borrowed pointers are passed.
+        let raw_snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if raw_snapshot == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let snapshot = SnapshotHandle(raw_snapshot);
+        let mut raw_entry = ProcessEntry32W {
+            size: mem::size_of::<ProcessEntry32W>() as u32,
+            usage: 0,
+            process_id: 0,
+            default_heap_id: 0,
+            module_id: 0,
+            thread_count: 0,
+            parent_process_id: 0,
+            base_priority: 0,
+            flags: 0,
+            executable_file: [0; MAX_PATH],
+        };
+        // SAFETY: `snapshot.0` remains live for this call and `raw_entry` points to a
+        // writable, correctly sized `ProcessEntry32W`.
+        if unsafe { Process32FirstW(snapshot.0, &mut raw_entry) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut processes = Vec::new();
+        loop {
+            processes.push(ProcessEntry {
+                pid: raw_entry.process_id,
+                parent_pid: raw_entry.parent_process_id,
+            });
+            // SAFETY: The same live snapshot and valid writable entry are retained for
+            // the complete enumeration.
+            if unsafe { Process32NextW(snapshot.0, &mut raw_entry) } != 0 {
+                continue;
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_NO_MORE_FILES) {
+                break;
+            }
+            return Err(error);
+        }
+        Ok(processes)
+    }
+}
+
+// These process handles bind cleanup to the exact PIDs captured while the recorder-owned
+// launcher is still alive. Holding the handles prevents PID reuse from redirecting cleanup to an
+// unrelated process. No executable names or command lines cross this FFI boundary.
+#[allow(unsafe_code)]
+mod process_handle_ffi {
+    use std::ffi::c_void;
+    use std::io;
+    use std::ptr;
+    use std::time::{Duration, Instant};
+
+    const PROCESS_TERMINATE: u32 = 0x0000_0001;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const WAIT_OBJECT_0: u32 = 0x0000_0000;
+    const WAIT_TIMEOUT: u32 = 0x0000_0102;
+    const WAIT_FAILED: u32 = 0xffff_ffff;
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
+        fn TerminateProcess(process: *mut c_void, exit_code: u32) -> i32;
+        fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+
+    #[derive(Debug)]
+    struct OwnedProcessHandle {
+        raw: *mut c_void,
+    }
+
+    impl OwnedProcessHandle {
+        fn open(process_id: u32) -> io::Result<Option<Self>> {
+            // SAFETY: OpenProcess is called with a numeric PID from Toolhelp32 and no inherited
+            // handle. A non-null handle is owned by this value and closed exactly once in Drop.
+            let raw = unsafe { OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, 0, process_id) };
+            if raw.is_null() {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
+                    return Ok(None);
+                }
+                return Err(error);
+            }
+            Ok(Some(Self { raw }))
+        }
+
+        fn is_exited(&self) -> io::Result<bool> {
+            // SAFETY: self.raw remains a valid owned process handle until Drop.
+            match unsafe { WaitForSingleObject(self.raw, 0) } {
+                WAIT_OBJECT_0 => Ok(true),
+                WAIT_TIMEOUT => Ok(false),
+                WAIT_FAILED => Err(io::Error::last_os_error()),
+                outcome => Err(io::Error::other(format!(
+                    "unexpected process wait result {outcome}"
+                ))),
+            }
+        }
+
+        fn terminate(&self) -> io::Result<()> {
+            if self.is_exited()? {
+                return Ok(());
+            }
+            // SAFETY: self.raw is an owned handle opened with PROCESS_TERMINATE.
+            if unsafe { TerminateProcess(self.raw, 1) } == 0 {
+                if self.is_exited()? {
+                    return Ok(());
+                }
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
+        fn wait_for_exit(&self, timeout: Duration) -> io::Result<()> {
+            let milliseconds = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+            // SAFETY: self.raw remains valid for the duration of this bounded wait.
+            match unsafe { WaitForSingleObject(self.raw, milliseconds) } {
+                WAIT_OBJECT_0 => Ok(()),
+                WAIT_TIMEOUT => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "captured descendant did not exit after forced termination",
+                )),
+                WAIT_FAILED => Err(io::Error::last_os_error()),
+                outcome => Err(io::Error::other(format!(
+                    "unexpected process wait result {outcome}"
+                ))),
+            }
+        }
+    }
+
+    impl Drop for OwnedProcessHandle {
+        fn drop(&mut self) {
+            if !self.raw.is_null() {
+                // SAFETY: self.raw is owned by this value and has not been closed elsewhere.
+                let _close_result = unsafe { CloseHandle(self.raw) };
+                self.raw = ptr::null_mut();
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    pub(super) struct CapturedDescendants {
+        handles: Vec<OwnedProcessHandle>,
+    }
+
+    impl CapturedDescendants {
+        pub(super) fn capture(process_ids: impl Iterator<Item = u32>) -> io::Result<Self> {
+            let mut handles = Vec::new();
+            for process_id in process_ids {
+                if let Some(handle) = OwnedProcessHandle::open(process_id)? {
+                    handles.push(handle);
+                }
+            }
+            Ok(Self { handles })
+        }
+
+        pub(super) fn terminate_and_wait(&self, timeout: Duration) -> io::Result<()> {
+            for handle in &self.handles {
+                handle.terminate()?;
+            }
+            let started = Instant::now();
+            for handle in &self.handles {
+                let remaining = timeout.saturating_sub(started.elapsed());
+                handle.wait_for_exit(remaining)?;
+            }
+            Ok(())
+        }
+    }
+}
 
 fn configure_child(command: &mut Command) {
     command.creation_flags(CREATE_NO_WINDOW);
@@ -32,6 +263,32 @@ fn configure_child(command: &mut Command) {
 
 pub(super) fn fixture_sandbox_root_is_link(path: &Path) -> io::Result<bool> {
     Ok(fs::symlink_metadata(path)?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+}
+
+pub(super) fn quarantine_sandbox_working_copy(source: &Path, quarantine: &Path) -> io::Result<()> {
+    let started = Instant::now();
+    retry_directory_rename_after_sharing_violation(
+        || fs::rename(source, quarantine),
+        || started.elapsed() < SANDBOX_RENAME_RETRY_TIMEOUT,
+        || thread::sleep(SANDBOX_RENAME_RETRY_INTERVAL),
+    )
+}
+
+fn retry_directory_rename_after_sharing_violation(
+    mut operation: impl FnMut() -> io::Result<()>,
+    mut retry_available: impl FnMut() -> bool,
+    mut wait: impl FnMut(),
+) -> io::Result<()> {
+    loop {
+        match operation() {
+            Err(error)
+                if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) && retry_available() =>
+            {
+                wait();
+            }
+            outcome => return outcome,
+        }
+    }
 }
 
 pub(super) fn canonical_permission_path(path: &Path) -> io::Result<PathBuf> {
@@ -814,13 +1071,90 @@ fn decode_diagnostic_bytes(bytes: &[u8]) -> String {
 }
 
 pub(super) fn terminate_tree(child: &mut Child) -> Result<ExitStatus, ProcessError> {
-    terminate_tree_with(child, |process_id| {
+    let root_pid = child.id();
+    let snapshot = process_snapshot_ffi::snapshot_processes().map_err(|error| {
+        ProcessError::Terminate(io::Error::new(
+            error.kind(),
+            format!("could not capture spawned root PID {root_pid} family: {error}"),
+        ))
+    })?;
+    let family = SpawnedProcessFamily::capture(root_pid, &snapshot);
+    let descendants = process_handle_ffi::CapturedDescendants::capture(family.descendant_pids())
+        .map_err(|error| {
+            ProcessError::Terminate(io::Error::new(
+                error.kind(),
+                format!(
+                    "could not retain exact handles for spawned root PID {root_pid} descendants: \
+                     {error}"
+                ),
+            ))
+        });
+    let root_termination = terminate_tree_with(child, |process_id| {
         taskkill_command(process_id)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-    })
+    });
+    let descendant_termination = descendants.and_then(|descendants| {
+        descendants
+            .terminate_and_wait(DESCENDANT_FORCE_EXIT_TIMEOUT)
+            .map_err(|error| {
+                ProcessError::Terminate(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "could not terminate exact descendants of spawned root PID {root_pid}: \
+                         {error}"
+                    ),
+                ))
+            })
+    });
+    let status = combine_family_termination(root_termination, descendant_termination)?;
+    wait_for_spawned_process_family_exit(
+        &family,
+        PROCESS_FAMILY_EXIT_TIMEOUT,
+        process_snapshot_ffi::snapshot_processes,
+    )?;
+    Ok(status)
+}
+
+fn combine_family_termination(
+    root: Result<ExitStatus, ProcessError>,
+    descendants: Result<(), ProcessError>,
+) -> Result<ExitStatus, ProcessError> {
+    match (root, descendants) {
+        (Ok(status), Ok(())) => Ok(status),
+        (Err(root), Ok(())) => Err(root),
+        (Ok(_), Err(descendants)) => Err(descendants),
+        (Err(root), Err(descendants)) => Err(ProcessError::Terminate(io::Error::other(format!(
+            "spawned root cleanup failed ({root}); exact descendant cleanup also failed \
+                 ({descendants})"
+        )))),
+    }
+}
+
+#[cfg(test)]
+fn terminate_tree_with_tracking(
+    child: &mut Child,
+    run_taskkill: impl FnOnce(u32) -> io::Result<ExitStatus>,
+    mut snapshot_processes: impl FnMut() -> io::Result<Vec<ProcessEntry>>,
+) -> Result<ExitStatus, ProcessError> {
+    let root_pid = child.id();
+    let family =
+        snapshot_processes().map(|snapshot| SpawnedProcessFamily::capture(root_pid, &snapshot));
+    let termination = terminate_tree_with(child, run_taskkill);
+    let status = termination?;
+    let family = family.map_err(|error| {
+        ProcessError::Terminate(io::Error::new(
+            error.kind(),
+            format!(
+                "spawned root PID {root_pid} was reaped, but its process family could not be \
+                 captured before cleanup: {error}"
+            ),
+        ))
+    })?;
+    wait_for_spawned_process_family_exit(&family, PROCESS_FAMILY_EXIT_TIMEOUT, snapshot_processes)?;
+    Ok(status)
 }
 
 trait TerminationTarget {
@@ -875,12 +1209,7 @@ fn finish_termination(
 
     let direct_kill_result = child.kill_direct();
     match child.poll_exit(Duration::from_secs(3)) {
-        Ok(Some(status)) if taskkill_result.as_ref().is_ok_and(ExitStatus::success) => Ok(status),
-        Ok(Some(_)) => Err(ProcessError::Terminate(io::Error::other(format!(
-            "{}; the root process was killed directly but descendant termination is not \
-             guaranteed",
-            taskkill_outcome(&taskkill_result)
-        )))),
+        Ok(Some(status)) => Ok(status),
         Err(error) => Err(error),
         Ok(None) => {
             if let Err(error) = direct_kill_result {
@@ -934,7 +1263,7 @@ mod tests {
     use std::fs;
     use std::io;
     use std::os::windows::process::ExitStatusExt;
-    use std::process::ExitStatus;
+    use std::process::{Child, Command, ExitStatus, Stdio};
     use std::time::Duration;
 
     use tempfile::tempdir;
@@ -942,13 +1271,66 @@ mod tests {
     use super::{
         command_script_line, decode_diagnostic_bytes, executable_extensions,
         expand_environment_variables, parse_registry_value, prefer_persistent_environment_value,
-        probe_in, query_registry_value, taskkill_command, terminate_tree_with,
+        probe_in, query_registry_value, retry_directory_rename_after_sharing_violation,
+        taskkill_command, terminate_tree_with, terminate_tree_with_tracking,
         utf8_registry_query_command_line, utf8_where_command_line, where_output, TerminationTarget,
-        USER_ENVIRONMENT_KEY,
+        ERROR_SHARING_VIOLATION, USER_ENVIRONMENT_KEY,
     };
     use crate::platform::{CandidateStatus, DiscoveryLayer, Launcher, ProbeStatus, ProcessError};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn sandbox_quarantine_retries_transient_windows_sharing_violations() -> TestResult {
+        let attempts = Cell::new(0);
+        let waits = Cell::new(0);
+
+        retry_directory_rename_after_sharing_violation(
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() < 3 {
+                    Err(io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION))
+                } else {
+                    Ok(())
+                }
+            },
+            || true,
+            || waits.set(waits.get() + 1),
+        )?;
+
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(waits.get(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn sandbox_quarantine_does_not_retry_other_windows_errors() -> TestResult {
+        let attempts = Cell::new(0);
+        let retry_checks = Cell::new(0);
+        let waits = Cell::new(0);
+
+        let result = retry_directory_rename_after_sharing_violation(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(io::Error::from_raw_os_error(5))
+            },
+            || {
+                retry_checks.set(retry_checks.get() + 1);
+                true
+            },
+            || waits.set(waits.get() + 1),
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(()) => return Err("access denied unexpectedly succeeded".into()),
+        };
+
+        assert_eq!(error.raw_os_error(), Some(5));
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(retry_checks.get(), 0);
+        assert_eq!(waits.get(), 0);
+        Ok(())
+    }
 
     #[test]
     fn ignores_extensionless_shim_and_selects_cmd() -> TestResult {
@@ -1265,6 +1647,63 @@ mod tests {
         assert_eq!(arguments, ["/PID", "42", "/T", "/F"]);
     }
 
+    #[test]
+    fn toolhelp_snapshot_contains_the_current_process_by_pid() -> TestResult {
+        let processes = super::process_snapshot_ffi::snapshot_processes()?;
+
+        assert!(processes
+            .iter()
+            .any(|process| process.pid == std::process::id()));
+        Ok(())
+    }
+
+    #[test]
+    fn captured_process_handle_terminates_only_the_exact_pid() -> TestResult {
+        fn sleeping_process() -> io::Result<Child> {
+            let mut command = Command::new("powershell.exe");
+            command
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "[Threading.Thread]::Sleep(30000)",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            super::configure_child(&mut command);
+            command.spawn()
+        }
+
+        let mut target = sleeping_process()?;
+        let mut unrelated = match sleeping_process() {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = target.kill();
+                let _ = target.wait();
+                return Err(error.into());
+            }
+        };
+        let result = (|| -> TestResult {
+            let handles =
+                super::process_handle_ffi::CapturedDescendants::capture([target.id()].into_iter())?;
+            handles.terminate_and_wait(Duration::from_secs(5))?;
+
+            assert!(target.wait()?.code().is_some());
+            assert!(
+                unrelated.try_wait()?.is_none(),
+                "a process whose PID was not captured must remain untouched"
+            );
+            Ok(())
+        })();
+        let _ = target.kill();
+        let _ = target.wait();
+        let _ = unrelated.kill();
+        let _ = unrelated.wait();
+        result
+    }
+
     struct RecordingTerminationTarget {
         calls: Vec<&'static str>,
         exit_status: Option<ExitStatus>,
@@ -1292,7 +1731,7 @@ mod tests {
     }
 
     #[test]
-    fn taskkill_spawn_failure_still_kills_and_waits_for_the_child() -> TestResult {
+    fn taskkill_spawn_failure_reaps_root_for_outer_family_verification() -> TestResult {
         let taskkill_process_id = Cell::new(0);
         let mut child = RecordingTerminationTarget {
             calls: Vec::new(),
@@ -1307,17 +1746,15 @@ mod tests {
             ))
         });
 
-        let Err(ProcessError::Terminate(error)) = result else {
-            return Err(io::Error::other("tree termination failure must be reported").into());
-        };
-        assert!(error.to_string().contains("descendant termination"));
+        let status = result?;
+        assert_eq!(status.code(), Some(0));
         assert_eq!(taskkill_process_id.get(), 42);
         assert_eq!(child.calls, ["try-wait", "kill", "wait"]);
         Ok(())
     }
 
     #[test]
-    fn taskkill_nonzero_exit_still_kills_and_waits_for_the_child() -> TestResult {
+    fn taskkill_nonzero_exit_reaps_root_for_outer_family_verification() -> TestResult {
         let mut child = RecordingTerminationTarget {
             calls: Vec::new(),
             exit_status: Some(ExitStatus::from_raw(0)),
@@ -1325,11 +1762,53 @@ mod tests {
 
         let result = terminate_tree_with(&mut child, |_| Ok(ExitStatus::from_raw(5)));
 
-        let Err(ProcessError::Terminate(error)) = result else {
-            return Err(io::Error::other("nonzero taskkill must be reported").into());
-        };
-        assert!(error.to_string().contains("descendant termination"));
+        let status = result?;
+        assert_eq!(status.code(), Some(0));
         assert_eq!(child.calls, ["try-wait", "kill", "wait"]);
+        Ok(())
+    }
+
+    #[test]
+    fn real_child_with_nonzero_taskkill_reaches_pid_family_verification() -> TestResult {
+        let mut command = Command::new("powershell.exe");
+        command
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[Threading.Thread]::Sleep(30000)",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        super::configure_child(&mut command);
+        let mut child = command.spawn()?;
+        let snapshot_calls = Cell::new(0_usize);
+
+        let result = terminate_tree_with_tracking(
+            &mut child,
+            |_| Ok(ExitStatus::from_raw(1)),
+            || {
+                snapshot_calls.set(snapshot_calls.get() + 1);
+                super::process_snapshot_ffi::snapshot_processes()
+            },
+        );
+
+        let status = match result {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.into());
+            }
+        };
+        assert!(status.code().is_some());
+        assert!(
+            snapshot_calls.get() >= 2,
+            "outer PID-family verification was skipped"
+        );
+        assert!(child.try_wait()?.is_some());
         Ok(())
     }
 

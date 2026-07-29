@@ -1,9 +1,10 @@
 use std::error::Error;
-use std::io::{self, Write};
+use std::io::{self, Cursor, Write};
 use std::time::Duration;
 
 use kaleido_recorder::fixture::{
-    http_response_payload, Direction, FixtureError, FixtureSink, Transport,
+    http_response_payload, reprocess_jsonl, Direction, FixtureError, FixtureReprocessError,
+    FixtureSink, Transport,
 };
 use kaleido_recorder::redact::Redactor;
 
@@ -128,6 +129,77 @@ fn http_envelope_retains_raw_scalar_body() -> Result<(), Box<dyn Error>> {
         payload,
         r#"{"method":"GET","path":"/global/health","status":200,"content_type":"application/json","body":null}"#
     );
+    Ok(())
+}
+
+#[test]
+fn reprocess_jsonl_uses_the_same_redactor_without_changing_fixture_metadata(
+) -> Result<(), Box<dyn Error>> {
+    let input = concat!(
+        "{\"ts_ms\":7,\"dir\":\"s2c\",\"transport\":\"stdio\",\"payload\":",
+        "{\"method\":\"session/update\",\"params\":{\"update\":",
+        "{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":",
+        "[{\"name\":\"private-one\"},{\"name\":\"private-two\"}],\"tail\":\"same\"}}}}\n"
+    );
+    let expected = concat!(
+        "{\"ts_ms\":7,\"dir\":\"s2c\",\"transport\":\"stdio\",\"payload\":",
+        "{\"method\":\"session/update\",\"params\":{\"update\":",
+        "{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":",
+        "[{\"name\":\"<REDACTED_COMMAND>\",\"description\":\"<REDACTED_COMMAND>\",",
+        "\"_meta\":{\"kaleidoRedaction\":\"available_commands_update\",",
+        "\"originalCount\":2}}],\"tail\":\"same\"}}}}\n"
+    );
+    let redactor = Redactor::from_pairs([]);
+    let mut first = Vec::new();
+
+    assert_eq!(
+        reprocess_jsonl(Cursor::new(input), &mut first, &redactor)?,
+        1
+    );
+    assert_eq!(String::from_utf8(first.clone())?, expected);
+
+    let mut second = Vec::new();
+    assert_eq!(
+        reprocess_jsonl(Cursor::new(first), &mut second, &redactor)?,
+        1
+    );
+    assert_eq!(String::from_utf8(second)?, expected);
+    Ok(())
+}
+
+#[test]
+fn matching_malformed_available_commands_payload_writes_no_bytes() -> Result<(), Box<dyn Error>> {
+    let mut sink = FixtureSink::new(Vec::new(), Redactor::from_pairs([]));
+    let malformed = r#"{"method":"session/update","params":{"update":{"sessionUpdate":"available_commands_update","availableCommands":[],"availableCommands":[]}}}"#;
+
+    let Err(error) = sink.record_at(Duration::ZERO, Direction::S2c, Transport::Stdio, malformed)
+    else {
+        return Err("malformed available_commands_update was recorded".into());
+    };
+
+    assert!(matches!(error, FixtureError::Redaction(_)));
+    assert!(sink.into_inner().is_empty());
+    Ok(())
+}
+
+#[test]
+fn reprocess_jsonl_rejects_an_unknown_fixture_envelope_field() -> Result<(), Box<dyn Error>> {
+    let input = concat!(
+        "{\"ts_ms\":7,\"dir\":\"s2c\",\"transport\":\"stdio\",",
+        "\"host_private\":\"must-not-be-dropped\",\"payload\":{\"ok\":true}}\n"
+    );
+    let mut output = Vec::new();
+
+    let Err(error) = reprocess_jsonl(Cursor::new(input), &mut output, &Redactor::from_pairs([]))
+    else {
+        return Err("unknown fixture envelope field was silently dropped".into());
+    };
+
+    assert!(matches!(
+        error,
+        FixtureReprocessError::LineJson { line: 1, .. }
+    ));
+    assert!(output.is_empty());
     Ok(())
 }
 

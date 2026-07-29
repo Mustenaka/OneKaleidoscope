@@ -32,12 +32,12 @@ jobs:
           package-manager-cache: false
 
       - name: Install pinned upstream CLIs
-        run: npm install --global @openai/codex@0.144.6 opencode-ai@1.18.8
+        run: npm install --global @openai/codex@0.146.0 opencode-ai@1.18.8
 
       - name: Verify upstream CLI versions
         shell: bash
         run: |
-          test "$(codex --version)" = "codex-cli 0.144.6"
+          test "$(codex --version)" = "codex-cli 0.146.0"
           test "$(opencode --version)" = "1.18.8"
 
       - name: Check semantic schema drift

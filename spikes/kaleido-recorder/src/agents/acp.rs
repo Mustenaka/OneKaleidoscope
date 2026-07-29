@@ -17,6 +17,11 @@ use crate::fixture::{Direction, FixtureSink, Transport};
 use crate::platform::{self, ResolvedExecutable};
 use crate::stdio_tee::{StdioError, StdioTee};
 
+#[path = "client_services.rs"]
+mod client_services;
+
+use client_services::{AcpClientServices, ClientMethodOutcome};
+
 pub const CLAUDE_ACP_PACKAGE_NAME: &str = "@agentclientprotocol/claude-agent-acp";
 pub const CLAUDE_ACP_VERSION: &str = "0.63.0";
 pub const CLAUDE_ACP_PACKAGE: &str = "@agentclientprotocol/claude-agent-acp@0.63.0";
@@ -267,6 +272,7 @@ pub struct AcpStateMachine {
     tool_lifecycle_integrity_failed: bool,
     permission_flows: Vec<PermissionFlow>,
     editable_before: Option<Vec<u8>>,
+    client_services: AcpClientServices,
 }
 
 impl AcpStateMachine {
@@ -286,6 +292,7 @@ impl AcpStateMachine {
         let editable_before = (scenario == AcpScenario::FileChange)
             .then(|| fs::read(sandbox.join("editable.txt")).ok())
             .flatten();
+        let client_services = AcpClientServices::new(sandbox.clone(), scenario);
         Self {
             scenario,
             sandbox,
@@ -303,6 +310,7 @@ impl AcpStateMachine {
             tool_lifecycle_integrity_failed: false,
             permission_flows: Vec::new(),
             editable_before,
+            client_services,
         }
     }
 
@@ -348,10 +356,10 @@ impl AcpStateMachine {
                 "protocolVersion": ACP_PROTOCOL_VERSION,
                 "clientCapabilities": {
                     "fs": {
-                        "readTextFile": false,
-                        "writeTextFile": false
+                        "readTextFile": true,
+                        "writeTextFile": true
                     },
-                    "terminal": false
+                    "terminal": true
                 },
                 "clientInfo": {
                     "name": "OneKaleidoscope fixture recorder",
@@ -374,9 +382,19 @@ impl AcpStateMachine {
 
     fn validate_pending_message(&self, message: &Value) -> Result<(), AcpError> {
         self.validate_pending_list_response(message)?;
-        if message.get("method").and_then(Value::as_str) == Some("session/request_permission") {
+        let method = message.get("method").and_then(Value::as_str);
+        if method == Some("session/request_permission") {
             validate_acp_permission_scope(message, &self.sandbox, self.scenario)
                 .map_err(|_| AcpError::UnsafePermissionScope)?;
+        }
+        if method.is_some_and(AcpClientServices::validates) {
+            if !matches!(self.phase, Phase::Prompt { .. }) {
+                return Err(AcpError::InvalidState(
+                    "ACP client method arrived outside a prompt turn",
+                ));
+            }
+            self.client_services
+                .validate_request(message, self.session_id.as_deref())?;
         }
         Ok(())
     }
@@ -406,23 +424,51 @@ impl AcpStateMachine {
             ));
         }
 
-        if let Some(method) = object.get("method").and_then(Value::as_str) {
-            return self.accept_method(message, method);
-        }
-        if object.contains_key("id")
+        let step = if let Some(method) = object.get("method").and_then(Value::as_str) {
+            self.accept_method(message, method)?
+        } else if object.contains_key("id")
             && (object.contains_key("result") || object.contains_key("error"))
         {
-            return self.accept_response(message);
+            self.accept_response(message)?
+        } else {
+            return Err(AcpError::MessageShape(
+                "ACP message is neither a request, response, nor notification",
+            ));
+        };
+        if matches!(step, MachineStep::Complete(_)) {
+            self.client_services.stop_all()?;
         }
-        Err(AcpError::MessageShape(
-            "ACP message is neither a request, response, nor notification",
-        ))
+        Ok(step)
     }
 
     fn accept_method(&mut self, message: &Value, method: &str) -> Result<MachineStep, AcpError> {
         match method {
             "session/update" => self.accept_session_update(message),
             "session/request_permission" => self.accept_permission_request(message),
+            _ if AcpClientServices::validates(method) => {
+                let id = message
+                    .get("id")
+                    .ok_or(AcpError::MessageShape(
+                        "ACP client method request id is missing",
+                    ))?
+                    .clone();
+                let response = match self.client_services.handle(message)? {
+                    ClientMethodOutcome::Success(result) => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": result
+                    }),
+                    ClientMethodOutcome::Failure(error) => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": error.code(),
+                            "message": error.message()
+                        }
+                    }),
+                };
+                Ok(MachineStep::Send(vec![serialize_message(response)?]))
+            }
             _ if message.get("id").is_some() => {
                 let id = message
                     .get("id")
@@ -1625,6 +1671,30 @@ pub enum AcpError {
         "ACP permission request could not be proven safe inside the canonical fixture sandbox"
     )]
     UnsafePermissionScope,
+    #[error("ACP client method could not be proven safe inside the canonical fixture sandbox")]
+    UnsafeClientMethodScope,
+    #[error("ACP client terminal {0} pipe was unavailable")]
+    ClientTerminalPipe(&'static str),
+    #[error("ACP client terminal output was unavailable")]
+    ClientTerminalOutputUnavailable,
+    #[error("ACP client terminal output reader panicked")]
+    ClientTerminalReaderPanicked,
+    #[error(transparent)]
+    ClientTerminalIo(#[from] std::io::Error),
+    #[error(transparent)]
+    ClientTerminalProcess(#[from] platform::ProcessError),
+    #[error("ACP client terminal setup failed ({source}); child cleanup also failed: {cleanup}")]
+    ClientTerminalCleanupAfterError {
+        #[source]
+        source: Box<AcpError>,
+        cleanup: platform::ProcessError,
+    },
+    #[error("ACP protocol attempt failed ({source}); terminal cleanup also failed: {cleanup}")]
+    ClientServiceCleanupAfterError {
+        #[source]
+        source: Box<AcpError>,
+        cleanup: Box<AcpError>,
+    },
     #[error("recording directory must be the dedicated tests/fixtures/sandbox directory")]
     InvalidSandbox,
     #[error("the dedicated fixture sandbox path is not valid UTF-8")]
@@ -1725,7 +1795,23 @@ fn run_state_machine<W: Write>(
             }
         }
     })();
+    let recording = finish_client_services(recording, || machine.client_services.stop_all());
     finish_recording(recording, move || tee.stop())
+}
+
+fn finish_client_services(
+    recording: Result<ScenarioOutcome, AcpError>,
+    cleanup: impl FnOnce() -> Result<(), AcpError>,
+) -> Result<ScenarioOutcome, AcpError> {
+    match (recording, cleanup()) {
+        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Err(source), Err(cleanup)) => Err(AcpError::ClientServiceCleanupAfterError {
+            source: Box::new(source),
+            cleanup: Box::new(cleanup),
+        }),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
 }
 
 fn finish_recording(

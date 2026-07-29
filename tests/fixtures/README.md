@@ -1,4 +1,4 @@
-# T-004：三家 agent 的真实协议录制
+# T-004 / T-006：三家 agent 的真实协议录制
 
 录制日期：2026-07-29。所有录制进程的工作目录都是本目录下的 `sandbox/`
 玩具项目；没有主动在 OneKaleidoscope 仓库根目录或其他真实项目中启动录制。
@@ -6,6 +6,10 @@
 该临时输出只含项目根元数据和固定 seed prompt，不含源码，已立即丢弃。提交的
 OpenCode fixture 是用临时嵌套 toy repository 重新录制的，原始 `directory`、
 `cwd`、`root` 均精确等于 sandbox。
+
+T-006 在同日完成环境修复后的补录尝试，但没有新增达到场景判据的 fixture。
+下文严格区分“已提交的契约 fixture”和“只用于诊断的失败尝试”：后者即使包含
+真实协议事件，也不计入覆盖率，构建目录中的临时日志也不作为契约 fixture。
 
 ## 证据完整性
 
@@ -26,8 +30,10 @@ OpenCode fixture 是用临时嵌套 toy repository 重新录制的，原始 `dir
 - 场景完成判定会检查活动 turn/prompt 的全部 lifecycle，而不只挑一个看起来正确
   的 call：孤儿 update/terminal、冲突 ID、额外 call、范围无法证明的 call 都会让
   整个尝试失败。simple-turn 与 elicitation 也不能夹带工具生命周期。
-- `acp-claude/06-cancel.jsonl:6` 的 `available_commands_update` 是 agent
-  实际发送的完整能力清单。它不含密钥、用户名或真实项目内容，故未删字段。
+- `acp-claude/06-cancel.jsonl:6` 的 `available_commands_update` 原始载荷含
+  负责人本机 58 条 slash command / skill / 插件配置。按 T-006 主管批准的唯一
+  payload 例外，该数组已由同一脱敏链替换成保留原长度的单项摘要；其余字段和
+  cancel 生命周期仍逐字保留。
 - 三家录制入口都会拒绝 sandbox 根本身是 symlink/junction/reparse point；
   OpenCode session-list 的原始响应在确认所有会话目录均为 sandbox 且存在精确
   seed 前只保留在内存，不会把 outside 元数据写进临时 fixture。
@@ -56,19 +62,60 @@ OpenCode fixture 是用临时嵌套 toy repository 重新录制的，原始 `dir
 | JSON 字符串字段 `api_key`、`authorization` 的值 | `<REDACTED_TOKEN>` |
 | 支持的凭据环境变量的非空 Unicode 值：Anthropic/Claude、AWS Bedrock、Azure、Codex/OpenAI、Gemini/Google、GitHub、OpenRouter、OpenCode。长度至少 8 时逐字替换；短值只在它恰好是完整 JSON 字符串值时替换 | `<REDACTED_TOKEN>` |
 | JSON 字符串中出现的沙盒外绝对文件路径；为防止命令串残留上下文，替换整个字符串 token。HTTP envelope 顶层 `path` 是路由而非文件路径，仍会扫描其 query 中的密钥 | `<OUTSIDE_PATH>` |
+| 仅当 method=`session/update` 且 discriminator=`available_commands_update` 时，精确路径 `params.update.availableCommands` 的原始数组 | `[{"name":"<REDACTED_COMMAND>","description":"<REDACTED_COMMAND>","_meta":{"kaleidoRedaction":"available_commands_update","originalCount":N}}]`；`N` 是原数组长度 |
 
 脱敏后再次执行泄漏扫描；命中当前用户名、家目录、密钥前缀、授权头或沙盒外
 绝对路径都会拒绝落盘。用户名只在 JSON 值中检测，键名恰好等于用户名不会误报；
 `sk-` / `ghp_` 需要位于 token 边界，`task-based`、`flask-test` 等普通单词不会
-被修改或误报。
+被修改或误报。对象键属于上游结构，因此用户名同名键保持原样；但键本身若是含
+`/` 或 `\`、且指向沙盒外的路径样式字符串，仍由路径扫描拒绝。
+
+命令清单规则只处理上述精确 ACP discriminator；缺失、非数组或重复的
+`availableCommands` 会在写任何 fixture 字节前失败。既有样本通过同一规则原子
+重处理，不手工改 JSON：
+
+```powershell
+cargo run -p kaleido-recorder -- redact-fixture acp-claude/06-cancel.jsonl
+```
+
+该命令只接受三家目录下九个规范场景文件名，全部记录处理成功后才替换原文件。
+对处理后的文件再次运行是字节幂等的。本次文件由 23,214 bytes 降为
+4,619 bytes（下降约 80.1%），摘要中的 `originalCount` 仍为 58。
 
 ## 精确版本
 
 | 接入 | 实际录制运行时 | 对照 schema |
 |---|---|---|
-| Codex | `@openai/codex@0.144.6`（另用 GUI 内置 `0.146.0-alpha.3.1` 做过同样失败复测，但不拿它冒充基线版本） | `schemas/codex`：`codex-cli 0.144.6` |
+| Codex | `@openai/codex@0.146.0`，原生二进制报告 `codex-cli 0.146.0` | `schemas/codex`：`codex-cli 0.146.0`，275 个原样 JSON |
 | Claude Code / ACP | `@agentclientprotocol/claude-agent-acp@0.63.0`；其 npm 自备原生二进制报告 `2.1.220 (Claude Code)` | `agent-client-protocol-json-schema-v1@1.18.0`，wire v1 |
 | OpenCode | `opencode-ai@1.18.8` | `schemas/opencode/openapi.json`：OpenAPI 3.1.0，CLI `1.18.8` |
+
+### Codex 0.146.0 的 schema 漂移
+
+录制前先对旧的 Codex 0.144.6 snapshot 执行语义 diff。命令精确抓取
+Codex 0.146.0、OpenCode 1.18.8 与 ACP crate 1.3.0 / schema 1.18.0，并报告：
+
+```text
+schema: fetching Codex 0.146.0, OpenCode 1.18.8, ACP crate 1.3.0 / schema 1.18.0
+schema: used a configured ACP snapshot verified against commit 48b2abf1ac750fece26e03e92e773ccbd4754f5d
+xtask: schema drift detected at 2380 path(s)
+```
+
+2,380 条漂移全部属于 `codex/`；OpenCode 与 ACP 没有漂移路径。代表性变化包括
+新增 Apps read/installed 请求、新增音频 content variant、thread `isPinned`、
+`RawResponseCompletedNotification`，以及 `UserInput` 联合类型变化。这不是键顺序
+噪声。随后按任务卡授权执行 schema refresh；`schemas/VERSIONS.md` 与
+`schemas/codex` 当前都已钉到 0.146.0。refresh 后用同一精确工具版本与经 Git
+blob 校验的 ACP commit snapshot 复跑，结果为
+`schema diff: no semantic drift (278 JSON files compared)`。
+
+## 本轮实际 model / provider
+
+| 接入 | 实际证据与结论 |
+|---|---|
+| Codex | 录制器没有在 `thread/start` 中覆盖 model/provider。负责人交互终端已确认 ChatGPT 登录，但本次使用的精确 0.146.0 二进制在录制进程环境中报告 `Not logged in`；同时 WebSocket/HTTPS 连接在任何 agent message 前失败。因此没有证据证明该进程复用了交互登录态，也没有足够 wire 证据给出实际采样模型名。 |
+| Claude ACP | `session/new` 返回的模型配置仍是 `currentValue:"default"`，候选说明把 default 映射为 Sonnet 5，initialize 的 `providers` 为空。由于所有补录 prompt 都没有返回模型事件，不能把说明文字升级为“已观察到某个具体 Claude 模型/provider”。 |
+| OpenCode | 八个最终非 session-load 场景实际选择 `providerID=openai`、`modelID=gpt-5.6`。隔离 XDG 配置是为安全录制而新建的；当前受限进程无法读取负责人终端里已配置的 DeepSeek v4，因此没有复用该真实配置。这是相对任务卡“本轮已改为 DeepSeek v4”的明确偏离，不是把旧的 Gemini 结论延续到本轮。 |
 
 ## 录制沙盒状态
 
@@ -93,6 +140,13 @@ Test-Path tests/fixtures/sandbox/permission-probe.txt
 
 第二条必须输出 `False`。
 
+T-006 最终尝试的清理检查只跟踪 recorder 本次 spawn 的根 PID 及其家族，不再按
+`codex.exe`、`claude.exe` 或 `opencode.exe` 名称扫描全系统进程。最终 Codex、
+ACP 与 OpenCode 尝试结束后均成功回收本次 spawn 的进程家族并恢复原始 sandbox；
+OpenCode 的八个 120 秒最终尝试也都完成服务清理和 restore，没有因机器上其他
+agent GUI/CLI 正在运行而误判失败。恢复后 `editable.txt` 仍为 `ORIGINAL`，
+`permission-probe.txt` 不存在，临时嵌套 `.git` 也不在提交树中。
+
 ## Windows 多源发现
 
 先运行发现命令。它会输出进程自身 `PATH` 的完整值，并按固定优先级逐层列出
@@ -101,7 +155,7 @@ Test-Path tests/fixtures/sandbox/permission-probe.txt
 
 ```powershell
 $repo = (Resolve-Path .).Path
-$codex = (Resolve-Path "$repo\target\npm-cache\_npx\531ac7f50155e193\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe").Path
+$codex = (Resolve-Path "$repo\target\npm-cache-t006\_npx\1c016cf0cb57261d\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe").Path
 $opencode = (Resolve-Path "$repo\target\npm-cache\_npx\78a1f4be48eedf14\node_modules\opencode-windows-x64-baseline\bin\opencode.exe").Path
 $claudeAcp = (Resolve-Path "$repo\target\npm-cache\_npx\3e28e223a0aba92d\node_modules\.bin\claude-agent-acp.cmd").Path
 $bundledClaude = (Resolve-Path "$repo\target\npm-cache\_npx\3e28e223a0aba92d\node_modules\@anthropic-ai\claude-agent-sdk-win32-x64\claude.exe").Path
@@ -112,7 +166,7 @@ cargo run -p kaleido-recorder -- discover --codex $codex --opencode $opencode --
 
 | 目标 | ① 显式配置 | ② 继承 PATH | ③ 持久化 PATH | ④ 已知位置 | ⑤ hostd 自备 |
 |---|---|---|---|---|---|
-| Codex | 精确的 `0.144.6` 原生 exe，可运行并被选中 | 解析到 WindowsApps GUI 内 `codex.exe` | 未解析到可运行 CLI | 找到 GUI/应用数据目录中的原生 exe | 不适用 |
+| Codex | 精确的 `0.146.0` 原生 exe，可运行并被选中 | 解析到 WindowsApps GUI 内 `codex.exe` | 未解析到可运行 CLI | 找到 GUI/应用数据目录中的原生 exe；目录证据本身不等于 CLI 判定 | 不适用 |
 | Claude ACP | 未配置 | 未解析到 launcher | 未解析到 launcher | 找到 Node/npm 安装位置；不据此自动安装 ACP 包 | 已安装的 `claude-agent-acp.cmd`，`0.63.0`，可运行并被选中 |
 | Claude CLI | 未配置 | 未解析到 launcher | 未解析到 launcher | 只有 nvm/npm 安装目录证据，没有可运行候选 | 不适用；ACP 首选路径不依赖此 CLI |
 | OpenCode | 精确的 `1.18.8` 原生 exe，可运行并被选中 | 未解析到 launcher | 未解析到 launcher | 只有 npm/nvm 安装目录证据，没有可运行候选 | 不适用 |
@@ -152,10 +206,10 @@ INFO: Could not find files for the given pattern(s).
 
 | 目标 | 鉴权结论 | 证据 |
 |---|---|---|
-| Codex 0.144.6 | `not-authenticated` | `codex login status` 明确返回未登录 |
+| Codex 0.146.0 | `interactive-auth-confirmed; recorder-process-not-authenticated` | 人类前置检查在负责人的交互终端返回 `Logged in using ChatGPT`，但本次精确二进制在录制进程环境中返回 `Not logged in`；同时 app-server 与 CLI seed 的 OpenAI WebSocket/HTTPS 均不可达。不能把交互登录态外推为本进程已复用 |
 | Claude ACP / npm 自备 Claude | `authenticated` | 自备 `claude auth status --json` 返回 `loggedIn=true` |
 | 用户 Claude CLI | `inconclusive` | 本进程没有可运行候选；不能据此说未安装或未登录 |
-| OpenCode 1.18.8 | `credential-source-observed-not-validated` | 只确认支持的 provider 环境变量存在且非空，不输出其内容；真实 seed 仍因选中的 Google provider 缺少对应 API key 而失败 |
+| OpenCode 1.18.8 | `isolated-provider-observed-network-blocked` | 最终八次补录实际选择 `openai/gpt-5.6`，但当前受限进程无法连接 provider API。负责人交互终端里的 DeepSeek v4 配置无法从该隔离进程读取；不能据此推断负责人未配置或未登录 |
 | Node | `not-applicable` | 运行时前置，没有 agent 登录态 |
 
 Windows 解析按 `PATHEXT` 顺序只尝试允许的 `.cmd` / `.exe` / `.bat`，不会执行 npm
@@ -185,9 +239,10 @@ Node 不是只做“存在性”检查：多源发现选出的 Node 必须先通
 ```powershell
 $repo = (Resolve-Path .).Path
 $cache = "$repo\target\npm-cache"
+$codexCache = "$repo\target\npm-cache-t006"
 $env:PATH = "D:\Program Files\nodejs;" + $env:PATH
 
-npx.cmd --yes --cache $cache "@openai/codex@0.144.6" --version
+npx.cmd --yes --cache $codexCache "@openai/codex@0.146.0" --version
 npx.cmd --yes --cache $cache "@agentclientprotocol/claude-agent-acp@0.63.0" --version
 npx.cmd --yes --ignore-scripts --cache $cache "opencode-ai@1.18.8" --version
 ```
@@ -195,8 +250,8 @@ npx.cmd --yes --ignore-scripts --cache $cache "opencode-ai@1.18.8" --version
 哈希目录由 npm 计算，不是协议版本。用版本输出筛选出本次精确运行时：
 
 ```powershell
-$codex = (Get-ChildItem "$cache\_npx\*\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe" |
-  Where-Object { (& $_.FullName --version) -eq "codex-cli 0.144.6" } |
+$codex = (Get-ChildItem "$codexCache\_npx\*\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe" |
+  Where-Object { (& $_.FullName --version) -eq "codex-cli 0.146.0" } |
   Select-Object -First 1).FullName
 
 $claudeAcp = (Get-ChildItem "$cache\_npx\*\node_modules\.bin\claude-agent-acp.cmd" |
@@ -211,10 +266,10 @@ $opencode = (Get-ChildItem "$cache\_npx\*\node_modules\opencode-windows-x64-base
 为避免 OpenCode 读取真实项目配置，本次把 XDG 状态也隔离在任务构建目录：
 
 ```powershell
-$env:XDG_CONFIG_HOME = "$repo\target\opencode-xdg-t004-final\config"
-$env:XDG_DATA_HOME = "$repo\target\opencode-xdg-t004-final\data"
-$env:XDG_STATE_HOME = "$repo\target\opencode-xdg-t004-final\state"
-$env:XDG_CACHE_HOME = "$repo\target\opencode-xdg-t004-final\cache"
+$env:XDG_CONFIG_HOME = "$repo\target\opencode-xdg-t006\config"
+$env:XDG_DATA_HOME = "$repo\target\opencode-xdg-t006\data"
+$env:XDG_STATE_HOME = "$repo\target\opencode-xdg-t006\state"
+$env:XDG_CACHE_HOME = "$repo\target\opencode-xdg-t006\cache"
 New-Item -ItemType Directory -Force $env:XDG_CONFIG_HOME,$env:XDG_DATA_HOME,$env:XDG_STATE_HOME,$env:XDG_CACHE_HOME | Out-Null
 ```
 
@@ -251,7 +306,7 @@ foreach ($scenario in $scenarios | Where-Object { $_ -ne "session-load" }) {
 git -C tests/fixtures/sandbox init
 try {
   foreach ($scenario in $scenarios) {
-    cargo run -p kaleido-recorder -- opencode $scenario --executable $opencode --timeout-secs 30
+    cargo run -p kaleido-recorder -- opencode $scenario --executable $opencode --timeout-secs 120
   }
 }
 finally {
@@ -280,14 +335,15 @@ $threadId = ($codexSeedEvents |
 if ($codexSeedExit -ne 0 -or [string]::IsNullOrWhiteSpace($threadId)) {
   throw "Codex seed did not complete with a structured thread id"
 }
-cargo run -p kaleido-recorder -- codex session-load --thread-id $threadId --executable $codex --timeout-secs 60
+cargo run -p kaleido-recorder -- codex session-load --thread-id $threadId --executable $codex --timeout-secs 120
 ```
 
-CLI seed 内部先做了 5 次 WebSocket 重试，再 fallback 到 HTTPS 并做 5 次重试，
-最终仍在 `/v1/responses` 断流，本轮没有得到一个成功 seed 的结构化 thread id。
-旧实现随后曾真实执行 `thread/list` 并得到“no matching sandbox thread”；录制器现已
-收紧为必须传入 seed 输出的精确 `--thread-id`，缺失时在发协议报文前失败，不会选
-列表中的第一个旧会话，也没有凭空填写 thread id。
+最终 seed 确实输出了 `thread.started` 和结构化 thread id，但随后先做 5 次
+WebSocket 重试、fallback 到 HTTPS 再做 5 次重试，最终以 `turn.failed`、进程
+exit 1 结束。**有 thread id 但 seed turn 失败仍不是可加载的成功 seed。** 因此
+没有把该 id 传给录制器；随后以空 id 调用 session-load 时，录制器按预期在发
+协议报文前拒绝。旧实现曾用 `thread/list` 猜旧会话，当前实现只接受成功 seed
+输出的精确 `--thread-id`，不会把 `thread.started` 单独偷换成 session-load 成功。
 
 Claude 本次用 npm SDK 自备、已经证明能复用现有用户登录上下文的原生二进制
 建立 seed：
@@ -308,11 +364,9 @@ cargo run -p kaleido-recorder -- acp session-load --session-id $sessionId --bund
 seed 在 120 s 内没有结束，本轮没有得到可传给 `--session-id` 的结构化 id，故
 仍未录到。旧实现随后曾真实执行 ACP `session/list`，但没有返回此 sandbox 的
 会话；录制器现已收紧为没有精确 seed id 就在发协议报文前失败，不会选第一个旧
-session。超时遗留的 `claude.exe` PID 219188
-在当前受限进程中用 `Stop-Process` 与 `taskkill /PID 219188 /T /F` 均得到
-`Access is denied`；需要负责人在自己的 PowerShell 中结束它。本卡的 Windows
-进程终止实现已增加 `taskkill` 启动失败和非零退出时的 `child.kill()` 回退测试，
-但无法越过当前宿主对这个已脱离句柄进程的权限限制。
+session。T-004 曾把一个同名 `claude.exe` 误判为录制残留；负责人核实它其实是
+自己的 Claude Code 会话。T-006 的清理逻辑已改为只检查本次 spawn 的 PID 家族，
+不再要求关闭无关的 Claude GUI/CLI。
 
 OpenCode 的 session-load 使用同一隔离 XDG 状态，并用临时嵌套 toy repository
 约束项目根：
@@ -322,37 +376,64 @@ git -C tests/fixtures/sandbox init
 Push-Location tests/fixtures/sandbox
 & $opencode run --pure --format json --title "KALEIDO SESSION LOAD SEED" '"Reply with exactly KALEIDO SESSION LOAD SEED"'
 Pop-Location
-cargo run -p kaleido-recorder -- opencode session-load --executable $opencode --timeout-secs 30
+cargo run -p kaleido-recorder -- opencode session-load --executable $opencode --timeout-secs 120
 Remove-Item -LiteralPath "$repo\tests\fixtures\sandbox\.git" -Recurse -Force
 ```
 
-seed 因实际选择的 Google provider 缺少
-`GOOGLE_GENERATIVE_AI_API_KEY` 而以 `ProviderAuthError` 退出，但 OpenCode
-确实持久化了这次真实会话。录制器随后依次执行 `GET /session`、
+这份已提交的 T-004 session-load seed 当时因选择 Google provider 且缺少
+对应凭据而以 `ProviderAuthError` 退出，但 OpenCode 确实持久化了这次真实会话。
+录制器随后依次执行 `GET /session`、
 `GET /session/{id}`、`GET /session/{id}/message`，得到提交的
 `opencode/08-session-load.jsonl`。录制器要求会话目录规范化后精确等于
 sandbox 且标题精确等于 `KALEIDO SESSION LOAD SEED`；不会加载列表中任意会话。
+该历史 fixture 的 provider 结论不能外推到 T-006：本轮八个最终补录实际使用的
+是隔离配置中的 `openai/gpt-5.6`。
+
+## ACP initialize 与客户端能力复测
+
+T-006 已把 ACP 客户端能力从旧 fixture 第 1 行真实记录的全 `false` 改为实现
+真实支持的值。最终重试发送的 initialize 请求为：
+
+```json
+{"id":1,"jsonrpc":"2.0","method":"initialize","params":{"clientCapabilities":{"fs":{"readTextFile":true,"writeTextFile":true},"terminal":true},"clientInfo":{"name":"OneKaleidoscope fixture recorder","version":"0.1.0"},"protocolVersion":1}}
+```
+
+对应实现不是只改 capability bit：录制器处理 `fs/read_text_file`、
+`fs/write_text_file`、`terminal/create`、`terminal/output`、
+`terminal/wait_for_exit`、`terminal/kill` 与 `terminal/release`。文件访问必须
+规范化到当前 sandbox；terminal 只接受任务卡允许的确定性 `cargo run` 形式，
+不会借能力声明放宽安全边界。
+
+0.63.0 adapter 接受该 initialize，协议版本仍为 1；其真实能力响应仍包括
+`loadSession:true`、session list/resume/close 等能力，随后 `session/new`
+也成功。补录的 simple-turn、tool-call、permission approve/deny、file-change
+与 error 最终仍都在 `session/prompt` 后 120 秒没有下一条协议消息。由此只能
+得出“全 false capability 不是唯一根因”；不能把 initialize/new 成功或能力
+元数据冒充 tool call、权限请求或模型回复。保留的
+`acp-claude/06-cancel.jsonl` 是 T-004 的真实历史报文，不能为了反映新客户端
+实现而改写其第 1 行。
 
 ## 3 × 9 场景尝试结果
 
-| 场景 | Codex 0.144.6 | Claude ACP 0.63.0 | OpenCode 1.18.8 |
+| 场景 | Codex 0.146.0 | Claude ACP 0.63.0 | OpenCode 1.18.8 |
 |---|---|---|---|
-| 01 simple turn | 未录到：`thread/start`、`turn/start` 后连续 `responseStreamDisconnected`，只有 `userMessage` item，turn=`failed` | 未录到：initialize 与 `session/new` 成功，`session/prompt` 后 120 s 无下一条协议消息 | 未录到：最终重试收到 16 条真实 SSE，只有 busy / assistant metadata / `session.error` / idle，没有文本 delta |
-| 02 tool call | 未录到：同一响应流断开，未出现 command/tool item | 未录到：prompt 后 60 s 超时，未出现 `tool_call` update | 未录到：16 条 SSE 中没有同一 call ID 的 start / progress / terminal |
-| 03 permission approve | 未录到：模型流在发起 server request 前断开 | 未录到：prompt 后超时，没有 `session/request_permission` | 未录到：16 条 SSE 中没有 `permission.asked` / `permission.v2.asked`，故未发送伪批准 |
-| 04 permission deny | 未录到：模型流在发起 server request 前断开 | 未录到：prompt 后超时，没有可拒绝的 permission request | 未录到：16 条 SSE 中没有 permission event，故未发送伪 reject reply |
-| 05 file change | 未录到：没有 file-change item 或 diff update | 未录到：prompt 后超时，没有 tool call | 未录到：16 条 SSE 中没有非空 diff，`editable.txt` 字节也未改变；早期尝试所见空 diff 同样不算成功 |
-| 06 cancel | 未录到：在 commandExecution item 出现前 turn 已失败，录制器拒绝把未发生的取消算成功 | **已录到：`acp-claude/06-cancel.jsonl`**；真实 `session/cancel` 后 stopReason=`cancelled` | 未录到：没有进入可中断的 tool call，未满足 abort request + aborted/idle 组合判据 |
-| 07 error | 未录到：必败命令没有启动，只有上游连接错误 | 未录到：prompt 后超时，没有 failed tool update | 未录到：有 `session.error` 但没有“实际 tool call 失败”生命周期，不把 provider/session 错误偷换成命令错误 |
-| 08 session load | 未录到：CLI seed 的 WebSocket 与 HTTPS 重试均断流，未得到可传入的结构化 thread id；录制器拒绝无 id 加载 | 未录到：自备 Claude seed 120 s 未结束，未得到可传入的结构化 session id；录制器拒绝无 id 加载 | **已录到：`opencode/08-session-load.jsonl`**；真实 CLI seed 虽以 provider auth 错误结束但已持久化，随后由 HTTP 列出、加载会话和消息 |
-| 09 elicitation | 未录到：请求支持 structured elicitation 的 MCP server，但模型流先断开；没有 `mcpServer/elicitation/request` | 未录到：钉定 ACP v1.18 schema 根本没有 elicitation 方法，录制器以 `ElicitationAbsentFromPinnedSchema` 拒绝启动伪场景 | 未录到：明确要求 question tool 询问三选一颜色；16 条 SSE 中没有 `question.asked` / `question.v2.asked` |
+| 01 simple turn | 未录到：真实 app-server 完成 initialize/thread/start/turn/start，但 turn=`failed`；只有 `userMessage` item 和 11 个 error-info 通知，没有 agent text | 未录到：用 `fs.readTextFile=true`、`fs.writeTextFile=true`、`terminal=true` initialize，`session/new` 成功，`session/prompt` 后 120 秒无下一条协议消息 | 未录到：23 个真实事件，只有 session busy 与 assistant metadata；prompt POST 120 秒超时，0 text/reasoning/tool/command 证据 |
+| 02 tool call | 未录到：turn=`failed`，只有 `userMessage`，没有 command/tool item 或 command exit | 未录到：真实能力 initialize/new 成功，prompt 后 120 秒超时，没有 `tool_call` update | 未录到：23 个真实事件，prompt POST 120 秒超时；0 tool/command 证据，故没有同一 call ID 的 start/progress/terminal |
+| 03 permission approve | 未录到：turn 在任何 approval server request 前失败；0 command/tool/approval 证据 | 未录到：真实能力 initialize/new 成功，prompt 后 120 秒超时，没有 `session/request_permission`，未发送伪批准 | 未录到：23 个真实事件，prompt POST 120 秒超时；0 permission/tool/command 证据，未发送伪批准 |
+| 04 permission deny | 未录到：turn 在任何 approval server request 前失败；0 command/tool/approval 证据 | 未录到：真实能力 initialize/new 成功，prompt 后 120 秒超时，没有可拒绝的 permission request | 未录到：23 个真实事件，prompt POST 120 秒超时；0 permission/tool/command 证据，未发送伪 reject |
+| 05 file change | 未录到：turn=`failed`，没有 file-change item、diff update 或磁盘变化 | 未录到：真实能力 initialize/new 成功，prompt 后 120 秒超时，没有 tool call/diff；sandbox 已恢复 | 未录到：23 个真实事件，prompt POST 120 秒超时；0 tool/diff/command 证据，`editable.txt` 未改变且 restore 成功 |
+| 06 cancel | 未录到：turn 在 commandExecution item 出现前失败，录制器明确拒绝把未发生的 cancel 算成功 | **已录到：`acp-claude/06-cancel.jsonl`**；真实 `session/cancel` 后 stopReason=`cancelled` | 未录到：23 个真实事件，prompt POST 120 秒超时；0 tool/command 证据，没有可中断 lifecycle |
+| 07 error | 未录到：必败命令未启动，只有上游连接错误；不把网络错误偷换为命令错误 | 未录到：真实能力 initialize/new 成功，prompt 后 120 秒超时，没有 failed tool update | 未录到：23 个真实事件，prompt POST 120 秒超时；0 tool/command 证据，不把 provider 连接失败偷换为命令错误 |
+| 08 session load | 未录到：seed 输出 `thread.started`，但 turn=`failed` 且 CLI exit 1；失败 seed 的 id 不可用，空 id 被录制器 fail-closed 拒绝 | 未补录：没有新的成功 Claude seed/session id；仍拒绝无精确 id 加载 | **已录到：`opencode/08-session-load.jsonl`**；T-004 真实 CLI seed虽以 provider auth 错误结束但已持久化，随后由 HTTP 列出、加载会话和消息 |
+| 09 elicitation | 未录到：turn=`failed`，没有 `mcpServer/elicitation/request` | 不适用且未伪录：ADR-0007 已确认钉定 ACP v1.18 schema 不含 elicitation 方法 | 未录到：23 个真实事件，prompt POST 120 秒超时；0 question/permission/tool/command 证据 |
 
-OpenCode 八个非 session-load 场景在完成判据与 lifecycle fail-closed 加固后的
-最终重试各收到 16 条真实 SSE。它们证明进程、HTTP 与 SSE 都实际跑通，但隔离
-XDG 状态所选 provider 在工具调用前报
-`session.error`，不满足对应场景完成条件。每次协议结论后，当前受限 Windows
-宿主的 `taskkill` 又以 exit 1 失败；录制器直接杀死并等待根进程后仍不能证明后代
-进程已终止，故返回错误并丢弃临时 transcript，不提交为契约 fixture。
+OpenCode 八个非 session-load 场景的最终重试各收到 23 个真实事件，统一只观察到
+session busy 与 assistant metadata；每个 prompt POST 都在 120 秒超时，并且权限、
+question、tool、diff、command 证据均为 0。这证明进程、HTTP 与 SSE 都实际跑通，
+但不满足任何场景完成条件。八次的本次 spawn 进程家族清理和 sandbox restore
+均成功；失败临时 transcript 仍被丢弃，不能引用为契约 fixture。实际 provider/model
+是隔离配置中的 `openai/gpt-5.6`，不是负责人交互环境中已配置但本进程无法读取的
+DeepSeek v4。
 
 ## Schema 与泄漏校验结果
 
@@ -366,7 +447,8 @@ symlink/junction fixture 都会直接失败，不能借目录位置逃过 schema
 ```
 
 本次没有 schema 校验失败条目；特别是
-`session/update` 的 `available_commands_update` 与 ACP v1.18.0 snapshot 一致。
+`session/update` 的 `available_commands_update` 摘要保留 ACP v1.18.0 要求的
+`name`、`description`，长度证据放入协议保留的 `_meta`，因此仍通过 snapshot。
 校验器同时要求 Codex/ACP request 在文件结束前有同方向 ID 空间中的匹配
 response，并要求 OpenCode HTTP request/response 按 method + path 顺序闭合。
 
@@ -379,12 +461,12 @@ xtask: fixture verification found 1 issue(s):
 ```
 
 随后删除该临时行；修改前后 SHA-256 均为
-`D6FF226CFEDB90DCF29121714BE849D129F4EFD887E3E97726BCED15BA4D13C9`，
+`B187EEAB9CE9D6A9FFE4D08045FD0AC079FDDC33CB93665969706BC14A972188`，
 当前文件已恢复为 8 行。两份当前 fixture 的 SHA-256 为：
 
 ```text
 acp-claude/06-cancel.jsonl
-D6FF226CFEDB90DCF29121714BE849D129F4EFD887E3E97726BCED15BA4D13C9
+B187EEAB9CE9D6A9FFE4D08045FD0AC079FDDC33CB93665969706BC14A972188
 
 opencode/08-session-load.jsonl
 9F823AA5E4177A1B952FC2FB9022F230B0DB00B5A0DA6C9463683F134B8E6F58
@@ -393,22 +475,23 @@ opencode/08-session-load.jsonl
 ## 12 个 UACP 事件变体 × 3 家覆盖
 
 下表只把已提交 fixture 作为“已录到”。失败临时 transcript 即便曾出现某个
-通用生命周期信号，也不进入可复用的契约覆盖。
+通用生命周期信号，也不进入可复用的契约覆盖。当前覆盖仍为 **2/36**，
+其余 **34/36** 均逐格保留未录到原因。
 
 | UACP 变体 | Codex | Claude Code / ACP | OpenCode |
 |---|---|---|---|
-| `MessageChunk` | 未录到（响应流在 agent message 前断开） | 未录到（prompt 后超时） | 未录到（无 text delta） |
-| `ThoughtChunk` | 未录到（无 reasoning item/delta） | 未录到（无 thought chunk） | 未录到（无 reasoning delta） |
-| `ToolCallStart` | 未录到（无 tool item） | 未录到（无 tool-call update） | 未录到（无 tool-called event） |
-| `ToolCallUpdate` | 未录到（无 tool item） | 未录到（无 tool-call update） | 未录到（无 tool-progress event） |
-| `ToolCallEnd` | 未录到（无 tool item） | 未录到（无 tool-call terminal update） | 未录到（无 tool success/failure event） |
-| `PermissionRequest` | 未录到（无 approval server request） | 未录到（无 `session/request_permission`） | 未录到（无 permission asked event） |
-| `Elicitation` | 未录到（上游流先断开） | 未录到（钉定 schema 不含该方法） | 未录到（question tool 未触发） |
-| `PlanUpdate` | 未录到（无 plan update） | 未录到（line 6 是命令能力清单，不是 plan） | 未录到（无 todo/plan 事件） |
-| `DiffProduced` | 未录到（无 diff update） | 未录到（无文件工具调用） | 未录到（只见空 diff） |
+| `MessageChunk` | 未录到（0.146.0 turn 失败，只有 user message） | 未录到（真实能力 initialize 后 prompt 120 秒超时） | 未录到（23 个事件中 0 text evidence） |
+| `ThoughtChunk` | 未录到（0 reasoning item/delta） | 未录到（0 thought chunk） | 未录到（23 个事件中 0 reasoning evidence） |
+| `ToolCallStart` | 未录到（0 command/tool item） | 未录到（0 tool-call update） | 未录到（23 个事件中 0 tool/command evidence） |
+| `ToolCallUpdate` | 未录到（0 command/tool item） | 未录到（0 tool-call update） | 未录到（23 个事件中 0 tool/command evidence） |
+| `ToolCallEnd` | 未录到（0 command/tool item） | 未录到（0 terminal tool-call update） | 未录到（23 个事件中 0 tool/command evidence） |
+| `PermissionRequest` | 未录到（0 approval server request） | 未录到（0 `session/request_permission`） | 未录到（23 个事件中 0 permission evidence） |
+| `Elicitation` | 未录到（0 `mcpServer/elicitation/request`） | 未录到且不适用（ADR-0007：钉定 schema 不含该方法） | 未录到（23 个事件中 0 question evidence） |
+| `PlanUpdate` | 未录到（0 plan update） | 未录到（保留 fixture line 6 是命令能力清单，不是 plan） | 未录到（23 个事件中只有 busy 与 assistant metadata） |
+| `DiffProduced` | 未录到（0 diff update） | 未录到（0 文件工具调用） | 未录到（23 个事件中 0 diff evidence） |
 | `TurnStart` | 未录到（失败 transcript 未提交） | **已录到（`acp-claude/06-cancel.jsonl:5`）** | 未录到（失败 transcript 未提交） |
 | `TurnEnd` | 未录到（失败 transcript 未提交） | **已录到（`acp-claude/06-cancel.jsonl:8`）** | 未录到（失败 transcript 未提交） |
-| `Error` | 未录到（没有目标命令错误） | 未录到（没有 failed tool update） | 未录到（只有 provider/session error，不是目标命令错误） |
+| `Error` | 未录到（只有网络错误，没有目标命令错误） | 未录到（0 failed tool update） | 未录到（0 command evidence；provider 连接失败不是目标命令错误） |
 
 ## Elicitation 触发分析与 schema 摘录
 
@@ -447,8 +530,9 @@ rg -n -i "elicitation/create|elicitation" schemas/acp/schema.json schemas/acp/me
 
 ### OpenCode
 
-尝试方法：让 question tool 向用户询问 Red / Green / Blue 三选一。实际 SSE
-只有 session busy/error/idle 等事件，没有 question event。
+尝试方法：让 question tool 向用户询问 Red / Green / Blue 三选一。T-006 最终
+尝试收到 23 个真实事件，但只观察到 session busy 与 assistant metadata；
+prompt POST 在 120 秒超时，question/permission/tool/diff/command 证据均为 0。
 
 `schemas/opencode/openapi.json` 同时定义旧版与 v2 事件。旧版核心形状为：
 
@@ -468,17 +552,26 @@ rg -n -i "elicitation/create|elicitation" schemas/acp/schema.json schemas/acp/me
 
 v2 的同构事件把枚举改为 `question.v2.asked`，问题数组引用
 `QuestionV2Info`。上游只有在模型真正调用 question tool 时才发该事件；本次
-provider/session 在工具调用前失败。
+隔离配置实际选中 `openai/gpt-5.6`，但 provider API 在受限进程中不可达，
+prompt 没有进入 question tool。
 
 ## 权限审批：实际证据与 schema 预期
 
 ### 实际录制结论（R-8）
 
-三家的 approve / deny 场景都已实际执行，但三家均未产生一次权限请求：
-Codex 在 server request 前断流，Claude ACP 在 prompt 后超时，OpenCode 只有
-session error/idle。**因此本次没有三份可并排比较的“实际权限报文形状”。**
-这意味着 R-8 尚未被 fixture 一手证据缓解；不能把 schema 或录制器测试里的
-合成消息冒充实际差异。
+三家的 approve / deny 场景都已再次实际执行，但三家仍均未产生一次权限请求：
+
+- Codex 0.146.0 完成 initialize/thread/turn 建立后，turn 在任何 command item
+  或 approval server request 前以网络错误失败。
+- Claude ACP 0.63.0 接受声明真实 fs/terminal 能力的 initialize，`session/new`
+  也成功，但两个场景均在 prompt 后 120 秒超时，没有
+  `session/request_permission`。
+- OpenCode 1.18.8 的两个场景各收到 23 个真实事件，只有 session busy 与
+  assistant metadata；prompt POST 120 秒超时，permission/tool/command 证据均为 0。
+
+**因此本次仍没有三份可并排比较的“实际权限报文形状”，R-8 没有被一手
+fixture 缓解，T-006 的核心补录目标也没有完成。** 不能把失败尝试、schema、
+能力元数据或录制器测试里的合成消息冒充实际差异。
 
 `opencode/08-session-load.jsonl:2` 与 `:4` 真实返回了会话持久化的
 `permission` 策略数组，三项分别是 `question`、`plan_enter`、`plan_exit`，
@@ -542,12 +635,15 @@ R-11 的开箱体验问题。`auth status` 本身不能证明凭据字节一定�
 
 ## 已发现的上游/环境问题
 
-1. 精确 Codex 0.144.6 和 GUI 0.146.0-alpha.3.1 都在模型响应阶段断流；
-   app-server 初始化和 thread/turn 生命周期本身可用。
+1. 精确 Codex 0.146.0 在模型响应阶段因当前进程的 socket/HTTP 网络访问被拒而
+   失败；app-server initialize 和 thread/turn 生命周期本身可用。CLI seed
+   虽发出 `thread.started`，但 `turn.failed` 且 exit 1，不能用作 session-load。
 2. OpenCode 全局 CLI 确实安装在 nvm 位置，但本进程对该目录返回
    `PermissionDenied`；任务目录内的精确 1.18.8 原生包可运行。隔离 XDG 状态
-   避免读取真实配置，也意味着本次失败不能推断负责人“未登录”。
-3. ACP schema v1.18.0 没有 elicitation 定义，与 ADR-0004 P-5 的预期不一致。
+   避免读取真实配置，也意味着本次实际落到 `openai/gpt-5.6`，而没有使用负责人
+   交互环境已配置的 DeepSeek v4。这是本轮明确偏离，不能推断负责人“未登录”。
+3. ACP schema v1.18.0 没有 elicitation 定义；ADR-0007 已据此把 ACP elicitation
+   排除出本轮强制补录范围，录制器继续 fail-closed，不发明 wire 方法。
 4. `claude-agent-acp@0.63.0` 当前 package.json 实际声明
    `@agentclientprotocol/sdk: 1.3.0`、`@anthropic-ai/claude-agent-sdk: 0.3.220`；
    ADR-0004 记录的是 `0.25.0` 与 `0.3.169`。本卡未修改 ADR 或 schema。
@@ -559,20 +655,26 @@ R-11 的开箱体验问题。`auth status` 本身不能证明凭据字节一定�
 7. Windows `Path::canonicalize()` 会给 sandbox 产生 `\\?\` verbatim 前缀，
    而 OpenCode HTTP 返回普通盘符路径；脱敏器已覆盖两种等价拼写。修复前新增
    回归测试确实把 `<SANDBOX>` 误成 `<OUTSIDE_PATH>` 并变红，修复后通过。
-8. 一次超时的自备 `claude.exe`（PID 219188）仍在运行；当前受限宿主对
-   `Stop-Process` 与 `taskkill` 都返回 `Access is denied`，需负责人从自己的
-   PowerShell 清理。仓库实现不会因此放宽进程树终止逻辑。
+8. T-004 把一个同名 `claude.exe` 误判为录制残留；负责人确认它是自己的
+   Claude Code 会话，而不是 recorder 子进程。T-006 已改为只检查本次 spawn
+   根 PID 的进程家族，最终尝试清理成功；hostd/recorder 不能按可执行文件名要求
+   用户关闭无关 GUI/CLI。
 9. 本卡已在 Windows 上实测五层发现，并为非 Windows 实现裸可执行名与标准
    用户目录探测；尚未在 macOS / Linux 主机上执行 GUI 安装位置的 G8 冒烟。
    特别是 macOS GUI bundle 的已知位置仍需后续平台任务补充实测，不能从本次
    Windows 结果推断其可用。
-10. 当前 Windows 宿主不允许 `taskkill /T /F` 清理本卡启动的 OpenCode 服务树；
-    最终八次重试都在直接回收根进程后报告“descendant termination is not
-    guaranteed”。在找到可离线引入且安全 API 完整的 Job Object 方案前，动态
-    `npm prefix --global` 探测也保持禁用，避免发现步骤遗留 npm/cmd 子进程。
+10. 早期 ACP 重试暴露了进程家族清理问题；修正后最终 ACP 与 OpenCode 尝试都
+    完成本次 spawn 家族清理和 sandbox restore。动态 `npm prefix --global`
+    探测仍保持禁用，避免发现步骤额外启动 npm/cmd 子进程；已知 npm prefix
+    继续通过确定性默认位置、环境变量和 `.npmrc` 静态读取。
 11. 任务卡写“当前用户名出现即失败”，同时又要求 payload 键原样保留。Linux
     CI 的常见用户名 `root` 会与 OpenCode 真实结构字段名 `root` 冲突：若扫描
     JSON key，则无法既保留真实字段又通过门禁。当前实现因此只对 JSON value 和
     原始文本值扫描用户名，不把同名 key 当作泄漏；用户名、家目录、凭据和路径的
-    值仍严格失败。这是任务卡两条要求的字面歧义，需主管裁决，不能把它描述成
-    完全无偏离。
+    值仍严格失败；路径样式 key 仍检查越界。主管已在 T-006 裁决该行为正确。
+12. 把 ACP client capabilities 从全 `false` 改为真实 fs/terminal 能力并实现
+    对应方法后，0.63.0 仍在 prompt 后 120 秒无消息；能力协商假设不足以解释
+    ACP 整列缺失，仍需在网络/adapter/Claude 调用链继续诊断。
+13. Codex 0.144.6 → 0.146.0 的语义 diff 一次产生 2,380 条 Codex 路径变化，
+    是 R-4 的实际高漂移证据；本轮已 refresh 到 0.146.0，但后续仍必须在升级
+    runtime 前先 diff，不能让新二进制对照旧 snapshot 录制。

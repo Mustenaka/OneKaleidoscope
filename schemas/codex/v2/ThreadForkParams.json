@@ -34,6 +34,16 @@
         "null"
       ]
     },
+    "sandbox": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SandboxMode"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "config": {
       "type": [
         "object",
@@ -42,6 +52,12 @@
       "additionalProperties": true
     },
     "cwd": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "serviceTier": {
       "type": [
         "string",
         "null"
@@ -89,22 +105,6 @@
     },
     "threadId": {
       "type": "string"
-    },
-    "sandbox": {
-      "anyOf": [
-        {
-          "$ref": "#/definitions/SandboxMode"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "serviceTier": {
-      "type": [
-        "string",
-        "null"
-      ]
     }
   },
   "definitions": {

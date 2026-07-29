@@ -7,11 +7,11 @@
     "threadId"
   ],
   "properties": {
-    "summary": {
-      "description": "Override the reasoning summary for this turn and subsequent turns.",
+    "sandboxPolicy": {
+      "description": "Override the sandbox policy for this turn and subsequent turns.",
       "anyOf": [
         {
-          "$ref": "#/definitions/ReasoningSummary"
+          "$ref": "#/definitions/SandboxPolicy"
         },
         {
           "type": "null"
@@ -46,8 +46,12 @@
         "null"
       ]
     },
-    "threadId": {
-      "type": "string"
+    "serviceTier": {
+      "description": "Override the service tier for this turn and subsequent turns.",
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "cwd": {
       "description": "Override the working directory for this turn and subsequent turns.",
@@ -67,11 +71,15 @@
         }
       ]
     },
-    "serviceTier": {
-      "description": "Override the service tier for this turn and subsequent turns.",
-      "type": [
-        "string",
-        "null"
+    "summary": {
+      "description": "Override the reasoning summary for this turn and subsequent turns.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ReasoningSummary"
+        },
+        {
+          "type": "null"
+        }
       ]
     },
     "input": {
@@ -87,16 +95,8 @@
         "null"
       ]
     },
-    "sandboxPolicy": {
-      "description": "Override the sandbox policy for this turn and subsequent turns.",
-      "anyOf": [
-        {
-          "$ref": "#/definitions/SandboxPolicy"
-        },
-        {
-          "type": "null"
-        }
-      ]
+    "threadId": {
+      "type": "string"
     },
     "outputSchema": {
       "description": "Optional JSON Schema used to constrain the final assistant message for this turn."
@@ -480,6 +480,16 @@
         },
         "environmentId": {
           "type": "string"
+        },
+        "runtimeWorkspaceRoots": {
+          "description": "Environment-native runtime workspace roots. Omitted defaults to `cwd`.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/LegacyAppPathString"
+          }
         }
       }
     },
@@ -574,6 +584,46 @@
             }
           },
           "title": "LocalImageUserInput"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "url"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "audio"
+              ],
+              "title": "AudioUserInputType"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "title": "AudioUserInput"
+        },
+        {
+          "type": "object",
+          "required": [
+            "path",
+            "type"
+          ],
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "localAudio"
+              ],
+              "title": "LocalAudioUserInputType"
+            }
+          },
+          "title": "LocalAudioUserInput"
         },
         {
           "type": "object",

@@ -341,7 +341,7 @@ pub trait AgentAdapter: Send + Sync {
 | R-1 | iroh 在运营商级 NAT / 对称 NAT 下打洞失败率高 | 核心体验不可用 | G0 提前验证；保留 L2 relay 与 L3 隧道 |
 | R-2 | **ACP 规范自身处于 v1→v2 过渡**（crate 已发 2.0.0 而协议 v2 仍为 Draft，`session/update` 判别字符串已改名），且 Claude Code 适配器迭代频繁 | UACP 事件语义漂移；adapter 编译失败；Claude Code 功能缺失 | ACP 与适配器双钉定（ADR-0004 P-1/P-2）；UACP 判别值与 ACP 解耦（P-3）；schema 快照 + CI 每日 diff（P-4）；capabilities 优雅降级；预留直连 stream-json 的 plan B |
 | R-3 | iOS/Android 后台被杀导致连接不可靠 | 推送不及时 | 推送为唯一唤醒真源；App 冷启后按 cursor 重放 |
-| R-4 | **【已发生】**上游 schema 无法被指定生成器消化：progenitor 只支持 OpenAPI 3.0.x 而 OpenCode 输出 3.1.0；typify 无法解析 Codex schema 的嵌套 `definitions`。此外仍存在 Codex / OpenCode 协议 breaking change 的持续风险 | 自动生成链在写第一行 adapter 前即断裂；adapter 编译失败 | 引入受纪律约束的**规范化层**（[ADR-0005](adr/0005-schema-normalization-layer.md)）；生成器选型改为以证据决定（T-005）；`schemas/` 原样快照 + 每日语义 diff 监控漂移（T-003） |
+| R-4 | **【已发生，且变更速率极高】**T-006 实测 Codex `0.144.6 → 0.146.0` 一次小版本升级产生 **2380 处语义漂移**（added=548 / changed=1598 / removed=234）。此外上游 schema 无法被指定生成器消化：progenitor 只支持 OpenAPI 3.0.x 而 OpenCode 输出 3.1.0；typify 无法解析 Codex schema 的嵌套 `definitions`。此外仍存在 Codex / OpenCode 协议 breaking change 的持续风险 | 自动生成链在写第一行 adapter 前即断裂；adapter 编译失败 | 引入受纪律约束的**规范化层**（[ADR-0005](adr/0005-schema-normalization-layer.md)）；生成器选型改为以证据决定（T-005）；`schemas/` 原样快照 + 每日语义 diff 监控漂移（T-003） |
 | R-5 | UniFFI 类型表达能力受限（泛型、async 流） | 核心 API 被迫妥协 | 在 G1 阶段就用真实类型验证绑定生成，不要等到 G4 |
 | R-6 | Windows 上 npx/Node 子进程管理坑多 | Claude Code adapter 不稳 | Windows 作为首要测试平台；显式处理 `.cmd` 与进程树终止 |
 | R-7 | 需求被 AI 实现方悄悄偏离 | 交付物不符预期 | 门禁 + 契约测试 + 主管审核；`kaleido-proto` 为不可擅改的合同 |
@@ -349,6 +349,7 @@ pub trait AgentAdapter: Send + Sync {
 | R-9 | hostd 与用户的 CLI/GUI 并发读写同一份会话存储（`~/.claude/projects`、Codex thread 目录） | 会话损坏或事件错乱 | v1 内加载即独占，UI 明示「已被手机接管」；G2 必须实测并把实际行为记入 `docs/gates/G2-result.md`，不许假设安全（ADR-0003） |
 | R-10 | `loadSession` / `sessionCapabilities` 是能力位而非保证，适配器升级可能撤销 | 会话列表功能突然消失 | 握手时检查能力位，为 false 时降级为「只能新建」并在 UI 明示原因；禁止崩溃或静默隐藏（ADR-0003） |
 | R-11 | GUI 写入的登录态能否被 npm 自备的 Claude Code 二进制复用，尚未实测 | 若不能复用，Claude Code 路径需要用户额外登录一次，影响 OBJ-1 的开箱体验 | T-004 必须实测并给出结论；不能复用时在 UI 明示并给出可操作指引（ADR-0006） |
+| R-13 | **【已发生】**同一个 agent 在一台机器上存在**多个二进制实例**（Store/GUI 版、npm CLI 版、npx 临时版），**各自持有独立的登录态**。T-006 实测：`where.exe codex` 命中 Store GUI 版并返回 `Not logged in`，而用户终端里的 CLI 版返回 `Logged in using ChatGPT` | hostd 找到了 agent 却用不了；用户看到「已登录」但 hostd 报未登录，无法自查 | 发现结果必须**按候选逐个报告登录态**，优先选择已认证的候选；UI 呈现「选中了哪一个二进制、它的登录态如何」，并允许用户显式指定（[ADR-0006](adr/0006-agent-discovery.md) 优先级①） |
 | R-12 | **【已发生】**hostd 以托盘 / LaunchAgent / systemd user unit 启动时**不执行用户的 shell profile**，拿不到 conda / nvm / profile 注入的 PATH。用户在终端里跑得好好的 agent，hostd 找不到 | 三家 agent 全部「未安装」，OBJ-1 直接失效 | 多源发现：显式配置 → 继承 PATH → 平台持久化环境变量 → 已知安装位置 → hostd 自备；失败时报告「在 5 处分别看到什么」而非「未安装」（[ADR-0006](adr/0006-agent-discovery.md) D-8） |
 
 ---

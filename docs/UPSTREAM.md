@@ -8,7 +8,7 @@ Generated or normalized schema must never be written back into this directory.
 
 | Upstream | Tool or artifact version | Snapshot |
 |---|---|---|
-| Codex app-server | `codex-cli 0.144.6` / `@openai/codex@0.144.6` | `schemas/codex/` |
+| Codex app-server | `codex-cli 0.146.0` / `@openai/codex@0.146.0` | `schemas/codex/` |
 | OpenCode | `opencode 1.18.8` / `opencode-ai@1.18.8` | `schemas/opencode/openapi.json` |
 | Agent Client Protocol | crate `1.3.0`, wire v1, schema artifact `1.18.0` | `schemas/acp/` |
 
@@ -62,3 +62,24 @@ implementation and generator selection belong to T-005.
 installs the exact Codex and OpenCode versions above, verifies their reported
 versions, and invokes only `cargo xtask schema diff`. The repository currently
 has no configured remote, so this workflow has not yet run on GitHub Actions.
+
+## Temporary offline Rust vendoring
+
+The T-004 recorder needed the following crates in a network-restricted build
+environment where Cargo could not download them from crates.io:
+
+| Crate | Exact version | Reason for vendoring |
+|---|---:|---|
+| `directories` | `6.0.0` | Required for platform-correct user directories and unavailable from crates.io in the offline environment |
+| `dirs-sys` | `0.5.0` | Transitive platform implementation required by `directories 6.0.0` |
+| `option-ext` | `0.2.0` | Transitive dependency required by `dirs-sys 0.5.0` |
+
+The root `[patch.crates-io]` table redirects the entire workspace to the
+unmodified sources under `vendor/`. This is an offline build accommodation,
+not a permanent upstream selection.
+
+**Removal condition:** after the build environment regains network access,
+delete the root `[patch.crates-io]` table and the entire `vendor/` directory,
+then confirm that `cargo build --locked` succeeds using the registry-resolved
+dependencies. Remove both overrides in the same reviewed change so the
+workspace cannot retain one half of the temporary configuration.

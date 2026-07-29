@@ -114,7 +114,7 @@ fn missing_upstream_tool_exits_two_for_diff_and_refresh() {
         assert_eq!(output.status.code(), Some(2));
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("required tool `codex` is unavailable"));
-        assert!(stderr.contains("@openai/codex@0.144.6"));
+        assert!(stderr.contains("@openai/codex@0.146.0"));
         assert_eq!(
             read_tree(&schemas),
             before,

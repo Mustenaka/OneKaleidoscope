@@ -5,7 +5,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::net::TcpListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -14,25 +14,31 @@ use chrono::{SecondsFormat, Utc};
 use reqwest::blocking::Client;
 use reqwest::header::ACCEPT;
 use serde_json::Value;
+use sha1_smol::Sha1;
 use tempfile::{Builder as TempDirBuilder, TempDir};
 use thiserror::Error;
 
-pub const CODEX_VERSION: &str = "0.144.6";
+pub const CODEX_VERSION: &str = "0.146.0";
 pub const OPENCODE_VERSION: &str = "1.18.8";
 pub const ACP_CRATE_VERSION: &str = "1.3.0";
 pub const ACP_SCHEMA_VERSION: &str = "1.18.0";
 pub const ACP_COMMIT: &str = "48b2abf1ac750fece26e03e92e773ccbd4754f5d";
 
-const CODEX_VERSION_OUTPUT: &str = "codex-cli 0.144.6";
+const CODEX_VERSION_OUTPUT: &str = "codex-cli 0.146.0";
 const OPENCODE_VERSION_OUTPUT: &str = "1.18.8";
+const CODEX_EXECUTABLE_ENVIRONMENT: &str = "KALEIDO_CODEX_EXECUTABLE";
+const OPENCODE_EXECUTABLE_ENVIRONMENT: &str = "KALEIDO_OPENCODE_EXECUTABLE";
+const ACP_SNAPSHOT_ENVIRONMENT: &str = "KALEIDO_ACP_SNAPSHOT_DIRECTORY";
 const ACP_REPOSITORY: &str = "https://github.com/agentclientprotocol/agent-client-protocol.git";
 const ACP_SCHEMA_URL: &str = "https://raw.githubusercontent.com/agentclientprotocol/agent-client-protocol/48b2abf1ac750fece26e03e92e773ccbd4754f5d/schema/v1/schema.json";
 const ACP_META_URL: &str = "https://raw.githubusercontent.com/agentclientprotocol/agent-client-protocol/48b2abf1ac750fece26e03e92e773ccbd4754f5d/schema/v1/meta.json";
+const ACP_SCHEMA_BLOB: &str = "0a830142717b69fbd1da2e67b5540636fc6e51dc";
+const ACP_META_BLOB: &str = "670d27876133a37cc1cc476c1ea685351422e07f";
 
 #[cfg(windows)]
-const CODEX_INSTALL_COMMAND: &str = "npm.cmd install --global @openai/codex@0.144.6";
+const CODEX_INSTALL_COMMAND: &str = "npm.cmd install --global @openai/codex@0.146.0";
 #[cfg(not(windows))]
-const CODEX_INSTALL_COMMAND: &str = "npm install --global @openai/codex@0.144.6";
+const CODEX_INSTALL_COMMAND: &str = "npm install --global @openai/codex@0.146.0";
 #[cfg(windows)]
 const OPENCODE_INSTALL_COMMAND: &str = "npm.cmd install --global opencode-ai@1.18.8";
 #[cfg(not(windows))]
@@ -46,6 +52,11 @@ pub enum SchemaCommand {
 
 #[derive(Debug, Error)]
 pub enum SchemaError {
+    #[error("configured tool `{tool}` in `{variable}` must be an absolute path")]
+    ToolConfiguration {
+        tool: &'static str,
+        variable: &'static str,
+    },
     #[error("required tool `{tool}` is unavailable ({detail}); install exactly with: {install}")]
     ToolUnavailable {
         tool: &'static str,
@@ -82,6 +93,14 @@ pub enum SchemaError {
     },
     #[error("invalid schema snapshot: {0}")]
     InvalidSnapshot(String),
+    #[error(
+        "configured ACP snapshot file `{file}` has Git blob {actual}, expected {expected} from commit {ACP_COMMIT}"
+    )]
+    SnapshotDigest {
+        file: &'static str,
+        expected: &'static str,
+        actual: String,
+    },
     #[error("OpenCode schema server failure: {0}")]
     Server(String),
     #[error("schema drift detected at {} path(s)", .0.len())]
@@ -91,7 +110,9 @@ pub enum SchemaError {
 impl SchemaError {
     pub const fn exit_code(&self) -> u8 {
         match self {
-            Self::ToolUnavailable { .. } | Self::ToolVersion { .. } => 2,
+            Self::ToolConfiguration { .. }
+            | Self::ToolUnavailable { .. }
+            | Self::ToolVersion { .. } => 2,
             Self::Drift(_) => 1,
             _ => 3,
         }
@@ -244,14 +265,28 @@ fn verify_tool(
     expected: &'static str,
     install: &'static str,
 ) -> Result<String, SchemaError> {
-    let output = child_command(tool_executable(tool))
-        .arg("--version")
-        .output()
-        .map_err(|error| SchemaError::ToolUnavailable {
-            tool,
-            detail: error.to_string(),
-            install,
-        })?;
+    let isolated_state = if tool == "opencode" {
+        Some(
+            TempDirBuilder::new()
+                .prefix("opencode-version-")
+                .tempdir()?,
+        )
+    } else {
+        None
+    };
+    let mut command = child_command(tool_executable(tool)?);
+    if let Some(state) = &isolated_state {
+        configure_opencode_environment(&mut command, state.path())?;
+    }
+    let output =
+        command
+            .arg("--version")
+            .output()
+            .map_err(|error| SchemaError::ToolUnavailable {
+                tool,
+                detail: error.to_string(),
+                install,
+            })?;
 
     if !output.status.success() {
         return Err(SchemaError::ToolUnavailable {
@@ -300,7 +335,7 @@ fn fetch_all(
 
 fn fetch_codex(workspace_root: &Path, schemas_root: &Path) -> Result<usize, SchemaError> {
     let codex_dir = schemas_root.join("codex");
-    let status = child_command(tool_executable("codex"))
+    let status = child_command(tool_executable("codex")?)
         .args(["app-server", "generate-json-schema", "--out"])
         .arg(&codex_dir)
         .current_dir(workspace_root)
@@ -328,7 +363,8 @@ fn fetch_opencode(schemas_root: &Path) -> Result<usize, SchemaError> {
 
     let run_dir = TempDirBuilder::new().prefix("opencode-schema-").tempdir()?;
     let port_string = port.to_string();
-    let mut server_command = child_command(tool_executable("opencode"));
+    let mut server_command = child_command(tool_executable("opencode")?);
+    configure_opencode_environment(&mut server_command, run_dir.path())?;
     server_command
         .args([
             "serve",
@@ -437,19 +473,37 @@ fn fetch_opencode(schemas_root: &Path) -> Result<usize, SchemaError> {
     validate_json_tree(&opencode_dir)
 }
 
+fn configure_opencode_environment(command: &mut Command, root: &Path) -> io::Result<()> {
+    for (variable, directory) in [
+        ("XDG_CONFIG_HOME", root.join("config")),
+        ("XDG_DATA_HOME", root.join("data")),
+        ("XDG_STATE_HOME", root.join("state")),
+        ("XDG_CACHE_HOME", root.join("cache")),
+    ] {
+        fs::create_dir_all(&directory)?;
+        command.env(variable, directory);
+    }
+    Ok(())
+}
+
 fn fetch_acp(schemas_root: &Path) -> Result<usize, SchemaError> {
-    let client = Client::builder()
-        .timeout(Duration::from_secs(30))
-        .user_agent("OneKaleidoscope-schema-snapshot/0.1")
-        .build()
-        .map_err(|source| SchemaError::Http {
-            url: ACP_REPOSITORY.to_owned(),
-            source,
-        })?;
     let acp_dir = schemas_root.join("acp");
     fs::create_dir_all(&acp_dir)?;
-    download(&client, ACP_SCHEMA_URL, &acp_dir.join("schema.json"))?;
-    download(&client, ACP_META_URL, &acp_dir.join("meta.json"))?;
+    if let Some(source) = configured_acp_snapshot()? {
+        copy_verified_acp_snapshot(&source, &acp_dir)?;
+        println!("schema: used a configured ACP snapshot verified against commit {ACP_COMMIT}");
+    } else {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .user_agent("OneKaleidoscope-schema-snapshot/0.1")
+            .build()
+            .map_err(|source| SchemaError::Http {
+                url: ACP_REPOSITORY.to_owned(),
+                source,
+            })?;
+        download(&client, ACP_SCHEMA_URL, &acp_dir.join("schema.json"))?;
+        download(&client, ACP_META_URL, &acp_dir.join("meta.json"))?;
+    }
 
     let meta_path = acp_dir.join("meta.json");
     let meta = read_json(&meta_path)?;
@@ -459,6 +513,56 @@ fn fetch_acp(schemas_root: &Path) -> Result<usize, SchemaError> {
         ));
     }
     validate_json_tree(&acp_dir)
+}
+
+fn configured_acp_snapshot() -> Result<Option<PathBuf>, SchemaError> {
+    configured_acp_snapshot_with_lookup(|name| env::var_os(name))
+}
+
+fn configured_acp_snapshot_with_lookup(
+    mut lookup: impl FnMut(&str) -> Option<OsString>,
+) -> Result<Option<PathBuf>, SchemaError> {
+    let Some(configured) = lookup(ACP_SNAPSHOT_ENVIRONMENT) else {
+        return Ok(None);
+    };
+    if configured.is_empty() {
+        return Ok(None);
+    }
+    let path = PathBuf::from(configured);
+    if !path.is_absolute() {
+        return Err(SchemaError::ToolConfiguration {
+            tool: "ACP schema snapshot",
+            variable: ACP_SNAPSHOT_ENVIRONMENT,
+        });
+    }
+    Ok(Some(path))
+}
+
+fn copy_verified_acp_snapshot(source: &Path, destination: &Path) -> Result<(), SchemaError> {
+    for (file, expected) in [
+        ("schema.json", ACP_SCHEMA_BLOB),
+        ("meta.json", ACP_META_BLOB),
+    ] {
+        let bytes = fs::read(source.join(file))?;
+        let actual = git_blob_digest(&bytes);
+        if actual != expected {
+            return Err(SchemaError::SnapshotDigest {
+                file,
+                expected,
+                actual,
+            });
+        }
+        fs::write(destination.join(file), bytes)?;
+    }
+    Ok(())
+}
+
+fn git_blob_digest(bytes: &[u8]) -> String {
+    let header = format!("blob {}\0", bytes.len());
+    let mut digest = Sha1::new();
+    digest.update(header.as_bytes());
+    digest.update(bytes);
+    digest.digest().to_string()
 }
 
 fn download(client: &Client, url: &str, output: &Path) -> Result<(), SchemaError> {
@@ -795,7 +899,35 @@ fn display_path(path: &Path) -> String {
     }
 }
 
-fn tool_executable(tool: &str) -> OsString {
+fn tool_executable(tool: &'static str) -> Result<OsString, SchemaError> {
+    tool_executable_with_lookup(tool, |name| env::var_os(name))
+}
+
+fn tool_executable_with_lookup(
+    tool: &'static str,
+    mut lookup: impl FnMut(&str) -> Option<OsString>,
+) -> Result<OsString, SchemaError> {
+    let variable = match tool {
+        "codex" => Some(CODEX_EXECUTABLE_ENVIRONMENT),
+        "opencode" => Some(OPENCODE_EXECUTABLE_ENVIRONMENT),
+        _ => None,
+    };
+    if let Some((variable, configured)) =
+        variable.and_then(|name| lookup(name).map(|value| (name, value)))
+    {
+        if configured.is_empty() {
+            return Ok(default_tool_executable(tool));
+        }
+        let path = PathBuf::from(configured);
+        if !path.is_absolute() {
+            return Err(SchemaError::ToolConfiguration { tool, variable });
+        }
+        return Ok(path.into_os_string());
+    }
+    Ok(default_tool_executable(tool))
+}
+
+fn default_tool_executable(tool: &str) -> OsString {
     #[cfg(windows)]
     {
         OsString::from(format!("{tool}.cmd"))
@@ -816,6 +948,194 @@ fn child_command(program: impl AsRef<OsStr>) -> Command {
         command.creation_flags(CREATE_NO_WINDOW);
     }
     command
+}
+
+#[cfg(test)]
+mod executable_tests {
+    use super::*;
+
+    fn synthetic_exit_status(code: u32) -> ExitStatus {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+
+            ExitStatus::from_raw(code)
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::process::ExitStatusExt;
+
+            ExitStatus::from_raw(i32::try_from(code).unwrap_or(i32::MAX) << 8)
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn failed_tree_signal_cannot_be_hidden_by_root_exit() {
+        let tree_signal = Ok(synthetic_exit_status(5));
+        let root_exit = synthetic_exit_status(0);
+
+        assert!(!cleanup_is_proven(&tree_signal, Some(&root_exit)));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn successful_tree_signal_still_requires_bounded_root_exit() {
+        let tree_signal = Ok(synthetic_exit_status(0));
+
+        assert!(!cleanup_is_proven(&tree_signal, None));
+    }
+
+    #[test]
+    fn root_exit_before_cleanup_is_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let root_exit = synthetic_exit_status(0);
+
+        let Err(error) = require_running_root_for_cleanup(42, Some(&root_exit)) else {
+            return Err("an already-exited root unexpectedly proved descendant cleanup".into());
+        };
+
+        assert!(error
+            .to_string()
+            .contains("descendant cleanup cannot be proven"));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn spawned_family_uses_only_numeric_parentage() {
+        let family = SpawnedProcessFamily::capture(
+            100,
+            &[
+                ProcessEntry {
+                    pid: 100,
+                    parent_pid: 10,
+                },
+                ProcessEntry {
+                    pid: 101,
+                    parent_pid: 100,
+                },
+                ProcessEntry {
+                    pid: 102,
+                    parent_pid: 101,
+                },
+                ProcessEntry {
+                    pid: 219_188,
+                    parent_pid: 10,
+                },
+            ],
+        );
+
+        assert_eq!(family.members, BTreeSet::from([100_u32, 101_u32, 102_u32]));
+        assert!(!family.members.contains(&219_188));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_taskkill_falls_back_to_the_exact_root_handle(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        struct Root {
+            killed: bool,
+        }
+
+        impl RootTerminationTarget for Root {
+            fn process_id(&self) -> u32 {
+                100
+            }
+
+            fn try_wait_now(&mut self) -> io::Result<Option<ExitStatus>> {
+                Ok(None)
+            }
+
+            fn wait_for_exit(&mut self, _timeout: Duration) -> io::Result<Option<ExitStatus>> {
+                Ok(self.killed.then(|| synthetic_exit_status(1)))
+            }
+
+            fn kill_direct(&mut self) -> io::Result<()> {
+                self.killed = true;
+                Ok(())
+            }
+        }
+
+        let mut root = Root { killed: false };
+        let status = terminate_root_with(&mut root, |_| Ok(synthetic_exit_status(1)))?;
+
+        assert!(root.killed);
+        assert_eq!(status.code(), Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_schema_tool_path_has_priority() {
+        #[cfg(windows)]
+        let configured = PathBuf::from(r"C:\tools\codex.exe");
+        #[cfg(not(windows))]
+        let configured = PathBuf::from("/tools/codex");
+
+        let resolved = tool_executable_with_lookup("codex", |name| {
+            (name == CODEX_EXECUTABLE_ENVIRONMENT).then(|| configured.clone().into_os_string())
+        });
+
+        assert_eq!(resolved.ok(), Some(configured.into_os_string()));
+    }
+
+    #[test]
+    fn relative_explicit_schema_tool_path_is_rejected() {
+        let result = tool_executable_with_lookup("opencode", |name| {
+            (name == OPENCODE_EXECUTABLE_ENVIRONMENT).then(|| OsString::from("relative/opencode"))
+        });
+
+        assert!(matches!(
+            result,
+            Err(SchemaError::ToolConfiguration {
+                tool: "opencode",
+                variable: OPENCODE_EXECUTABLE_ENVIRONMENT,
+            })
+        ));
+    }
+
+    #[test]
+    fn relative_explicit_acp_snapshot_path_is_rejected() {
+        let result = configured_acp_snapshot_with_lookup(|name| {
+            (name == ACP_SNAPSHOT_ENVIRONMENT).then(|| OsString::from("relative/acp"))
+        });
+
+        assert!(matches!(
+            result,
+            Err(SchemaError::ToolConfiguration {
+                tool: "ACP schema snapshot",
+                variable: ACP_SNAPSHOT_ENVIRONMENT,
+            })
+        ));
+    }
+
+    #[test]
+    fn git_blob_digest_includes_the_git_header() {
+        assert_eq!(
+            git_blob_digest(b"hello\n"),
+            "ce013625030ba8dba906f756967f9e9ca394464a"
+        );
+    }
+
+    #[test]
+    fn configured_acp_snapshot_rejects_content_from_another_commit(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let source = tempfile::tempdir()?;
+        let destination = tempfile::tempdir()?;
+        fs::write(source.path().join("schema.json"), b"{}\n")?;
+
+        let result = copy_verified_acp_snapshot(source.path(), destination.path());
+
+        assert!(matches!(
+            result,
+            Err(SchemaError::SnapshotDigest {
+                file: "schema.json",
+                expected: ACP_SCHEMA_BLOB,
+                ..
+            })
+        ));
+        assert!(!destination.path().join("schema.json").exists());
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -855,53 +1175,553 @@ impl Drop for ChildGuard {
 }
 
 #[cfg(windows)]
-fn terminate_process_tree(child: &mut Child) -> io::Result<()> {
-    if child.try_wait()?.is_some() {
-        return Ok(());
+const PROCESS_FAMILY_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(windows)]
+const DESCENDANT_FORCE_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProcessEntry {
+    pid: u32,
+    parent_pid: u32,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SpawnedProcessFamily {
+    root_pid: u32,
+    members: BTreeSet<u32>,
+}
+
+#[cfg(windows)]
+impl SpawnedProcessFamily {
+    fn capture(root_pid: u32, snapshot: &[ProcessEntry]) -> Self {
+        let mut members = BTreeSet::from([root_pid]);
+        loop {
+            let before = members.len();
+            for process in snapshot {
+                if members.contains(&process.parent_pid) {
+                    members.insert(process.pid);
+                }
+            }
+            if members.len() == before {
+                break;
+            }
+        }
+        Self { root_pid, members }
     }
 
-    let status = child_command("taskkill")
-        .args(["/PID", &child.id().to_string(), "/T", "/F"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    let waited = child.wait()?;
-    if status.success() || waited.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "taskkill failed with {status}; child exited with {waited}"
-        )))
+    fn descendant_pids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.members
+            .iter()
+            .copied()
+            .filter(|process_id| *process_id != self.root_pid)
+    }
+
+    fn remaining<'a>(&self, snapshot: &'a [ProcessEntry]) -> Vec<&'a ProcessEntry> {
+        snapshot
+            .iter()
+            .filter(|process| self.members.contains(&process.pid))
+            .collect()
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_spawned_process_family_exit(
+    family: &SpawnedProcessFamily,
+    timeout: Duration,
+    mut snapshot: impl FnMut() -> io::Result<Vec<ProcessEntry>>,
+) -> io::Result<()> {
+    let started = Instant::now();
+    loop {
+        let current = snapshot().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "could not verify cleanup of spawned root PID {}: {error}",
+                    family.root_pid
+                ),
+            )
+        })?;
+        let remaining = family.remaining(&current);
+        if remaining.is_empty() {
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "{} member(s) of spawned root PID {} family remained after cleanup",
+                    remaining.len(),
+                    family.root_pid
+                ),
+            ));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+// Toolhelp32 enumerates only numeric PID/PPID relationships. It never reads or compares
+// executable names, so an unrelated user process cannot become part of the spawned family merely
+// because it has the same executable name.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod process_snapshot_ffi {
+    use std::ffi::c_void;
+    use std::io;
+    use std::mem;
+
+    use super::ProcessEntry;
+
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+    const ERROR_NO_MORE_FILES: i32 = 18;
+    const MAX_PATH: usize = 260;
+    const INVALID_HANDLE_VALUE: *mut c_void = -1_isize as *mut c_void;
+
+    #[repr(C)]
+    struct ProcessEntry32W {
+        size: u32,
+        usage: u32,
+        process_id: u32,
+        default_heap_id: usize,
+        module_id: u32,
+        thread_count: u32,
+        parent_process_id: u32,
+        base_priority: i32,
+        flags: u32,
+        executable_file: [u16; MAX_PATH],
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> *mut c_void;
+        fn Process32FirstW(snapshot: *mut c_void, entry: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(snapshot: *mut c_void, entry: *mut ProcessEntry32W) -> i32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+
+    struct SnapshotHandle(*mut c_void);
+
+    impl Drop for SnapshotHandle {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is a live snapshot handle returned by
+            // `CreateToolhelp32Snapshot`; this owner closes it exactly once.
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    pub(super) fn snapshot_processes() -> io::Result<Vec<ProcessEntry>> {
+        // SAFETY: The flags request a system process snapshot and the PID argument is required to
+        // be zero for this snapshot kind. No borrowed pointers are passed.
+        let raw_snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if raw_snapshot == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let snapshot = SnapshotHandle(raw_snapshot);
+        let mut raw_entry = ProcessEntry32W {
+            size: mem::size_of::<ProcessEntry32W>() as u32,
+            usage: 0,
+            process_id: 0,
+            default_heap_id: 0,
+            module_id: 0,
+            thread_count: 0,
+            parent_process_id: 0,
+            base_priority: 0,
+            flags: 0,
+            executable_file: [0; MAX_PATH],
+        };
+        // SAFETY: `snapshot.0` remains live for this call and `raw_entry` points to a writable,
+        // correctly sized `ProcessEntry32W`.
+        if unsafe { Process32FirstW(snapshot.0, &mut raw_entry) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut processes = Vec::new();
+        loop {
+            processes.push(ProcessEntry {
+                pid: raw_entry.process_id,
+                parent_pid: raw_entry.parent_process_id,
+            });
+            // SAFETY: The same live snapshot and valid writable entry are retained for the
+            // complete enumeration.
+            if unsafe { Process32NextW(snapshot.0, &mut raw_entry) } != 0 {
+                continue;
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_NO_MORE_FILES) {
+                break;
+            }
+            return Err(error);
+        }
+        Ok(processes)
+    }
+}
+
+// Holding exact process handles prevents PID reuse from redirecting cleanup to an unrelated
+// process while the spawned family is being terminated and verified.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod process_handle_ffi {
+    use std::ffi::c_void;
+    use std::io;
+    use std::ptr;
+    use std::time::{Duration, Instant};
+
+    const PROCESS_TERMINATE: u32 = 0x0000_0001;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const WAIT_OBJECT_0: u32 = 0x0000_0000;
+    const WAIT_TIMEOUT: u32 = 0x0000_0102;
+    const WAIT_FAILED: u32 = 0xffff_ffff;
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
+        fn TerminateProcess(process: *mut c_void, exit_code: u32) -> i32;
+        fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+
+    #[derive(Debug)]
+    struct OwnedProcessHandle {
+        raw: *mut c_void,
+    }
+
+    impl OwnedProcessHandle {
+        fn open(process_id: u32) -> io::Result<Option<Self>> {
+            // SAFETY: OpenProcess receives a PID captured from Toolhelp32 and no inherited handle.
+            // A non-null result is owned by this value and closed exactly once in Drop.
+            let raw = unsafe { OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, 0, process_id) };
+            if raw.is_null() {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
+                    return Ok(None);
+                }
+                return Err(error);
+            }
+            Ok(Some(Self { raw }))
+        }
+
+        fn is_exited(&self) -> io::Result<bool> {
+            // SAFETY: `self.raw` remains a valid owned process handle until Drop.
+            match unsafe { WaitForSingleObject(self.raw, 0) } {
+                WAIT_OBJECT_0 => Ok(true),
+                WAIT_TIMEOUT => Ok(false),
+                WAIT_FAILED => Err(io::Error::last_os_error()),
+                outcome => Err(io::Error::other(format!(
+                    "unexpected process wait result {outcome}"
+                ))),
+            }
+        }
+
+        fn terminate(&self) -> io::Result<()> {
+            if self.is_exited()? {
+                return Ok(());
+            }
+            // SAFETY: `self.raw` is an owned handle opened with PROCESS_TERMINATE.
+            if unsafe { TerminateProcess(self.raw, 1) } == 0 {
+                if self.is_exited()? {
+                    return Ok(());
+                }
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
+        fn wait_for_exit(&self, timeout: Duration) -> io::Result<()> {
+            let milliseconds = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+            // SAFETY: `self.raw` remains valid for the duration of this bounded wait.
+            match unsafe { WaitForSingleObject(self.raw, milliseconds) } {
+                WAIT_OBJECT_0 => Ok(()),
+                WAIT_TIMEOUT => Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "captured descendant did not exit after forced termination",
+                )),
+                WAIT_FAILED => Err(io::Error::last_os_error()),
+                outcome => Err(io::Error::other(format!(
+                    "unexpected process wait result {outcome}"
+                ))),
+            }
+        }
+    }
+
+    impl Drop for OwnedProcessHandle {
+        fn drop(&mut self) {
+            if !self.raw.is_null() {
+                // SAFETY: `self.raw` is owned by this value and has not been closed elsewhere.
+                let _close_result = unsafe { CloseHandle(self.raw) };
+                self.raw = ptr::null_mut();
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    pub(super) struct CapturedDescendants {
+        handles: Vec<OwnedProcessHandle>,
+    }
+
+    impl CapturedDescendants {
+        pub(super) fn capture(process_ids: impl Iterator<Item = u32>) -> io::Result<Self> {
+            let mut handles = Vec::new();
+            for process_id in process_ids {
+                if let Some(handle) = OwnedProcessHandle::open(process_id)? {
+                    handles.push(handle);
+                }
+            }
+            Ok(Self { handles })
+        }
+
+        pub(super) fn terminate_and_wait(&self, timeout: Duration) -> io::Result<()> {
+            for handle in &self.handles {
+                handle.terminate()?;
+            }
+            let started = Instant::now();
+            for handle in &self.handles {
+                let remaining = timeout.saturating_sub(started.elapsed());
+                handle.wait_for_exit(remaining)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(windows)]
+fn terminate_process_tree(child: &mut Child) -> io::Result<()> {
+    let root_pid = child.id();
+    require_running_root_for_cleanup(root_pid, child.try_wait()?.as_ref())?;
+    let snapshot = process_snapshot_ffi::snapshot_processes().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("could not capture spawned root PID {root_pid} family: {error}"),
+        )
+    })?;
+    let family = SpawnedProcessFamily::capture(root_pid, &snapshot);
+    let descendants = process_handle_ffi::CapturedDescendants::capture(family.descendant_pids())
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "could not retain exact handles for spawned root PID {root_pid} descendants: \
+                     {error}"
+                ),
+            )
+        });
+    let root_termination = terminate_root_with(child, |process_id| {
+        let mut taskkill = child_command("taskkill.exe");
+        taskkill
+            .args(["/PID", &process_id.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        run_command_with_timeout(&mut taskkill, Duration::from_secs(10), "taskkill")
+    });
+    let descendant_termination = match &descendants {
+        Ok(descendants) => descendants
+            .terminate_and_wait(DESCENDANT_FORCE_EXIT_TIMEOUT)
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "could not terminate exact descendants of spawned root PID {root_pid}: \
+                         {error}"
+                    ),
+                )
+            }),
+        Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
+    };
+    combine_family_termination(root_pid, root_termination, descendant_termination)?;
+    let verification = wait_for_spawned_process_family_exit(
+        &family,
+        PROCESS_FAMILY_EXIT_TIMEOUT,
+        process_snapshot_ffi::snapshot_processes,
+    );
+    drop(descendants);
+    verification
+}
+
+#[cfg(windows)]
+trait RootTerminationTarget {
+    fn process_id(&self) -> u32;
+    fn try_wait_now(&mut self) -> io::Result<Option<ExitStatus>>;
+    fn wait_for_exit(&mut self, timeout: Duration) -> io::Result<Option<ExitStatus>>;
+    fn kill_direct(&mut self) -> io::Result<()>;
+}
+
+#[cfg(windows)]
+impl RootTerminationTarget for Child {
+    fn process_id(&self) -> u32 {
+        self.id()
+    }
+
+    fn try_wait_now(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.try_wait()
+    }
+
+    fn wait_for_exit(&mut self, timeout: Duration) -> io::Result<Option<ExitStatus>> {
+        wait_for_child_exit(self, timeout)
+    }
+
+    fn kill_direct(&mut self) -> io::Result<()> {
+        self.kill()
+    }
+}
+
+#[cfg(windows)]
+fn terminate_root_with(
+    child: &mut impl RootTerminationTarget,
+    run_taskkill: impl FnOnce(u32) -> io::Result<ExitStatus>,
+) -> io::Result<ExitStatus> {
+    if let Some(status) = child.try_wait_now()? {
+        return Ok(status);
+    }
+    let process_id = child.process_id();
+    let tree_result = run_taskkill(process_id);
+    if tree_result.as_ref().is_ok_and(ExitStatus::success) {
+        if let Some(status) = child.wait_for_exit(Duration::from_secs(3))? {
+            return Ok(status);
+        }
+    }
+
+    let direct_kill_result = child.kill_direct();
+    if let Some(status) = child.wait_for_exit(Duration::from_secs(3))? {
+        return Ok(status);
+    }
+
+    Err(io::Error::other(format!(
+        "spawned root PID {process_id} did not exit after {} and direct kill ({})",
+        command_outcome("taskkill", &tree_result),
+        direct_kill_result
+            .map(|()| "requested successfully".to_owned())
+            .unwrap_or_else(|error| error.to_string())
+    )))
+}
+
+#[cfg(windows)]
+fn combine_family_termination(
+    root_pid: u32,
+    root: io::Result<ExitStatus>,
+    descendants: io::Result<()>,
+) -> io::Result<()> {
+    match (root, descendants) {
+        (Ok(_), Ok(())) => Ok(()),
+        (Err(root), Ok(())) => Err(root),
+        (Ok(_), Err(descendants)) => Err(descendants),
+        (Err(root), Err(descendants)) => Err(io::Error::other(format!(
+            "spawned root PID {root_pid} cleanup failed ({root}); exact descendant cleanup also \
+             failed ({descendants})"
+        ))),
+    }
+}
+
+fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> io::Result<Option<ExitStatus>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
 #[cfg(not(windows))]
 fn terminate_process_tree(child: &mut Child) -> io::Result<()> {
-    if child.try_wait()?.is_some() {
-        return Ok(());
-    }
-
-    let process_group = format!("-{}", child.id());
-    let terminate_status = child_command("kill")
+    let process_id = child.id();
+    require_running_root_for_cleanup(process_id, child.try_wait()?.as_ref())?;
+    let process_group = format!("-{process_id}");
+    let mut terminate_command = child_command("kill");
+    terminate_command
         .args(["-TERM", "--", &process_group])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
+        .stderr(Stdio::null());
+    let terminate_result =
+        run_command_with_timeout(&mut terminate_command, Duration::from_secs(2), "kill -TERM");
     thread::sleep(Duration::from_millis(250));
-    let kill_status = child_command("kill")
+    let mut kill_command = child_command("kill");
+    kill_command
         .args(["-KILL", "--", &process_group])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    let waited = child.wait()?;
-    if terminate_status.success() || kill_status.success() || waited.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "process-group termination failed with {terminate_status} and {kill_status}; child exited with {waited}"
-        )))
+        .stderr(Stdio::null());
+    let kill_result =
+        run_command_with_timeout(&mut kill_command, Duration::from_secs(2), "kill -KILL");
+
+    let mut root_exit = wait_for_child_exit(child, Duration::from_secs(3))?;
+    let mut direct_kill_error = None;
+    if root_exit.is_none() {
+        direct_kill_error = child.kill().err();
+        root_exit = wait_for_child_exit(child, Duration::from_secs(3))?;
+    }
+
+    if cleanup_is_proven(&terminate_result, root_exit.as_ref())
+        || cleanup_is_proven(&kill_result, root_exit.as_ref())
+    {
+        return Ok(());
+    }
+
+    Err(io::Error::other(format!(
+        "could not prove process-group cleanup for spawned root PID {}: {}; {}; root exit: {}; \
+         direct kill: {}",
+        child.id(),
+        command_outcome("kill -TERM", &terminate_result),
+        command_outcome("kill -KILL", &kill_result),
+        root_exit.map_or_else(
+            || "not observed within timeout".to_owned(),
+            |status| status.to_string()
+        ),
+        direct_kill_error.map_or_else(
+            || "not required or requested successfully".to_owned(),
+            |error| error.to_string()
+        )
+    )))
+}
+
+fn require_running_root_for_cleanup(
+    process_id: u32,
+    initial_status: Option<&ExitStatus>,
+) -> io::Result<()> {
+    match initial_status {
+        None => Ok(()),
+        Some(status) => Err(io::Error::other(format!(
+            "spawned root PID {process_id} exited with {status} before process-tree cleanup; \
+             descendant cleanup cannot be proven"
+        ))),
+    }
+}
+
+#[cfg(not(windows))]
+fn cleanup_is_proven(tree_signal: &io::Result<ExitStatus>, root_exit: Option<&ExitStatus>) -> bool {
+    tree_signal.as_ref().is_ok_and(ExitStatus::success) && root_exit.is_some()
+}
+
+fn run_command_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+    label: &str,
+) -> io::Result<ExitStatus> {
+    let mut child = command.spawn()?;
+    if let Some(status) = wait_for_child_exit(&mut child, timeout)? {
+        return Ok(status);
+    }
+
+    let kill_error = child.kill().err();
+    let reaped = wait_for_child_exit(&mut child, Duration::from_secs(2))?;
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "{label} exceeded its timeout; helper exit: {}; helper kill: {}",
+            reaped.map_or_else(|| "not observed".to_owned(), |status| status.to_string()),
+            kill_error.map_or_else(|| "requested".to_owned(), |error| error.to_string())
+        ),
+    ))
+}
+
+fn command_outcome(label: &str, result: &io::Result<ExitStatus>) -> String {
+    match result {
+        Ok(status) => format!("{label} exited with {status}"),
+        Err(error) => format!("{label} failed: {error}"),
     }
 }

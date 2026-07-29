@@ -12,8 +12,11 @@
     "thread"
   ],
   "properties": {
-    "thread": {
-      "$ref": "#/definitions/Thread"
+    "serviceTier": {
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "approvalPolicy": {
       "$ref": "#/definitions/AskForApproval"
@@ -29,10 +32,14 @@
     "cwd": {
       "$ref": "#/definitions/AbsolutePathBuf"
     },
-    "serviceTier": {
-      "type": [
-        "string",
-        "null"
+    "reasoningEffort": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ReasoningEffort"
+        },
+        {
+          "type": "null"
+        }
       ]
     },
     "instructionSources": {
@@ -42,6 +49,9 @@
       "items": {
         "$ref": "#/definitions/LegacyAppPathString"
       }
+    },
+    "thread": {
+      "$ref": "#/definitions/Thread"
     },
     "model": {
       "type": "string"
@@ -54,16 +64,6 @@
       "allOf": [
         {
           "$ref": "#/definitions/SandboxPolicy"
-        }
-      ]
-    },
-    "reasoningEffort": {
-      "anyOf": [
-        {
-          "$ref": "#/definitions/ReasoningEffort"
-        },
-        {
-          "type": "null"
         }
       ]
     }
@@ -527,6 +527,26 @@
             }
           },
           "title": "InputImageDynamicToolCallOutputContentItem"
+        },
+        {
+          "type": "object",
+          "required": [
+            "audioUrl",
+            "type"
+          ],
+          "properties": {
+            "audioUrl": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "inputAudio"
+              ],
+              "title": "InputAudioDynamicToolCallOutputContentItemType"
+            }
+          },
+          "title": "InputAudioDynamicToolCallOutputContentItem"
         }
       ]
     },
@@ -635,12 +655,6 @@
           ]
         },
         "resourceUri": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "templateId": {
           "type": [
             "string",
             "null"
@@ -1136,6 +1150,11 @@
             "null"
           ]
         },
+        "updatedAt": {
+          "description": "Unix timestamp (in seconds) when the thread was last updated.",
+          "type": "integer",
+          "format": "int64"
+        },
         "cliVersion": {
           "description": "Version of the CLI that created the thread.",
           "type": "string"
@@ -1157,12 +1176,16 @@
           "description": "Whether the thread is ephemeral and should not be materialized on disk.",
           "type": "boolean"
         },
-        "turns": {
-          "description": "Only populated on `thread/resume`, `thread/rollback`, `thread/fork`, and `thread/read` (when `includeTurns` is true) responses. For all other responses and notifications returning a Thread, the turns field will be an empty list.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/Turn"
-          }
+        "threadSource": {
+          "description": "Optional analytics source classification for this thread.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadSource"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "forkedFromId": {
           "description": "Source thread id when this thread was created by forking another thread.",
@@ -1182,14 +1205,21 @@
             }
           ]
         },
-        "updatedAt": {
-          "description": "Unix timestamp (in seconds) when the thread was last updated.",
-          "type": "integer",
-          "format": "int64"
+        "turns": {
+          "description": "Only populated on `thread/resume`, `thread/rollback`, `thread/fork`, and `thread/read` (when `includeTurns` is true) responses. For all other responses and notifications returning a Thread, the turns field will be an empty list.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Turn"
+          }
         },
         "id": {
           "description": "Identifier for this thread. Codex-generated thread IDs are UUIDv7.",
           "type": "string"
+        },
+        "isPinned": {
+          "description": "Whether the thread has been pinned by the user.",
+          "default": false,
+          "type": "boolean"
         },
         "modelProvider": {
           "description": "Model provider used for this thread (for example, 'openai').",
@@ -1245,17 +1275,6 @@
           "allOf": [
             {
               "$ref": "#/definitions/ThreadStatus"
-            }
-          ]
-        },
-        "threadSource": {
-          "description": "Optional analytics source classification for this thread.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ThreadSource"
-            },
-            {
-              "type": "null"
             }
           ]
         }
@@ -1505,8 +1524,24 @@
             "id": {
               "type": "string"
             },
+            "pluginId": {
+              "description": "Trusted first-party plugin id when this command resolves to one plugin script.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "processId": {
               "description": "Identifier for the underlying PTY process (when available).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "scriptPath": {
+              "description": "Safe plugin-relative path when this command resolves to one plugin script.",
+              "default": null,
               "type": [
                 "string",
                 "null"
@@ -1849,6 +1884,15 @@
             "query": {
               "type": "string"
             },
+            "results": {
+              "description": "Structured search results returned out-of-band by standalone web search.\n\nThese stay as opaque JSON at the extension/app-server boundary so new result fields and result types can pass through without a Codex release.",
+              "default": null,
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": true
+            },
             "type": {
               "type": "string",
               "enum": [
@@ -1884,6 +1928,7 @@
           "title": "ImageViewThreadItem"
         },
         {
+          "description": "Display item emitted by the interruptible `clock.sleep` tool.",
           "type": "object",
           "required": [
             "durationMs",
@@ -2348,6 +2393,46 @@
             }
           },
           "title": "LocalImageUserInput"
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "url"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "audio"
+              ],
+              "title": "AudioUserInputType"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "title": "AudioUserInput"
+        },
+        {
+          "type": "object",
+          "required": [
+            "path",
+            "type"
+          ],
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "localAudio"
+              ],
+              "title": "LocalAudioUserInputType"
+            }
+          },
+          "title": "LocalAudioUserInput"
         },
         {
           "type": "object",

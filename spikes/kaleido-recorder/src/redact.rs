@@ -4,10 +4,22 @@ use std::fmt;
 use std::path::Path;
 
 use directories::BaseDirs;
+use serde::Deserialize;
+use serde_json::value::RawValue;
 use serde_json::Value;
+use thiserror::Error;
 
 const REDACTED_TOKEN: &str = "<REDACTED_TOKEN>";
 const OUTSIDE_PATH: &str = "<OUTSIDE_PATH>";
+const REDACTED_COMMAND: &str = "<REDACTED_COMMAND>";
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum RedactionError {
+    #[error("available_commands_update did not contain one valid availableCommands array")]
+    AvailableCommandsShape,
+    #[error("available_commands_update raw array span was not unique")]
+    AvailableCommandsRawSpan,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SupportedSecretEnvironment {
@@ -126,8 +138,9 @@ impl Redactor {
         }
     }
 
-    pub fn redact(&self, input: &str) -> String {
-        let mut redacted = redact_sandbox_traversals(input, &self.sandbox_variants);
+    pub fn try_redact(&self, input: &str) -> Result<String, RedactionError> {
+        let mut redacted = redact_available_commands_update(input)?;
+        redacted = redact_sandbox_traversals(&redacted, &self.sandbox_variants);
         for sensitive in &self.secret_replacements {
             redacted = if sensitive.len() < 8 {
                 redact_exact_json_string_value(&redacted, sensitive, REDACTED_TOKEN)
@@ -147,8 +160,114 @@ impl Redactor {
         redacted = redact_prefixed_value(&redacted, "Bearer ", REDACTED_TOKEN);
         redacted = redact_json_string_field(&redacted, "api_key", REDACTED_TOKEN);
         redacted = redact_json_string_field(&redacted, "authorization", REDACTED_TOKEN);
-        redact_absolute_path_strings(&redacted)
+        Ok(redact_absolute_path_strings(&redacted))
     }
+
+    pub fn redact(&self, input: &str) -> String {
+        match self.try_redact(input) {
+            Ok(redacted) => redacted,
+            Err(_) => "<REDACTION_ERROR>".to_owned(),
+        }
+    }
+}
+
+fn redact_available_commands_update(input: &str) -> Result<String, RedactionError> {
+    let Ok(payload) = serde_json::from_str::<Value>(input) else {
+        return Ok(input.to_owned());
+    };
+    if payload.get("method").and_then(Value::as_str) != Some("session/update")
+        || payload
+            .pointer("/params/update/sessionUpdate")
+            .and_then(Value::as_str)
+            != Some("available_commands_update")
+    {
+        return Ok(input.to_owned());
+    }
+    let envelope: AvailableCommandsEnvelope<'_> =
+        serde_json::from_str(input).map_err(|_| RedactionError::AvailableCommandsShape)?;
+    if envelope.method != "session/update"
+        || envelope.params.update.session_update != "available_commands_update"
+    {
+        return Err(RedactionError::AvailableCommandsShape);
+    }
+    let raw_commands = envelope.params.update.available_commands.get();
+    let commands: Vec<Value> =
+        serde_json::from_str(raw_commands).map_err(|_| RedactionError::AvailableCommandsShape)?;
+    if is_redacted_command_summary(&commands) {
+        return Ok(input.to_owned());
+    }
+    let original_count = legacy_redacted_command_count(&commands)
+        .map_or_else(|| commands.len().to_string(), |count| count.to_string());
+    let (start, end) = unique_raw_value_span(input, raw_commands)
+        .ok_or(RedactionError::AvailableCommandsRawSpan)?;
+    let replacement = format!(
+        r#"[{{"name":"{REDACTED_COMMAND}","description":"{REDACTED_COMMAND}","_meta":{{"kaleidoRedaction":"available_commands_update","originalCount":{original_count}}}}}]"#
+    );
+    let mut output = String::with_capacity(input.len() - (end - start) + replacement.len());
+    output.push_str(&input[..start]);
+    output.push_str(&replacement);
+    output.push_str(&input[end..]);
+    Ok(output)
+}
+
+fn is_redacted_command_summary(commands: &[Value]) -> bool {
+    let [Value::Object(summary)] = commands else {
+        return false;
+    };
+    let Some(Value::Object(metadata)) = summary.get("_meta") else {
+        return false;
+    };
+    summary.len() == 3
+        && summary.get("name").and_then(Value::as_str) == Some(REDACTED_COMMAND)
+        && summary.get("description").and_then(Value::as_str) == Some(REDACTED_COMMAND)
+        && metadata.len() == 2
+        && metadata.get("kaleidoRedaction").and_then(Value::as_str)
+            == Some("available_commands_update")
+        && metadata
+            .get("originalCount")
+            .and_then(Value::as_u64)
+            .is_some()
+}
+
+fn legacy_redacted_command_count(commands: &[Value]) -> Option<u64> {
+    let [Value::Object(summary)] = commands else {
+        return None;
+    };
+    if summary.len() == 2 && summary.get("name").and_then(Value::as_str) == Some(REDACTED_COMMAND) {
+        summary.get("count").and_then(Value::as_u64)
+    } else {
+        None
+    }
+}
+
+fn unique_raw_value_span(input: &str, raw_value: &str) -> Option<(usize, usize)> {
+    let mut matches = input.match_indices(raw_value);
+    let (start, _) = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some((start, start + raw_value.len()))
+}
+
+#[derive(Debug, Deserialize)]
+struct AvailableCommandsEnvelope<'a> {
+    method: &'a str,
+    #[serde(borrow)]
+    params: AvailableCommandsParams<'a>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AvailableCommandsParams<'a> {
+    #[serde(borrow)]
+    update: AvailableCommandsUpdate<'a>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AvailableCommandsUpdate<'a> {
+    #[serde(rename = "sessionUpdate")]
+    session_update: &'a str,
+    #[serde(borrow, rename = "availableCommands")]
+    available_commands: &'a RawValue,
 }
 
 fn secret_environment_values(lookup: impl FnMut(&str) -> Option<OsString>) -> Vec<String> {

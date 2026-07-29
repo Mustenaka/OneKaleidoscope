@@ -3,18 +3,18 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::io::{self, BufReader, Write};
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use kaleido_recorder::agents::acp::{self, AcpScenario, ScenarioOutcome as AcpOutcome};
-use kaleido_recorder::agents::codex::{self, CodexRecording, CodexScenario};
+use kaleido_recorder::agents::codex::{self, CodexRecorderConfig, CodexRecording, CodexScenario};
 use kaleido_recorder::agents::opencode::{
     self, Outcome as OpenCodeOutcome, Scenario as OpenCodeScenario,
 };
 use kaleido_recorder::auth;
-use kaleido_recorder::fixture::FixtureSink;
+use kaleido_recorder::fixture::{reprocess_jsonl, FixtureSink};
 use kaleido_recorder::platform::{
     self, DiscoveryLayer, DiscoveryTarget, ProbeStatus, ResolvedExecutable, RuntimeCandidateProbe,
     RuntimeProbe,
@@ -33,6 +33,8 @@ const RECORD_USAGE: &str = "kaleido-recorder <codex|acp|opencode> <scenario> \
     [--thread-id <codex-thread-id>] [--session-id <acp-session-id>]\n\
     scenarios: simple-turn, tool-call, permission-approve, permission-deny, \
     file-change, cancel, error, session-load, elicitation";
+const REDACT_FIXTURE_USAGE: &str =
+    "kaleido-recorder redact-fixture <codex|acp-claude|opencode>/<fixture>.jsonl";
 
 #[derive(Debug)]
 enum RecorderError {
@@ -40,6 +42,7 @@ enum RecorderError {
     WorkspaceRoot,
     Io(io::Error),
     Agent(Box<dyn Error>),
+    Fixture(Box<dyn Error>),
     Discovery(String),
     ExistingFixture(String),
     NotObserved(String),
@@ -54,6 +57,7 @@ impl fmt::Display for RecorderError {
             Self::WorkspaceRoot => formatter.write_str("could not resolve workspace root"),
             Self::Io(error) => write!(formatter, "I/O failure: {error}"),
             Self::Agent(error) => write!(formatter, "agent protocol attempt failed: {error}"),
+            Self::Fixture(error) => write!(formatter, "fixture reprocessing failed: {error}"),
             Self::Discovery(reason) => write!(formatter, "agent discovery failed: {reason}"),
             Self::ExistingFixture(path) => {
                 write!(formatter, "refusing to overwrite existing fixture {path}")
@@ -73,6 +77,7 @@ impl Error for RecorderError {
         match self {
             Self::Io(error) => Some(error),
             Self::Agent(error) => Some(error.as_ref()),
+            Self::Fixture(error) => Some(error.as_ref()),
             Self::Usage(_)
             | Self::WorkspaceRoot
             | Self::Discovery(_)
@@ -286,7 +291,7 @@ impl SandboxState {
         };
         let quarantine = guard.path().join("quarantine");
 
-        let quarantined = match fs::rename(&self.root, &quarantine) {
+        let quarantined = match platform::quarantine_sandbox_working_copy(&self.root, &quarantine) {
             Ok(()) => true,
             Err(error) if error.kind() == io::ErrorKind::NotFound => false,
             Err(error) => {
@@ -483,6 +488,9 @@ fn run() -> Result<(), RecorderError> {
     if command == "discover" {
         return run_discover(parse_discover_arguments(arguments)?);
     }
+    if command == "redact-fixture" {
+        return run_redact_fixture(arguments);
+    }
     let agent = if command == "record" {
         let value = arguments
             .next()
@@ -493,6 +501,89 @@ fn run() -> Result<(), RecorderError> {
         AgentKind::parse(&command)?
     };
     run_record(agent, parse_record_arguments(arguments)?)
+}
+
+fn run_redact_fixture(mut arguments: impl Iterator<Item = OsString>) -> Result<(), RecorderError> {
+    let relative = arguments
+        .next()
+        .ok_or_else(|| RecorderError::Usage(REDACT_FIXTURE_USAGE.to_owned()))
+        .map(PathBuf::from)?;
+    if arguments.next().is_some() {
+        return Err(RecorderError::Usage(REDACT_FIXTURE_USAGE.to_owned()));
+    }
+    let agent = validate_fixture_relative_path(&relative)?;
+    let root = workspace_root()?;
+    let fixtures = root.join("tests").join("fixtures");
+    let canonical_fixtures = fixtures.canonicalize()?;
+    let target = fixtures.join(&relative);
+    if platform::path_is_link_or_reparse(&target)? {
+        return Err(RecorderError::Usage(
+            "redact-fixture target must not be a link or reparse point".to_owned(),
+        ));
+    }
+    let canonical_target = target.canonicalize()?;
+    let expected_target = canonical_fixtures.join(&relative);
+    if canonical_target != expected_target {
+        return Err(RecorderError::Usage(
+            "redact-fixture target escaped tests/fixtures".to_owned(),
+        ));
+    }
+    let sandbox = canonical_fixtures.join("sandbox");
+    let redactor = Redactor::for_environment(&sandbox);
+    let records = reprocess_fixture_atomically(&target, &redactor)?;
+    println!(
+        "reprocessed {records} record(s) in {}/{}",
+        agent.fixture_directory(),
+        relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| RecorderError::Usage(REDACT_FIXTURE_USAGE.to_owned()))?
+    );
+    Ok(())
+}
+
+fn reprocess_fixture_atomically(
+    target: &Path,
+    redactor: &Redactor,
+) -> Result<usize, RecorderError> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| RecorderError::Usage(REDACT_FIXTURE_USAGE.to_owned()))?;
+    let source = fs::File::open(target)?;
+    let mut temporary = NamedTempFile::new_in(parent)?;
+    let records = reprocess_jsonl(BufReader::new(source), temporary.as_file_mut(), redactor)
+        .map_err(|error| RecorderError::Fixture(Box::new(error)))?;
+    temporary.as_file_mut().sync_all()?;
+    temporary.persist(target).map_err(|error| error.error)?;
+    Ok(records)
+}
+
+fn validate_fixture_relative_path(relative: &Path) -> Result<AgentKind, RecorderError> {
+    let mut components = relative.components();
+    let Some(Component::Normal(agent)) = components.next() else {
+        return Err(RecorderError::Usage(REDACT_FIXTURE_USAGE.to_owned()));
+    };
+    let Some(Component::Normal(file)) = components.next() else {
+        return Err(RecorderError::Usage(REDACT_FIXTURE_USAGE.to_owned()));
+    };
+    if components.next().is_some()
+        || Path::new(file).extension().and_then(|value| value.to_str()) != Some("jsonl")
+    {
+        return Err(RecorderError::Usage(REDACT_FIXTURE_USAGE.to_owned()));
+    }
+    let file = file
+        .to_str()
+        .ok_or_else(|| RecorderError::Usage(REDACT_FIXTURE_USAGE.to_owned()))?;
+    let scenario = Scenario::parse(file)?;
+    if scenario.file_name() != file {
+        return Err(RecorderError::Usage(REDACT_FIXTURE_USAGE.to_owned()));
+    }
+    match agent.to_str() {
+        Some("codex") => Ok(AgentKind::Codex),
+        Some("acp-claude") => Ok(AgentKind::Acp),
+        Some("opencode") => Ok(AgentKind::OpenCode),
+        _ => Err(RecorderError::Usage(REDACT_FIXTURE_USAGE.to_owned())),
+    }
 }
 
 fn parse_record_arguments(
@@ -1088,6 +1179,7 @@ fn record_agent<W: Write>(
         AgentKind::Codex => record_codex(
             arguments.scenario,
             arguments.thread_id,
+            arguments.timeout,
             executable,
             sandbox,
             fixture,
@@ -1113,6 +1205,7 @@ fn record_agent<W: Write>(
 fn record_codex<W: Write>(
     scenario: Scenario,
     thread_id: Option<String>,
+    timeout: Duration,
     executable: &ResolvedExecutable,
     sandbox: &Path,
     fixture: &mut FixtureSink<W>,
@@ -1128,8 +1221,17 @@ fn record_codex<W: Write>(
         Scenario::SessionLoad => CodexScenario::SessionLoad { thread_id },
         Scenario::Elicitation => CodexScenario::Elicitation,
     };
-    let recording =
-        codex::record(executable, sandbox, codex_scenario, fixture).map_err(agent_error)?;
+    let recording = codex::record_with_config(
+        executable,
+        sandbox,
+        codex_scenario,
+        fixture,
+        &CodexRecorderConfig {
+            request_timeout: timeout,
+            turn_timeout: timeout,
+        },
+    )
+    .map_err(agent_error)?;
     ensure_codex_observed(scenario, &recording)?;
     Ok(format!(
         "{} notification methods, {} server requests",
@@ -1338,6 +1440,41 @@ fn workspace_root() -> Result<PathBuf, RecorderError> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn redact_fixture_path_is_limited_to_one_known_agent_jsonl() {
+        assert_eq!(
+            validate_fixture_relative_path(Path::new("acp-claude/06-cancel.jsonl")).ok(),
+            Some(AgentKind::Acp)
+        );
+        assert!(validate_fixture_relative_path(Path::new("../outside.jsonl")).is_err());
+        assert!(validate_fixture_relative_path(Path::new("sandbox/private.jsonl")).is_err());
+        assert!(validate_fixture_relative_path(Path::new("codex/nested/private.jsonl")).is_err());
+        assert!(validate_fixture_relative_path(Path::new("codex/private.jsonl")).is_err());
+        assert!(validate_fixture_relative_path(Path::new("codex/private.txt")).is_err());
+    }
+
+    #[test]
+    fn failed_reprocessing_never_replaces_the_original_fixture() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let fixture = directory.path().join("06-cancel.jsonl");
+        let original = concat!(
+            "{\"ts_ms\":1,\"dir\":\"s2c\",\"transport\":\"stdio\",\"payload\":",
+            "{\"method\":\"session/update\",\"params\":{\"update\":",
+            "{\"sessionUpdate\":\"available_commands_update\",",
+            "\"availableCommands\":[{\"name\":\"private\",\"description\":\"private\"}]}}}}\n",
+            "{\"ts_ms\":2,\"dir\":\"s2c\",\"transport\":\"stdio\",",
+            "\"unexpected\":\"must-not-be-dropped\",\"payload\":{\"ok\":true}}\n"
+        );
+        fs::write(&fixture, original)?;
+
+        let result =
+            reprocess_fixture_atomically(&fixture, &Redactor::for_environment(directory.path()));
+
+        assert!(matches!(result, Err(RecorderError::Fixture(_))));
+        assert_eq!(fs::read_to_string(&fixture)?, original);
+        Ok(())
+    }
+
     fn record_arguments(scenario: Scenario) -> RecordArguments {
         RecordArguments {
             executable: None,
@@ -1408,6 +1545,7 @@ mod tests {
 
         assert_eq!(parsed.scenario, Scenario::SessionLoad);
         assert_eq!(parsed.session_id.as_deref(), Some("session-from-seed"));
+        assert_eq!(parsed.timeout, Duration::from_secs(1));
         Ok(())
     }
 

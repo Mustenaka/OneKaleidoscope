@@ -234,6 +234,46 @@
         "method": {
           "type": "string",
           "enum": [
+            "thread/environment/connected"
+          ],
+          "title": "Thread/environment/connectedNotificationMethod"
+        },
+        "params": {
+          "$ref": "#/definitions/EnvironmentConnectionNotification"
+        }
+      },
+      "title": "Thread/environment/connectedNotification"
+    },
+    {
+      "type": "object",
+      "required": [
+        "method",
+        "params"
+      ],
+      "properties": {
+        "method": {
+          "type": "string",
+          "enum": [
+            "thread/environment/disconnected"
+          ],
+          "title": "Thread/environment/disconnectedNotificationMethod"
+        },
+        "params": {
+          "$ref": "#/definitions/EnvironmentConnectionNotification"
+        }
+      },
+      "title": "Thread/environment/disconnectedNotification"
+    },
+    {
+      "type": "object",
+      "required": [
+        "method",
+        "params"
+      ],
+      "properties": {
+        "method": {
+          "type": "string",
+          "enum": [
             "thread/settings/updated"
           ],
           "title": "Thread/settings/updatedNotificationMethod"
@@ -1726,12 +1766,6 @@
             "null"
           ]
         },
-        "firstPartyType": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "review": {
           "anyOf": [
             {
@@ -2501,6 +2535,26 @@
             }
           },
           "title": "InputImageDynamicToolCallOutputContentItem"
+        },
+        {
+          "type": "object",
+          "required": [
+            "audioUrl",
+            "type"
+          ],
+          "properties": {
+            "audioUrl": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "inputAudio"
+              ],
+              "title": "InputAudioDynamicToolCallOutputContentItemType"
+            }
+          },
+          "title": "InputAudioDynamicToolCallOutputContentItem"
         }
       ]
     },
@@ -2511,6 +2565,21 @@
         "completed",
         "failed"
       ]
+    },
+    "EnvironmentConnectionNotification": {
+      "type": "object",
+      "required": [
+        "environmentId",
+        "threadId"
+      ],
+      "properties": {
+        "environmentId": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      }
     },
     "ErrorNotification": {
       "type": "object",
@@ -2583,6 +2652,12 @@
           "type": "string"
         },
         "source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "subErrorType": {
           "type": [
             "string",
             "null"
@@ -2673,6 +2748,7 @@
         "SUBAGENTS",
         "HOOKS",
         "COMMANDS",
+        "MEMORY",
         "SESSIONS"
       ]
     },
@@ -2858,9 +2934,13 @@
               ]
             },
             "subpath": {
-              "type": [
-                "string",
-                "null"
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/LegacyAppPathString"
+                },
+                {
+                  "type": "null"
+                }
               ]
             }
           },
@@ -2913,9 +2993,13 @@
               "type": "string"
             },
             "subpath": {
-              "type": [
-                "string",
-                "null"
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/LegacyAppPathString"
+                },
+                {
+                  "type": "null"
+                }
               ]
             }
           }
@@ -3385,6 +3469,7 @@
         "preCompact",
         "postCompact",
         "sessionStart",
+        "sessionEnd",
         "userPromptSubmit",
         "subagentStart",
         "subagentStop",
@@ -3847,12 +3932,6 @@
             "string",
             "null"
           ]
-        },
-        "templateId": {
-          "type": [
-            "string",
-            "null"
-          ]
         }
       }
     },
@@ -4249,6 +4328,7 @@
         "team",
         "self_serve_business_usage_based",
         "business",
+        "ent26",
         "enterprise_cbp_usage_based",
         "enterprise",
         "edu",
@@ -4429,6 +4509,13 @@
               "type": "null"
             }
           ]
+        },
+        "spendControlReached": {
+          "description": "Backend-reported spend-control state. `None` is unavailable, not a sparse-update recovery.",
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       }
     },
@@ -4462,7 +4549,8 @@
       "type": "string",
       "enum": [
         "v1",
-        "v2"
+        "v2",
+        "v3"
       ]
     },
     "ReasoningEffort": {
@@ -5054,6 +5142,11 @@
             "null"
           ]
         },
+        "updatedAt": {
+          "description": "Unix timestamp (in seconds) when the thread was last updated.",
+          "type": "integer",
+          "format": "int64"
+        },
         "cliVersion": {
           "description": "Version of the CLI that created the thread.",
           "type": "string"
@@ -5075,12 +5168,16 @@
           "description": "Whether the thread is ephemeral and should not be materialized on disk.",
           "type": "boolean"
         },
-        "turns": {
-          "description": "Only populated on `thread/resume`, `thread/rollback`, `thread/fork`, and `thread/read` (when `includeTurns` is true) responses. For all other responses and notifications returning a Thread, the turns field will be an empty list.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/Turn"
-          }
+        "threadSource": {
+          "description": "Optional analytics source classification for this thread.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadSource"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "forkedFromId": {
           "description": "Source thread id when this thread was created by forking another thread.",
@@ -5100,14 +5197,21 @@
             }
           ]
         },
-        "updatedAt": {
-          "description": "Unix timestamp (in seconds) when the thread was last updated.",
-          "type": "integer",
-          "format": "int64"
+        "turns": {
+          "description": "Only populated on `thread/resume`, `thread/rollback`, `thread/fork`, and `thread/read` (when `includeTurns` is true) responses. For all other responses and notifications returning a Thread, the turns field will be an empty list.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Turn"
+          }
         },
         "id": {
           "description": "Identifier for this thread. Codex-generated thread IDs are UUIDv7.",
           "type": "string"
+        },
+        "isPinned": {
+          "description": "Whether the thread has been pinned by the user.",
+          "default": false,
+          "type": "boolean"
         },
         "modelProvider": {
           "description": "Model provider used for this thread (for example, 'openai').",
@@ -5163,17 +5267,6 @@
           "allOf": [
             {
               "$ref": "#/definitions/ThreadStatus"
-            }
-          ]
-        },
-        "threadSource": {
-          "description": "Optional analytics source classification for this thread.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ThreadSource"
-            },
-            {
-              "type": "null"
             }
           ]
         }
@@ -5545,8 +5638,24 @@
             "id": {
               "type": "string"
             },
+            "pluginId": {
+              "description": "Trusted first-party plugin id when this command resolves to one plugin script.",
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "processId": {
               "description": "Identifier for the underlying PTY process (when available).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "scriptPath": {
+              "description": "Safe plugin-relative path when this command resolves to one plugin script.",
+              "default": null,
               "type": [
                 "string",
                 "null"
@@ -5889,6 +5998,15 @@
             "query": {
               "type": "string"
             },
+            "results": {
+              "description": "Structured search results returned out-of-band by standalone web search.\n\nThese stay as opaque JSON at the extension/app-server boundary so new result fields and result types can pass through without a Codex release.",
+              "default": null,
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": true
+            },
             "type": {
               "type": "string",
               "enum": [
@@ -5924,6 +6042,7 @@
           "title": "ImageViewThreadItem"
         },
         {
+          "description": "Display item emitted by the interruptible `clock.sleep` tool.",
           "type": "object",
           "required": [
             "durationMs",
@@ -6524,6 +6643,11 @@
         "totalTokens"
       ],
       "properties": {
+        "cacheWriteInputTokens": {
+          "default": 0,
+          "type": "integer",
+          "format": "int64"
+        },
         "cachedInputTokens": {
           "type": "integer",
           "format": "int64"
@@ -6889,6 +7013,46 @@
         {
           "type": "object",
           "required": [
+            "type",
+            "url"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "audio"
+              ],
+              "title": "AudioUserInputType"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "title": "AudioUserInput"
+        },
+        {
+          "type": "object",
+          "required": [
+            "path",
+            "type"
+          ],
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "localAudio"
+              ],
+              "title": "LocalAudioUserInputType"
+            }
+          },
+          "title": "LocalAudioUserInput"
+        },
+        {
+          "type": "object",
+          "required": [
             "name",
             "path",
             "type"
@@ -7107,6 +7271,13 @@
           }
         }
       }
+    }
+  },
+  "properties": {
+    "emittedAtMs": {
+      "description": "Unix timestamp (in milliseconds) when app-server emitted this notification.",
+      "format": "int64",
+      "type": "integer"
     }
   }
 }

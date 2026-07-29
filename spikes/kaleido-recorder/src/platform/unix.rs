@@ -13,12 +13,19 @@ use directories::BaseDirs;
 
 use super::{
     platform_append_unix_installation_evidence, platform_extend_unix_known_executable_directories,
-    read_user_npm_prefix, resolved, Candidate, CandidateStatus, DiscoveryLayer, DiscoveryTarget,
-    Launcher, LayerReport, ProbeStatus, ProcessError, ResolvedExecutable,
+    read_user_npm_prefix, resolved, wait_for_spawned_process_family_exit, Candidate,
+    CandidateStatus, DiscoveryLayer, DiscoveryTarget, Launcher, LayerReport, ProbeStatus,
+    ProcessEntry, ProcessError, ResolvedExecutable, SpawnedProcessFamily,
 };
+
+const PROCESS_FAMILY_EXIT_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub(super) fn fixture_sandbox_root_is_link(path: &Path) -> io::Result<bool> {
     Ok(fs::symlink_metadata(path)?.file_type().is_symlink())
+}
+
+pub(super) fn quarantine_sandbox_working_copy(source: &Path, quarantine: &Path) -> io::Result<()> {
+    fs::rename(source, quarantine)
 }
 
 pub(super) fn canonical_permission_path(path: &Path) -> io::Result<PathBuf> {
@@ -248,8 +255,11 @@ fn inspect_candidate(path: &Path) -> Candidate {
 }
 
 pub(super) fn terminate_tree(child: &mut Child) -> Result<ExitStatus, ProcessError> {
+    let root_pid = child.id();
+    let family =
+        snapshot_processes().map(|snapshot| SpawnedProcessFamily::capture(root_pid, &snapshot));
     if let Some(status) = child.try_wait().map_err(ProcessError::Inspect)? {
-        return Ok(status);
+        return verify_spawned_process_family(status, root_pid, family);
     }
 
     let process_group = format!("-{}", child.id());
@@ -270,12 +280,72 @@ pub(super) fn terminate_tree(child: &mut Child) -> Result<ExitStatus, ProcessErr
         .map_err(ProcessError::Terminate)?;
     let child_status = child.wait().map_err(ProcessError::Terminate)?;
     if terminate.success() || kill.success() || child_status.success() {
-        Ok(child_status)
+        verify_spawned_process_family(child_status, root_pid, family)
     } else {
         Err(ProcessError::Terminate(io::Error::other(format!(
             "process-group termination exited with {terminate} and {kill}; child exited with {child_status}"
         ))))
     }
+}
+
+fn verify_spawned_process_family(
+    status: ExitStatus,
+    root_pid: u32,
+    family: io::Result<SpawnedProcessFamily>,
+) -> Result<ExitStatus, ProcessError> {
+    let family = family.map_err(|error| {
+        ProcessError::Terminate(io::Error::new(
+            error.kind(),
+            format!(
+                "spawned root PID {root_pid} was reaped, but its process family could not be \
+                 captured before cleanup: {error}"
+            ),
+        ))
+    })?;
+    wait_for_spawned_process_family_exit(&family, PROCESS_FAMILY_EXIT_TIMEOUT, snapshot_processes)?;
+    Ok(status)
+}
+
+fn snapshot_processes() -> io::Result<Vec<ProcessEntry>> {
+    let output = Command::new("ps")
+        .args(["-e", "-o", "pid=", "-o", "ppid="])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "ps process snapshot exited with {}",
+            output.status
+        )));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "ps output was not UTF-8"))?;
+    stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(parse_process_entry)
+        .collect()
+}
+
+fn parse_process_entry(line: &str) -> io::Result<ProcessEntry> {
+    let mut fields = line.split_ascii_whitespace();
+    let pid = fields
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "ps row omitted PID"))?
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "ps PID was not numeric"))?;
+    let parent_pid = fields
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "ps row omitted parent PID"))?
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "ps parent PID was not numeric"))?;
+    if fields.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ps row contained unexpected fields",
+        ));
+    }
+    Ok(ProcessEntry { pid, parent_pid })
 }
 
 fn configure_child(command: &mut Command) {
