@@ -12,6 +12,21 @@
 >
 > 路径 A 的预检要求见文末「§路径 A：Codex 重试的预检门」。
 > 以下正文原为人工手册，两条路径的录制步骤与优先级完全相同。
+>
+> **路径 A 执行结果（2026-07-30）：P-1 未通过，已转路径 B。**
+>
+> ```
+> curl.exe --fail --location --silent --show-error --max-time 15 --range 0-127 \
+>   https://raw.githubusercontent.com/.../schema/v1/meta.json
+> curl: (7) Failed to connect to raw.githubusercontent.com:443 after 6 ms
+> ```
+>
+> **6 毫秒即失败，P-2~P-4 未执行，未写任何代码。** 预检门达到设计目的：
+> 前两轮各消耗一整轮工作量才得出同一结论，本轮成本为一条命令。
+>
+> 判定：负责人调整的是**系统网络参数**，而 Codex 的沙箱在**进程层**拦截出站连接，
+> 两者是不同的层。`Could not connect` 在 6ms 内返回是本地拦截的特征（真实网络故障
+> 通常表现为超时或 DNS 失败，不会这么快）。
 
 > 执行人：**项目负责人本人**，在自己的交互式 PowerShell 里
 > 前置：T-006 已交付（录制器已通过审核，可用）
