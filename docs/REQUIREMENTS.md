@@ -12,7 +12,8 @@
 | [0003 OBJ-1 三级语义](adr/0003-agent-attach-semantics.md) | §1.1 OBJ-1、§4.5、§9（新增 R-9 / R-10） |
 | [0004 ACP 版本钉定](adr/0004-acp-version-pinning.md) | §4.2（包名）、§4.5（新增 `Elicitation` 变体）、§9 R-2 |
 | [0005 schema 规范化层](adr/0005-schema-normalization-layer.md) | §4.3 / §4.4（生成器选型）、§9 R-4 |
-| [0006 Agent 发现策略](adr/0006-agent-discovery.md) | §4.2（Node 前置、GUI/CLI 双形态）、§9（新增 R-11） |
+| [0006 Agent 发现策略](adr/0006-agent-discovery.md) | §4.2（Node 前置、GUI/CLI 双形态）、§9（新增 R-11 / R-12） |
+| [0007 Elicitation 能力位控制](adr/0007-elicitation-capability-gated.md) | §4.5（取代 ADR-0004 P-5） |
 
 ---
 
@@ -225,9 +226,16 @@ pub trait AgentAdapter: Send + Sync {
 `MessageChunk` / `ThoughtChunk` / `ToolCallStart` / `ToolCallUpdate` / `ToolCallEnd` /
 `PermissionRequest` / `Elicitation` / `PlanUpdate` / `DiffProduced` / `TurnStart` / `TurnEnd` / `Error`
 
-> `Elicitation`（agent 要求结构化表单输入）由 ADR-0004 P-5 加入 v1。Codex 侧对应
-> `mcpServer/elicitation/request`，ACP 侧对应 `elicitation/create`。缺少它会导致
-> MCP server 走 OAuth 或要求填参数时手机端卡死。
+> `Elicitation`（agent 要求结构化表单输入）由 ADR-0004 P-5 加入，
+> 经 [ADR-0007](adr/0007-elicitation-capability-gated.md) 修正为**由 `caps.elicitation` 能力位控制**：
+> Codex 侧对应 `mcpServer/elicitation/request`；**ACP v1 不存在 elicitation**（实测
+> `grep -i "elicit" schemas/acp/schema.json` 无命中），故 Claude Code 在 v1 内不支持。
+> 其余 11 个变体仍要求三家全覆盖。
+>
+> 参考：ACP v1 的 `SessionUpdate` 实际变体为
+> `user_message_chunk` / `agent_message_chunk` / `agent_thought_chunk` / `tool_call` /
+> `tool_call_update` / `plan` / `available_commands_update` / `current_mode_update` /
+> `config_option_update` / `session_info_update` / `usage_update`。
 >
 > **判别字符串使用 UACP 自己的取值，不复用 ACP 的字符串**（ADR-0004 P-3），
 > adapter 层负责映射，使上游改名只影响单个 adapter crate。

@@ -14,7 +14,10 @@
 ### 事实 1：适配器包已废弃并改名
 
 - `@zed-industries/claude-code-acp`（最新 0.16.2）**每个版本都带废弃标记**：「This package has been renamed to `@agentclientprotocol/claude-agent-acp`. Please migrate to continue receiving updates.」
-- 新包：`@agentclientprotocol/claude-agent-acp`，最新 **0.63.0**，依赖 `@agentclientprotocol/sdk` 0.25.0 与 `@anthropic-ai/claude-agent-sdk` 0.3.169
+- 新包：`@agentclientprotocol/claude-agent-acp`，最新 **0.63.0**
+  - **版本更正（T-004 实测，2026-07-28）**：0.63.0 实际依赖 ACP SDK **1.3.0** 与
+    Claude Agent SDK **0.3.220**；其 npm 自备的原生二进制自报 `2.1.220 (Claude Code)`。
+    本节此前记录的 0.25.0 / 0.3.169 取自 npm registry 的非最新条目，已作废
 - 仓库从 `zed-industries/claude-code-acp` 迁至 `agentclientprotocol/claude-agent-acp`
 
 版本号从 0.16 跳到 0.63，说明改名后经历了大量迭代。**继续用旧包 = 用一个停止更新的适配器。**
@@ -81,7 +84,14 @@ Codex 与 ACP 双方都有**结构化表单输入**能力：
 
 CI 每日重新拉取并 diff（对应 R-4 的缓解措施）。**diff 非空即告警**，让上游 breaking change 在编译失败之前就被发现。
 
-### P-5 §4.5 的事件变体清单补充 `Elicitation`
+### ~~P-5 §4.5 的事件变体清单补充 `Elicitation`~~ —— **已被 [ADR-0007](0007-elicitation-capability-gated.md) 取代**
+
+> **修正（2026-07-28）**：本节引用的 ACP `elicitation/create` / `elicitation/complete` 来自
+> **v2 Draft** 文档，而本 ADR P-2 钉定的是 **v1**。对 `schemas/acp/schema.json` 的实测确认：
+> `grep -i "elicit"` 无任何命中，ACP v1 不存在 elicitation。
+> `Elicitation` 变体保留，但降级为 `caps.elicitation` 能力位控制，详见 ADR-0007。
+
+### P-5（原文，仅存档）
 
 `SessionEvent` 增加一个变体，承载「agent 要求结构化输入」：至少包含请求 id、提示文本、JSON Schema、以及取消语义。对应的客户端响应方法进入 `permission.*` 或独立的 `elicit.*` 方法族（G1 定夺）。
 

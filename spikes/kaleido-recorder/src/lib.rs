@@ -1,3 +1,5 @@
+pub mod agents;
+pub mod auth;
 pub mod fixture;
 pub mod platform;
 pub mod redact;

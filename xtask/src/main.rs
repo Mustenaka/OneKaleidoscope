@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus};
 
 use forbidden::scan_repository;
+use xtask::fixtures;
 use xtask::schema::{self, SchemaCommand};
 
 #[derive(Debug)]
@@ -17,6 +18,7 @@ enum Task {
     Clippy,
     Test,
     LintForbidden,
+    FixturesVerify,
     Schema(SchemaCommand),
 }
 
@@ -30,6 +32,7 @@ enum XtaskError {
         status: ExitStatus,
     },
     ForbiddenFound(usize),
+    Fixtures(fixtures::FixtureVerifyError),
     Schema(schema::SchemaError),
 }
 
@@ -38,7 +41,7 @@ impl fmt::Display for XtaskError {
         match self {
             Self::Usage => write!(
                 formatter,
-                "usage: cargo xtask <ci|fmt|clippy|test|lint-forbidden|schema <refresh|diff>>"
+                "usage: cargo xtask <ci|fmt|clippy|test|lint-forbidden|fixtures verify|schema <refresh|diff>>"
             ),
             Self::WorkspaceRoot => write!(formatter, "could not resolve the workspace root"),
             Self::Io(error) => write!(formatter, "I/O failure: {error}"),
@@ -48,6 +51,7 @@ impl fmt::Display for XtaskError {
             Self::ForbiddenFound(count) => {
                 write!(formatter, "lint-forbidden found {count} violation(s)")
             }
+            Self::Fixtures(error) => write!(formatter, "{error}"),
             Self::Schema(error) => write!(formatter, "{error}"),
         }
     }
@@ -57,6 +61,7 @@ impl std::error::Error for XtaskError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
+            Self::Fixtures(error) => Some(error),
             Self::Schema(error) => Some(error),
             _ => None,
         }
@@ -72,6 +77,12 @@ impl From<io::Error> for XtaskError {
 impl From<schema::SchemaError> for XtaskError {
     fn from(error: schema::SchemaError) -> Self {
         Self::Schema(error)
+    }
+}
+
+impl From<fixtures::FixtureVerifyError> for XtaskError {
+    fn from(error: fixtures::FixtureVerifyError) -> Self {
+        Self::Fixtures(error)
     }
 }
 
@@ -114,7 +125,8 @@ fn run() -> Result<(), XtaskError> {
                 &["clippy", "--all-targets", "--", "-D", "warnings"],
             )?;
             run_cargo_step_in_target(&root, &target, "test", &["test", "--workspace"])?;
-            run_forbidden_step(&root)
+            run_forbidden_step(&root)?;
+            run_fixtures_step(&root)
         }
         Task::Fmt => run_cargo_step(&root, "fmt-check", &["fmt", "--all", "--", "--check"]),
         Task::Clippy => run_cargo_step(
@@ -124,6 +136,7 @@ fn run() -> Result<(), XtaskError> {
         ),
         Task::Test => run_cargo_step(&root, "test", &["test", "--workspace"]),
         Task::LintForbidden => run_forbidden_step(&root),
+        Task::FixturesVerify => run_fixtures_step(&root),
         Task::Schema(command) => schema::run(command, &root).map_err(Into::into),
     }
 }
@@ -140,6 +153,15 @@ fn parse_task() -> Result<Task, XtaskError> {
         Some("clippy") => parse_without_extra_arguments(Task::Clippy, arguments),
         Some("test") => parse_without_extra_arguments(Task::Test, arguments),
         Some("lint-forbidden") => parse_without_extra_arguments(Task::LintForbidden, arguments),
+        Some("fixtures") => {
+            let Some(subcommand) = arguments.next() else {
+                return Err(XtaskError::Usage);
+            };
+            match subcommand.to_str() {
+                Some("verify") => parse_without_extra_arguments(Task::FixturesVerify, arguments),
+                _ => Err(XtaskError::Usage),
+            }
+        }
         Some("schema") => {
             let Some(subcommand) = arguments.next() else {
                 return Err(XtaskError::Usage);
@@ -218,6 +240,18 @@ fn run_forbidden_step(root: &Path) -> Result<(), XtaskError> {
         return Err(XtaskError::ForbiddenFound(violations.len()));
     }
     println!("<== {STEP}: ok");
+    Ok(())
+}
+
+fn run_fixtures_step(root: &Path) -> Result<(), XtaskError> {
+    const STEP: &str = "fixtures-verify";
+    announce(STEP)?;
+    let summary = fixtures::verify_workspace(root)?;
+    if summary.files == 0 {
+        println!("<== {STEP}: ok; 0 files, 0 records (no fixture files found)");
+    } else {
+        println!("<== {STEP}: ok; {summary}");
+    }
     Ok(())
 }
 

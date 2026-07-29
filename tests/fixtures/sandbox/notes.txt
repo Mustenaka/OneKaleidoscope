@@ -1,0 +1,2 @@
+Kaleidoscopes create changing symmetric patterns from a small set of pieces.
+This file is deliberately public, deterministic, and contains no project data.

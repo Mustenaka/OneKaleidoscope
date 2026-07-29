@@ -28,3 +28,8 @@ indexing_slicing = "deny"
 todo = "deny"
 unimplemented = "deny"
 dbg_macro = "deny"
+
+[patch.crates-io]
+directories = { path = "vendor/directories-6.0.0" }
+dirs-sys = { path = "vendor/dirs-sys-0.5.0" }
+option-ext = { path = "vendor/option-ext-0.2.0" }
