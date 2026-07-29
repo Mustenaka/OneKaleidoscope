@@ -12,6 +12,7 @@
 | [0003 OBJ-1 三级语义](adr/0003-agent-attach-semantics.md) | §1.1 OBJ-1、§4.5、§9（新增 R-9 / R-10） |
 | [0004 ACP 版本钉定](adr/0004-acp-version-pinning.md) | §4.2（包名）、§4.5（新增 `Elicitation` 变体）、§9 R-2 |
 | [0005 schema 规范化层](adr/0005-schema-normalization-layer.md) | §4.3 / §4.4（生成器选型）、§9 R-4 |
+| [0006 Agent 发现策略](adr/0006-agent-discovery.md) | §4.2（Node 前置、GUI/CLI 双形态）、§9（新增 R-11） |
 
 ---
 
@@ -157,7 +158,9 @@ Adapter 必须通过 `capabilities()` 显式声明自己支持哪些可选能力
 - Rust 侧使用官方 `agent-client-protocol` crate，**钉定 1.x（ACP 协议 v1）**，不跟进 v2 Draft
 - 版本号必须钉死确切值，不用 `latest` / `^`；升级走 ADR
 - **不要**直接对接 `claude --output-format stream-json`：该协议未公开承诺稳定，Zed 的适配器帮你扛住上游变更
-- 依赖：宿主机需有 Node（Claude Code 本身即 npm 分发，通常已具备）；hostd 启动时探测并在缺失时给出明确指引
+- 依赖：**Node 是独立的硬前置**，不可假设「通常已具备」—— Claude Code 桌面版不携带 Node（[ADR-0006](adr/0006-agent-discovery.md) D-4）。hostd 启动时显式探测并在缺失时给出确切安装指引
+- **不依赖用户安装 `claude` CLI**：`@agentclientprotocol/claude-agent-acp` 经 npm 安装时会自带各平台的 Claude Code 原生二进制（`@anthropic-ai/claude-agent-sdk-*`）。逃生舱为 `pathToClaudeCodeExecutable`
+- **仅装 GUI 的机器同样可用**。GUI 安装真正影响的是认证凭据与会话存储位置，不是能否起协议进程
 
 **文档**
 - Agent SDK 总览 — https://platform.claude.com/docs/en/agent-sdk/overview
@@ -337,6 +340,7 @@ pub trait AgentAdapter: Send + Sync {
 | R-8 | 三家的权限模型不同构：ACP 是「agent 提供动态选项数组 + 客户端回 optionId」，Codex 是两个分开的服务端请求 + 固定字符串枚举 | 无法无损归一化，UACP 设计一旦选错方向需推倒重来 | UACP 采用「选项列表 + 选项 id」形状（表达力更强的一侧），由 Codex adapter 合成固定选项集；G1 定稿前必须用三家真实录制 fixture 验证一遍 |
 | R-9 | hostd 与用户的 CLI/GUI 并发读写同一份会话存储（`~/.claude/projects`、Codex thread 目录） | 会话损坏或事件错乱 | v1 内加载即独占，UI 明示「已被手机接管」；G2 必须实测并把实际行为记入 `docs/gates/G2-result.md`，不许假设安全（ADR-0003） |
 | R-10 | `loadSession` / `sessionCapabilities` 是能力位而非保证，适配器升级可能撤销 | 会话列表功能突然消失 | 握手时检查能力位，为 false 时降级为「只能新建」并在 UI 明示原因；禁止崩溃或静默隐藏（ADR-0003） |
+| R-11 | 仅装 GUI 的机器上，GUI 写入的登录态能否被 npm 自备的 Claude Code 二进制复用，尚未实测 | 若不能复用，Claude Code 路径需要用户额外登录一次，影响 OBJ-1 的开箱体验 | T-004 必须实测并给出结论；不能复用时在 UI 明示并给出可操作指引（ADR-0006） |
 
 ---
 

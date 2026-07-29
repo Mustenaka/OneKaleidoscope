@@ -13,12 +13,17 @@ T-003 阻塞 → 拆出 T-005；T-004 阻塞（Windows 可执行文件解析）�
 | 1 | T-001 iroh spike | ✅ 已交付（待审） |
 | 2 | T-002 工程守卫 | ✅ 已交付（待审） |
 | 3 | T-003 schema 快照（修订 R1） | ✅ 已交付（待审） |
-| 4 | **T-005 阶段一**（生成链评估，第 0~3 步） | ⏩ **下一条发这个** |
-| 5 | **T-004（修订 R1）** 真实录制 | 待 Windows 解析问题修正 |
-| 6 | **T-005 阶段二**（fixture 往返验证，第 4 步） | 待 T-004 |
+| 4 | **T-004（修订 R2）** 真实录制 | ⏩ **下一条发这个** |
+| 5 | **T-005**（生成链落地，第 0~4 步一次做完） | 待 T-004 |
 
-理由：T-005 前三步只需 `schemas/`（已就绪），不需要三家 agent 跑起来。
-先做它可以在 T-004 环境问题解决期间拿到生成链的选型证据，队列不停摆。
+**三次改序说明**：
+
+- T-003 阻塞 → 拆出 T-005
+- T-004 阻塞（报 `claude` 不可发现）→ 曾计划先做 T-005 阶段一顶上
+- **负责人说明安装形态 + 核实到 Claude Code SDK 自带二进制（[ADR-0006](../adr/0006-agent-discovery.md)）→ T-004 阻塞解除，恢复原顺序**
+
+因此 T-005 不再需要分阶段，一次做完即可（fixture 往返验证需要 T-004 的产物）。
+下方保留了 T-005 分阶段的 prompt，**仅作 T-004 再次阻塞时的备选**。
 
 **共同前提**：Codex 每次动手前都必须重读 `AGENTS.md`。四条 prompt 里都写了，不要删。
 
@@ -159,16 +164,17 @@ Codex schema 的嵌套 definitions。你没改 schema、没手写类型、没动
 
 ---
 
-## Prompt 4（修订 R1）—— T-004 三家 agent 真实事件录制
+## Prompt 4（修订 R2）—— T-004 三家 agent 真实事件录制 ⏩ 现在发这条
 
-> **本条已重写。** 首次执行时报告环境阻塞，但经核对与 T-003 自己的交付物矛盾 ——
-> 根因是 Windows 上的可执行文件解析（R-6），不是环境缺失。
-> **在 Prompt 5-阶段一 交付之后再发这条。**
+> R1 判定阻塞根因为 Windows 解析（R-6）；R2 在负责人说明安装形态后，
+> 进一步核实到 Claude Code 不需要 CLI，**`claude` 的阻塞彻底解除**。
 
 ```
 继续 OneKaleidoscope 项目，你仍是实现方（Implementer）。
 
-关于你上一轮就 T-004 提交的环境阻塞：主管核对后判定根因不是环境缺失。
+关于你上一轮就 T-004 提交的环境阻塞：主管核对后判定阻塞不成立，两个根因都已澄清。
+
+【根因一：Windows 可执行文件解析，不是环境缺失】
 
 你在 T-003 交付的 schemas/VERSIONS.md 里，自己记录了在同一环境下成功执行过：
     codex.cmd app-server generate-json-schema --out schemas/codex
@@ -176,38 +182,55 @@ Codex schema 的嵌套 definitions。你没改 schema、没手写类型、没动
 
 也就是说 codex 与 opencode 装好了、能跑，只是不能用裸名字启动。
 
-根因是 Windows 上 npm 全局安装会生成三个文件：codex（无扩展名的 POSIX sh 脚本）、
+Windows 上 npm 全局安装会生成三个文件：codex（无扩展名的 POSIX sh 脚本）、
 codex.cmd、codex.ps1。直接 exec 那个无扩展名的 sh 脚本，Windows 返回的就是
 "Access is denied"。「不可发现」是同一现象的另一面。
-
 这正是 REQUIREMENTS §9 的 R-6 与 AGENTS.md §3.5 点名的陷阱。
 
+【根因二：Claude Code 根本不需要 CLI】
+
+负责人的实际安装形态是：Claude Code 只装了 GUI、Codex 装了 CLI+GUI、OpenCode 只装了 CLI。
+并明确要求同时支持 GUI 与 CLI 形态的协议识别。
+
+核实结果：@anthropic-ai/claude-agent-sdk 通过 npm optionalDependencies
+自带各平台的 Claude Code 原生二进制。官方文档原文：
+"The SDK bundles a native Claude Code binary for your platform as an optional
+dependency… You don't need to install Claude Code separately."
+
+所以 Claude Code 的录制方式是：用钉定版本的 @agentclientprotocol/claude-agent-acp
+经 npm/npx 起 ACP 进程。不要去找用户的 claude 命令，它不存在也不需要存在。
+
+主管据此签发了 docs/adr/0006-agent-discovery.md。
+
 动手前必读：
-1. docs/tasks/T-004.md —— 注意新增的「Windows 上的可执行文件解析」一节
-2. AGENTS.md §3.5（跨平台纪律）、§2.3（fixture 必须真实）
-3. docs/REQUIREMENTS.md §4.5（12 个事件变体）、§6.3（安全红线）、§9 R-6
+1. docs/adr/0006-agent-discovery.md —— 新签发，全文
+2. docs/tasks/T-004.md —— 注意新增的两节：「Windows 上的可执行文件解析」与「Agent 发现」
+3. AGENTS.md §3.5（跨平台纪律）、§2.3（fixture 必须真实）
+4. docs/REQUIREMENTS.md §4.5（12 个事件变体）、§6.3（安全红线）、§9 R-6 / R-11
 
 本次任务：执行修订后的 docs/tasks/T-004.md。
 
-先做这四件事，再判断环境：
+五件事需要特别注意：
 
-1. 写一个平台感知的可执行文件解析：Windows 上按 PATHEXT 顺序查找
-   （.cmd / .exe / .bat），命中 .cmd 时按 Windows 方式启动；非 Windows 用裸名字。
+1. 先写平台感知的可执行文件解析：Windows 上按 PATHEXT 顺序查找（.cmd / .exe / .bat），
+   命中 .cmd 时按 Windows 方式启动；非 Windows 用裸名字。
    逻辑收敛在 spikes/kaleido-recorder/src/platform/ 下，配单元测试。
    这段代码不是一次性的 —— hostd 将来 spawn 三家 agent 用的就是同一套逻辑。
 
-2. 用修好的解析重新探测三家。如果再报找不到，报告里必须包含：
-   查了哪些候选名、每个候选的解析结果、以及 where.exe <name> 的原始输出。
-   只说「不可发现」信息量不够。
+2. 禁止「PATH 上没有 CLI ⇒ 该 agent 不可用」的推断。探测报告必须区分四种情况：
+   没装 / 装了但解析方式不对 / 装了 GUI 没装 CLI（多数情况下仍可用）/ 装了但未登录。
 
-3. claude 有可能是真的没装。若确认只有它缺失，不要整卡阻塞 ——
-   先把 codex 与 opencode 两家的 fixture 录完，claude 那一列在覆盖度表里
-   如实标注「未安装」。部分交付比零交付有价值。
+3. 必须回答一个问题（对应新增风险 R-11）：负责人的 Claude Code 是 GUI 登录的，
+   GUI 写入 ~/.claude 的登录态能否被 npm 自备的二进制直接复用？
+   能复用就说明验证方式；不能就说明用户还需要做什么。如实报告，这影响开箱体验。
 
-4. 其余要求不变：不许编造报文、payload 原样保留、必须在
-   tests/fixtures/sandbox/ 里录、schema 校验失败要原样上报。
+4. 其余要求不变：不许编造报文、payload 原样保留、必须在 tests/fixtures/sandbox/ 里录、
+   schema 校验失败要原样上报、12×3 覆盖度表如实填（空格子比假数据有价值）。
 
-交付时按 AGENTS.md §4.2 附带全部要求项。
+5. 若某家仍然录不成，不要整卡阻塞 —— 先把能录的录完，那一家在覆盖度表里标注原因。
+
+交付时按 AGENTS.md §4.2 附带全部要求项，并单独整理一段
+「三家在权限审批上的实际报文形状差异」（主管等着用，对应 R-8）。
 
 边界：任务卡「边界」一节列出的文件一律不许碰。schemas/** 只读。
 
@@ -265,7 +288,10 @@ codex.cmd、codex.ps1。直接 exec 那个无扩展名的 sh 脚本，Windows �
 
 ---
 
-## Prompt 5 · 阶段一 —— T-005 生成链评估（第 0~3 步）⏩ 现在发这条
+## Prompt 5 · 阶段一 —— T-005 生成链评估（第 0~3 步）
+
+> **备选路径**：仅在 T-004 再次阻塞、需要让队列继续走时才发这条。
+> T-004 正常交付的话，直接用下面的 Prompt 5 合并版（存档折叠里那份）一次做完。
 
 ```
 继续 OneKaleidoscope 项目，你仍是实现方（Implementer）。
