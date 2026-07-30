@@ -657,6 +657,9 @@ fn process_error_kind(error: &ProcessError) -> io::ErrorKind {
         ProcessError::Spawn(error)
         | ProcessError::Inspect(error)
         | ProcessError::Terminate(error) => error.kind(),
+        ProcessError::IncompleteCleanup { .. } | ProcessError::CombinedCleanup { .. } => {
+            io::ErrorKind::Other
+        }
         ProcessError::Resolve(_) => io::ErrorKind::NotFound,
         ProcessError::UnsafeScriptArgument => io::ErrorKind::InvalidInput,
     }
@@ -725,8 +728,62 @@ pub enum ProcessError {
     Inspect(#[source] io::Error),
     #[error("failed to terminate child process tree: {0}")]
     Terminate(#[source] io::Error),
+    #[error(
+        "could not confirm termination of descendants {unconfirmed_pids:?} from spawned root PID \
+         {root_pid}: {detail}"
+    )]
+    IncompleteCleanup {
+        root_pid: u32,
+        unconfirmed_pids: Vec<u32>,
+        detail: String,
+    },
+    #[error(
+        "spawned root cleanup failed ({root}); exact descendant cleanup also failed \
+         ({descendants})"
+    )]
+    CombinedCleanup {
+        root: Box<ProcessError>,
+        #[source]
+        descendants: Box<ProcessError>,
+    },
     #[error("refusing unsafe command-script argument")]
     UnsafeScriptArgument,
+}
+
+impl ProcessError {
+    pub fn unconfirmed_pids(&self) -> Vec<u32> {
+        let mut process_ids = BTreeSet::new();
+        self.collect_unconfirmed_pids(&mut process_ids);
+        process_ids.into_iter().collect()
+    }
+
+    fn collect_unconfirmed_pids(&self, process_ids: &mut BTreeSet<u32>) {
+        match self {
+            Self::IncompleteCleanup {
+                unconfirmed_pids, ..
+            } => process_ids.extend(unconfirmed_pids),
+            Self::CombinedCleanup { root, descendants } => {
+                root.collect_unconfirmed_pids(process_ids);
+                descendants.collect_unconfirmed_pids(process_ids);
+            }
+            Self::Resolve(_)
+            | Self::Spawn(_)
+            | Self::Inspect(_)
+            | Self::Terminate(_)
+            | Self::UnsafeScriptArgument => {}
+        }
+    }
+}
+
+pub trait ProcessCleanupDiagnostic {
+    /// Returns every PID whose termination could not be confirmed, sorted and deduplicated.
+    fn unconfirmed_pids(&self) -> Vec<u32>;
+}
+
+impl ProcessCleanupDiagnostic for ProcessError {
+    fn unconfirmed_pids(&self) -> Vec<u32> {
+        Self::unconfirmed_pids(self)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -795,14 +852,19 @@ pub(super) fn wait_for_spawned_process_family_exit(
             return Ok(());
         }
         if started.elapsed() >= timeout {
-            return Err(ProcessError::Terminate(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "{} member(s) of spawned root PID {} family remained after cleanup",
-                    remaining.len(),
-                    family.root_pid
+            return Err(ProcessError::IncompleteCleanup {
+                root_pid: family.root_pid,
+                unconfirmed_pids: remaining
+                    .iter()
+                    .map(|process| process.pid)
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
+                detail: format!(
+                    "{} member(s) of the spawned process family remained after cleanup",
+                    remaining.len()
                 ),
-            )));
+            });
         }
         thread::sleep(Duration::from_millis(20));
     }
@@ -1334,7 +1396,14 @@ mod process_family_tests {
             return Err(io::Error::other("spawned descendant residual was not detected").into());
         };
 
-        assert!(matches!(error, ProcessError::Terminate(_)));
+        assert!(matches!(
+            error,
+            ProcessError::IncompleteCleanup {
+                root_pid: 100,
+                ref unconfirmed_pids,
+                ..
+            } if unconfirmed_pids == &[101]
+        ));
         assert!(error.to_string().contains("1 member(s)"));
         assert!(error.to_string().contains("root PID 100"));
         Ok(())

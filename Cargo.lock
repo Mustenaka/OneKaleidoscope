@@ -4245,9 +4245,12 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "proc-macro2",
  "reqwest",
+ "serde",
  "serde_json",
  "sha1_smol",
+ "syn 2.0.119",
  "tempfile",
  "thiserror 2.0.19",
 ]

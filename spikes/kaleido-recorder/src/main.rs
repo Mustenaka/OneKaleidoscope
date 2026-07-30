@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::error::Error;
 use std::ffi::OsString;
@@ -13,6 +14,7 @@ use kaleido_recorder::agents::codex::{self, CodexRecorderConfig, CodexRecording,
 use kaleido_recorder::agents::opencode::{
     self, Outcome as OpenCodeOutcome, Scenario as OpenCodeScenario,
 };
+use kaleido_recorder::agents::{CleanupIssue, CompletedRecording};
 use kaleido_recorder::auth;
 use kaleido_recorder::fixture::{reprocess_jsonl, FixtureSink};
 use kaleido_recorder::platform::{
@@ -20,6 +22,7 @@ use kaleido_recorder::platform::{
     RuntimeProbe,
 };
 use kaleido_recorder::redact::Redactor;
+use serde::Serialize;
 use tempfile::{Builder as TempDirBuilder, NamedTempFile, TempDir};
 
 const DISCOVER_USAGE: &str = "kaleido-recorder discover \
@@ -43,6 +46,7 @@ enum RecorderError {
     Io(io::Error),
     Agent(Box<dyn Error>),
     Fixture(Box<dyn Error>),
+    Metadata(serde_json::Error),
     Discovery(String),
     ExistingFixture(String),
     NotObserved(String),
@@ -58,6 +62,12 @@ impl fmt::Display for RecorderError {
             Self::Io(error) => write!(formatter, "I/O failure: {error}"),
             Self::Agent(error) => write!(formatter, "agent protocol attempt failed: {error}"),
             Self::Fixture(error) => write!(formatter, "fixture reprocessing failed: {error}"),
+            Self::Metadata(error) => {
+                write!(
+                    formatter,
+                    "recording metadata serialization failed: {error}"
+                )
+            }
             Self::Discovery(reason) => write!(formatter, "agent discovery failed: {reason}"),
             Self::ExistingFixture(path) => {
                 write!(formatter, "refusing to overwrite existing fixture {path}")
@@ -78,6 +88,7 @@ impl Error for RecorderError {
             Self::Io(error) => Some(error),
             Self::Agent(error) => Some(error.as_ref()),
             Self::Fixture(error) => Some(error.as_ref()),
+            Self::Metadata(error) => Some(error),
             Self::Usage(_)
             | Self::WorkspaceRoot
             | Self::Discovery(_)
@@ -470,12 +481,18 @@ fn remove_tree_if_present(path: &Path) -> io::Result<()> {
 }
 
 fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("kaleido-recorder: {error}");
-            ExitCode::FAILURE
-        }
+    let result = run();
+    if let Err(error) = &result {
+        eprintln!("kaleido-recorder: {error}");
+    }
+    result_exit_code(&result)
+}
+
+fn result_exit_code<T, E>(result: &Result<T, E>) -> ExitCode {
+    if result.is_ok() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 
@@ -969,17 +986,26 @@ fn run_record(agent: AgentKind, arguments: RecordArguments) -> Result<(), Record
     let expected_sandbox = canonical_fixtures_directory.join("sandbox");
     let redactor = Redactor::for_environment(&expected_sandbox);
     let output = output_directory.join(arguments.scenario.file_name());
-    match fs::symlink_metadata(&output) {
-        Ok(_) => {
-            return Err(RecorderError::ExistingFixture(format!(
-                "{}/{}",
-                agent.fixture_directory(),
-                arguments.scenario.file_name()
-            )));
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
+    let metadata_output = recording_metadata_path(&output);
+    require_absent_recording_target(
+        &output,
+        format!(
+            "{}/{}",
+            agent.fixture_directory(),
+            arguments.scenario.file_name()
+        ),
+    )?;
+    require_absent_recording_target(
+        &metadata_output,
+        format!(
+            "{}/{}",
+            agent.fixture_directory(),
+            metadata_output
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("recording metadata")
+        ),
+    )?;
 
     let explicit = match arguments.executable {
         Some(path) => Some(path),
@@ -1035,19 +1061,112 @@ fn run_record(agent: AgentKind, arguments: RecordArguments) -> Result<(), Record
     };
     let restore = sandbox_state.restore();
     restore?;
-    let summary = attempt?;
-    temporary.as_file_mut().flush()?;
-    temporary.as_file().sync_all()?;
-    temporary
-        .persist_noclobber(&output)
-        .map_err(|error| RecorderError::Io(error.error))?;
+    let mut warnings = io::stderr().lock();
+    let recording = install_recording(attempt, temporary, &output, &redactor, &mut warnings)?;
     println!(
-        "recorded agent={} scenario={} output={} ({summary})",
+        "recorded agent={} scenario={} output={} ({})",
         agent.fixture_directory(),
         arguments.scenario.label(),
-        redactor.redact(&output.to_string_lossy())
+        redactor.redact(&output.to_string_lossy()),
+        recording.summary
     );
     Ok(())
+}
+
+fn require_absent_recording_target(path: &Path, display: String) -> Result<(), RecorderError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(RecorderError::ExistingFixture(display)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn recording_metadata_path(output: &Path) -> PathBuf {
+    output.with_extension("metadata.json")
+}
+
+#[derive(Debug, Serialize)]
+struct RecordingMetadata {
+    cleanup: &'static str,
+    unconfirmed_pids: Vec<u32>,
+    cleanup_errors: Vec<String>,
+}
+
+impl RecordingMetadata {
+    fn from_cleanup_issues(issues: &[CleanupIssue], redactor: &Redactor) -> Self {
+        let unconfirmed_pids = issues
+            .iter()
+            .flat_map(|issue| issue.unconfirmed_pids.iter().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let cleanup_errors = issues
+            .iter()
+            .map(|issue| redactor.redact(&issue.error))
+            .collect();
+        Self {
+            cleanup: if issues.is_empty() {
+                "complete"
+            } else {
+                "incomplete"
+            },
+            unconfirmed_pids,
+            cleanup_errors,
+        }
+    }
+}
+
+fn install_recording(
+    attempt: Result<AgentRecordOutcome, RecorderError>,
+    mut temporary: NamedTempFile,
+    output: &Path,
+    redactor: &Redactor,
+    warnings: &mut impl Write,
+) -> Result<AgentRecordOutcome, RecorderError> {
+    // This remains the hard transcript gate. An error returns before either target is installed.
+    let recording = attempt?;
+    temporary.as_file_mut().flush()?;
+    temporary.as_file().sync_all()?;
+
+    let metadata = RecordingMetadata::from_cleanup_issues(&recording.cleanup_issues, redactor);
+    let metadata_output = recording_metadata_path(output);
+    let output_directory = output
+        .parent()
+        .ok_or_else(|| io::Error::other("fixture output has no parent directory"))?;
+    let mut metadata_temporary = NamedTempFile::new_in(output_directory)?;
+    serde_json::to_writer_pretty(metadata_temporary.as_file_mut(), &metadata)
+        .map_err(RecorderError::Metadata)?;
+    metadata_temporary.as_file_mut().write_all(b"\n")?;
+    metadata_temporary.as_file_mut().flush()?;
+    metadata_temporary.as_file().sync_all()?;
+
+    metadata_temporary
+        .persist_noclobber(&metadata_output)
+        .map_err(|error| RecorderError::Io(error.error))?;
+    if let Err(error) = temporary.persist_noclobber(output) {
+        let fixture_error = error.error;
+        if let Err(rollback_error) = fs::remove_file(&metadata_output) {
+            return Err(RecorderError::Io(io::Error::other(format!(
+                "fixture install failed: {fixture_error}; recording metadata rollback failed: \
+                 {rollback_error}"
+            ))));
+        }
+        return Err(RecorderError::Io(fixture_error));
+    }
+
+    if metadata.cleanup == "incomplete" {
+        // Metadata is the durable diagnostic. A closed stderr must not turn an already installed,
+        // strictly valid recording back into a failed command.
+        let _warning_result = writeln!(
+            warnings,
+            "WARNING: valid transcript installed, but process cleanup was incomplete; \
+             unconfirmed_pids={:?}; cleanup_errors={:?}; metadata={}",
+            metadata.unconfirmed_pids,
+            metadata.cleanup_errors,
+            redactor.redact(&metadata_output.to_string_lossy())
+        );
+    }
+    Ok(recording)
 }
 
 fn require_expected_directory(
@@ -1169,12 +1288,18 @@ struct AgentRecordArguments {
     timeout: Duration,
 }
 
+#[derive(Debug)]
+struct AgentRecordOutcome {
+    summary: String,
+    cleanup_issues: Vec<CleanupIssue>,
+}
+
 fn record_agent<W: Write>(
     arguments: AgentRecordArguments,
     executable: &ResolvedExecutable,
     sandbox: &Path,
     fixture: &mut FixtureSink<W>,
-) -> Result<String, RecorderError> {
+) -> Result<AgentRecordOutcome, RecorderError> {
     match arguments.agent {
         AgentKind::Codex => record_codex(
             arguments.scenario,
@@ -1209,7 +1334,7 @@ fn record_codex<W: Write>(
     executable: &ResolvedExecutable,
     sandbox: &Path,
     fixture: &mut FixtureSink<W>,
-) -> Result<String, RecorderError> {
+) -> Result<AgentRecordOutcome, RecorderError> {
     let codex_scenario = match scenario {
         Scenario::SimpleTurn => CodexScenario::SimpleTurn,
         Scenario::ToolCall => CodexScenario::ToolCall,
@@ -1232,12 +1357,14 @@ fn record_codex<W: Write>(
         },
     )
     .map_err(agent_error)?;
-    ensure_codex_observed(scenario, &recording)?;
-    Ok(format!(
-        "{} notification methods, {} server requests",
-        recording.notification_methods.len(),
-        recording.server_request_methods.len()
-    ))
+    finish_agent_recording(recording, |recording| {
+        ensure_codex_observed(scenario, &recording)?;
+        Ok(format!(
+            "{} notification methods, {} server requests",
+            recording.notification_methods.len(),
+            recording.server_request_methods.len()
+        ))
+    })
 }
 
 fn ensure_codex_observed(
@@ -1288,7 +1415,7 @@ fn record_acp<W: Write>(
     executable: &ResolvedExecutable,
     sandbox: &Path,
     fixture: &mut FixtureSink<W>,
-) -> Result<String, RecorderError> {
+) -> Result<AgentRecordOutcome, RecorderError> {
     if scenario == Scenario::SessionLoad {
         let session_id = session_id.ok_or_else(|| {
             RecorderError::Usage(
@@ -1304,7 +1431,7 @@ fn record_acp<W: Write>(
             timeout,
         )
         .map_err(agent_error)?;
-        return summarize_acp_outcome(scenario, outcome);
+        return finish_agent_recording(outcome, |outcome| summarize_acp_outcome(scenario, outcome));
     }
 
     let acp_scenario = match scenario {
@@ -1331,7 +1458,7 @@ fn record_acp<W: Write>(
         timeout,
     )
     .map_err(agent_error)?;
-    summarize_acp_outcome(scenario, outcome)
+    finish_agent_recording(outcome, |outcome| summarize_acp_outcome(scenario, outcome))
 }
 
 fn summarize_acp_outcome(scenario: Scenario, outcome: AcpOutcome) -> Result<String, RecorderError> {
@@ -1387,7 +1514,7 @@ fn record_opencode<W: Write>(
     executable: &ResolvedExecutable,
     sandbox: &Path,
     fixture: &mut FixtureSink<W>,
-) -> Result<String, RecorderError> {
+) -> Result<AgentRecordOutcome, RecorderError> {
     let opencode_scenario = match scenario {
         Scenario::SimpleTurn => OpenCodeScenario::SimpleTurn,
         Scenario::ToolCall => OpenCodeScenario::ToolCall,
@@ -1399,9 +1526,9 @@ fn record_opencode<W: Write>(
         Scenario::SessionLoad => OpenCodeScenario::SessionLoad,
         Scenario::Elicitation => OpenCodeScenario::Elicitation,
     };
-    match opencode::record(executable, sandbox, opencode_scenario, fixture, timeout)
-        .map_err(agent_error)?
-    {
+    let recording = opencode::record(executable, sandbox, opencode_scenario, fixture, timeout)
+        .map_err(agent_error)?;
+    finish_agent_recording(recording, |outcome| match outcome {
         OpenCodeOutcome::Recorded {
             event_count,
             observations,
@@ -1421,7 +1548,22 @@ fn record_opencode<W: Write>(
             "OpenCode recorded {event_count} events but required evidence was absent: {reason}; \
              observations={observations:?}"
         ))),
-    }
+    })
+}
+
+fn finish_agent_recording<T>(
+    recording: CompletedRecording<T>,
+    summarize: impl FnOnce(T) -> Result<String, RecorderError>,
+) -> Result<AgentRecordOutcome, RecorderError> {
+    let CompletedRecording {
+        outcome,
+        cleanup_issues,
+    } = recording;
+    let summary = summarize(outcome)?;
+    Ok(AgentRecordOutcome {
+        summary,
+        cleanup_issues,
+    })
 }
 
 fn agent_error<E: Error + 'static>(error: E) -> RecorderError {
@@ -1439,6 +1581,133 @@ fn workspace_root() -> Result<PathBuf, RecorderError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FailingWarningWriter;
+
+    impl Write for FailingWarningWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "forced warning write failure",
+            ))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn successful_transcript_with_incomplete_cleanup_installs_fixture_and_metadata(
+    ) -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let output = directory.path().join("01-simple-turn.jsonl");
+        let mut temporary = NamedTempFile::new_in(directory.path())?;
+        temporary
+            .as_file_mut()
+            .write_all(b"{\"real_protocol_transcript\":true}\n")?;
+        let completed = CompletedRecording::with_cleanup_result(
+            "strict transcript evidence accepted".to_owned(),
+            Err(platform::ProcessError::IncompleteCleanup {
+                root_pid: 108_000,
+                unconfirmed_pids: vec![108_028, 108_029],
+                detail: "access denied".to_owned(),
+            }),
+        );
+        let attempt = finish_agent_recording(completed, Ok);
+        let redactor = Redactor::from_pairs([]);
+        let mut warnings = Vec::new();
+
+        let result = install_recording(attempt, temporary, &output, &redactor, &mut warnings);
+
+        assert_eq!(result_exit_code(&result), ExitCode::SUCCESS);
+        let recording = result?;
+        assert_eq!(recording.summary, "strict transcript evidence accepted");
+        assert_eq!(fs::read(&output)?, b"{\"real_protocol_transcript\":true}\n");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(recording_metadata_path(&output))?)?;
+        assert_eq!(
+            metadata.get("cleanup"),
+            Some(&serde_json::json!("incomplete"))
+        );
+        assert_eq!(
+            metadata.get("unconfirmed_pids"),
+            Some(&serde_json::json!([108_028, 108_029]))
+        );
+        assert_eq!(
+            metadata.get("cleanup_errors"),
+            Some(&serde_json::json!([
+                "could not confirm termination of descendants [108028, 108029] from spawned root \
+                 PID 108000: access denied"
+            ]))
+        );
+        let warnings = String::from_utf8(warnings)?;
+        assert!(warnings.contains("WARNING: valid transcript installed"));
+        assert!(warnings.contains("unconfirmed_pids=[108028, 108029]"));
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_transcript_with_complete_cleanup_is_not_installed() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let output = directory.path().join("01-simple-turn.jsonl");
+        let mut temporary = NamedTempFile::new_in(directory.path())?;
+        temporary
+            .as_file_mut()
+            .write_all(b"{\"partial_protocol_transcript\":true}\n")?;
+        let attempt = Err(RecorderError::NotObserved(
+            "strict scenario evidence was absent".to_owned(),
+        ));
+        let mut warnings = Vec::new();
+
+        let result = install_recording(
+            attempt,
+            temporary,
+            &output,
+            &Redactor::from_pairs([]),
+            &mut warnings,
+        );
+
+        assert_eq!(result_exit_code(&result), ExitCode::FAILURE);
+        assert!(matches!(result, Err(RecorderError::NotObserved(_))));
+        assert!(!output.exists());
+        assert!(!recording_metadata_path(&output).exists());
+        assert!(warnings.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn failed_warning_write_cannot_reverse_an_installed_recording() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let output = directory.path().join("01-simple-turn.jsonl");
+        let mut temporary = NamedTempFile::new_in(directory.path())?;
+        temporary
+            .as_file_mut()
+            .write_all(b"{\"real_protocol_transcript\":true}\n")?;
+        let completed = CompletedRecording::with_cleanup_result(
+            "strict transcript evidence accepted".to_owned(),
+            Err(platform::ProcessError::IncompleteCleanup {
+                root_pid: 7,
+                unconfirmed_pids: vec![42],
+                detail: "forced cleanup failure".to_owned(),
+            }),
+        );
+        let attempt = finish_agent_recording(completed, Ok);
+
+        let result = install_recording(
+            attempt,
+            temporary,
+            &output,
+            &Redactor::from_pairs([]),
+            &mut FailingWarningWriter,
+        );
+
+        assert_eq!(result_exit_code(&result), ExitCode::SUCCESS);
+        let _recording = result?;
+        assert!(output.exists());
+        assert!(recording_metadata_path(&output).exists());
+        Ok(())
+    }
 
     #[test]
     fn redact_fixture_path_is_limited_to_one_known_agent_jsonl() {

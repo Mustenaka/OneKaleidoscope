@@ -1,12 +1,73 @@
+use std::error::Error;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::platform::ProcessCleanupDiagnostic;
+
 pub mod acp;
 pub mod codex;
 pub mod opencode;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CleanupIssue {
+    pub unconfirmed_pids: Vec<u32>,
+    pub error: String,
+}
+
+impl CleanupIssue {
+    pub fn from_error<E>(error: &E) -> Self
+    where
+        E: Error + ProcessCleanupDiagnostic + 'static,
+    {
+        Self {
+            unconfirmed_pids: error.unconfirmed_pids(),
+            error: error.to_string(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct CompletedRecording<T> {
+    pub outcome: T,
+    pub cleanup_issues: Vec<CleanupIssue>,
+}
+
+impl<T> CompletedRecording<T> {
+    pub fn clean(outcome: T) -> Self {
+        Self {
+            outcome,
+            cleanup_issues: Vec::new(),
+        }
+    }
+
+    pub fn add_cleanup_error<E>(&mut self, error: &E)
+    where
+        E: Error + ProcessCleanupDiagnostic + 'static,
+    {
+        self.cleanup_issues.push(CleanupIssue::from_error(error));
+    }
+
+    pub fn with_cleanup_result<E>(outcome: T, cleanup: Result<(), E>) -> Self
+    where
+        E: Error + ProcessCleanupDiagnostic + 'static,
+    {
+        let mut recording = Self::clean(outcome);
+        recording.add_cleanup_result(cleanup);
+        recording
+    }
+
+    pub fn add_cleanup_result<E>(&mut self, cleanup: Result<(), E>)
+    where
+        E: Error + ProcessCleanupDiagnostic + 'static,
+    {
+        if let Err(error) = cleanup {
+            self.add_cleanup_error(&error);
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum PermissionScopeError {
@@ -280,10 +341,30 @@ mod tests {
     use super::acp::{self, AcpError};
     use super::{
         validate_exact_permission_path, validate_permission_command,
-        validate_permission_command_as, validate_permission_path, PermissionCommand,
+        validate_permission_command_as, validate_permission_path, CleanupIssue, PermissionCommand,
         PermissionScopeError,
     };
     use crate::platform;
+
+    #[test]
+    fn cleanup_issue_preserves_nested_unconfirmed_process_ids() {
+        let error = platform::ProcessError::CombinedCleanup {
+            root: Box::new(platform::ProcessError::Terminate(std::io::Error::other(
+                "forced root cleanup failure",
+            ))),
+            descendants: Box::new(platform::ProcessError::IncompleteCleanup {
+                root_pid: 7,
+                unconfirmed_pids: vec![43, 42, 43],
+                detail: "forced descendant cleanup failure".to_owned(),
+            }),
+        };
+
+        let issue = CleanupIssue::from_error(&error);
+
+        assert_eq!(issue.unconfirmed_pids, [42, 43]);
+        assert!(issue.error.contains("forced root cleanup failure"));
+        assert!(issue.error.contains("forced descendant cleanup failure"));
+    }
 
     #[test]
     fn acp_sandbox_validation_rejects_a_linked_expected_root() -> Result<(), Box<dyn Error>> {

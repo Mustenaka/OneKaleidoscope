@@ -27,25 +27,72 @@ cargo xtask ci
 It stops at the first failure and runs, in this order:
 
 1. `cargo fmt --all -- --check`
-2. `cargo clippy --all-targets -- -D warnings`
-3. `cargo test --workspace`
-4. the repository forbidden-pattern scanner
+2. the architecture dependency guard
+3. the repository antipattern scanner
+4. `cargo clippy --all-targets -- -D warnings`
+5. `cargo test --workspace`
+6. fixture schema and leak verification
 
 Each gate can also be run independently:
 
 ```text
 cargo xtask fmt
+cargo xtask check-deps
+cargo xtask lint-forbidden
 cargo xtask clippy
 cargo xtask test
-cargo xtask lint-forbidden
+cargo xtask fixtures verify
 ```
 
 `cargo xtask fmt` is a formatting check; it does not rewrite files. To format
 code before running the gates, use `cargo fmt --all`.
 
 The forbidden-pattern scanner checks Rust source files under `crates/`,
-`spikes/`, and `xtask/`. It excludes `tests/fixtures/`, `schemas/`, and
-`target/`. A match is always an error; the scanner has no exemption mechanism.
+`spikes/`, and `xtask/`. It excludes root `schemas/`, `target/`, and every
+`tests/fixtures/` subtree. Dependency and crate-role rules come only from
+`docs/dependency-rules.toml`.
+
+## Adding a crate
+
+Every production crate belongs under `crates/` and must be represented in all
+of these places in the same change:
+
+1. the root workspace `members` list (the first M3 crate should add the
+   `crates/*` member glob);
+2. a `[crates."<package-name>"]` entry in
+   `docs/dependency-rules.toml`;
+3. that entry's complete `may_depend_on` allow-list and, where required,
+   its direct dependency deny-list.
+
+`cargo xtask check-deps` rejects a `crates/*/Cargo.toml` that Cargo does not
+consider a workspace member, a workspace member without a rules entry, and
+every workspace-internal edge outside the declared matrix. Rules for crates
+that have not been created yet are valid and intentionally do not fail.
+`spikes/*` and `xtask` are exempt only from having their own declaration; their
+workspace-internal edges still default to an empty allow-list.
+The `exclusive_targets` rule reserves concrete `kaleido-adapter-*` dependencies
+for the `kaleido-hostd` composition root, so a newly named UI crate cannot
+bypass the adapter boundary. If the new crate contains Rust UI code, also add
+its exact package name to `antipatterns.a2.ui_crates`.
+
+## A-2 agent-name branch exemptions
+
+UI code must branch on `capabilities()`, not an adapter name. If an A-2 match is
+a reviewed false positive, place this exact comment immediately before the
+flagged comparison or `match` expression:
+
+```rust
+// #[allow(kaleido::agent_name_branch)] reason: compatibility diagnostics only
+match adapter_name {
+    "codex" => render_diagnostic(),
+    _ => render_generic(),
+}
+```
+
+The text after `reason:` must be non-empty. The scanner prints the number of
+effective A-2 exemptions on every run so growth is visible in CI. This is the
+only antipattern exemption: A-1 ANSI/terminal parsing, A-4 upstream
+discriminators in UACP, and A-6 handwritten upstream types cannot be exempted.
 
 ## Test-only lint allowances
 

@@ -1,5 +1,3 @@
-mod forbidden;
-
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
@@ -7,9 +5,9 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus};
 
-use forbidden::scan_repository;
-use xtask::fixtures;
+use xtask::antipattern::{self, scan_repository};
 use xtask::schema::{self, SchemaCommand};
+use xtask::{deps, fixtures};
 
 #[derive(Debug)]
 enum Task {
@@ -17,6 +15,7 @@ enum Task {
     Fmt,
     Clippy,
     Test,
+    CheckDeps,
     LintForbidden,
     FixturesVerify,
     Schema(SchemaCommand),
@@ -32,6 +31,8 @@ enum XtaskError {
         status: ExitStatus,
     },
     ForbiddenFound(usize),
+    Dependencies(deps::DependencyCheckError),
+    Antipattern(antipattern::AntipatternError),
     Fixtures(fixtures::FixtureVerifyError),
     Schema(schema::SchemaError),
 }
@@ -41,7 +42,7 @@ impl fmt::Display for XtaskError {
         match self {
             Self::Usage => write!(
                 formatter,
-                "usage: cargo xtask <ci|fmt|clippy|test|lint-forbidden|fixtures verify|schema <refresh|diff>>"
+                "usage: cargo xtask <ci|fmt|clippy|test|check-deps|lint-forbidden|fixtures verify|schema <refresh|diff>>"
             ),
             Self::WorkspaceRoot => write!(formatter, "could not resolve the workspace root"),
             Self::Io(error) => write!(formatter, "I/O failure: {error}"),
@@ -51,6 +52,8 @@ impl fmt::Display for XtaskError {
             Self::ForbiddenFound(count) => {
                 write!(formatter, "lint-forbidden found {count} violation(s)")
             }
+            Self::Dependencies(error) => write!(formatter, "{error}"),
+            Self::Antipattern(error) => write!(formatter, "{error}"),
             Self::Fixtures(error) => write!(formatter, "{error}"),
             Self::Schema(error) => write!(formatter, "{error}"),
         }
@@ -61,6 +64,8 @@ impl std::error::Error for XtaskError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
+            Self::Dependencies(error) => Some(error),
+            Self::Antipattern(error) => Some(error),
             Self::Fixtures(error) => Some(error),
             Self::Schema(error) => Some(error),
             _ => None,
@@ -77,6 +82,18 @@ impl From<io::Error> for XtaskError {
 impl From<schema::SchemaError> for XtaskError {
     fn from(error: schema::SchemaError) -> Self {
         Self::Schema(error)
+    }
+}
+
+impl From<deps::DependencyCheckError> for XtaskError {
+    fn from(error: deps::DependencyCheckError) -> Self {
+        Self::Dependencies(error)
+    }
+}
+
+impl From<antipattern::AntipatternError> for XtaskError {
+    fn from(error: antipattern::AntipatternError) -> Self {
+        Self::Antipattern(error)
     }
 }
 
@@ -118,6 +135,8 @@ fn run() -> Result<(), XtaskError> {
                 "fmt-check",
                 &["fmt", "--all", "--", "--check"],
             )?;
+            run_deps_step(&root)?;
+            run_forbidden_step(&root)?;
             run_cargo_step_in_target(
                 &root,
                 &target,
@@ -125,7 +144,6 @@ fn run() -> Result<(), XtaskError> {
                 &["clippy", "--all-targets", "--", "-D", "warnings"],
             )?;
             run_cargo_step_in_target(&root, &target, "test", &["test", "--workspace"])?;
-            run_forbidden_step(&root)?;
             run_fixtures_step(&root)
         }
         Task::Fmt => run_cargo_step(&root, "fmt-check", &["fmt", "--all", "--", "--check"]),
@@ -135,6 +153,7 @@ fn run() -> Result<(), XtaskError> {
             &["clippy", "--all-targets", "--", "-D", "warnings"],
         ),
         Task::Test => run_cargo_step(&root, "test", &["test", "--workspace"]),
+        Task::CheckDeps => run_deps_step(&root),
         Task::LintForbidden => run_forbidden_step(&root),
         Task::FixturesVerify => run_fixtures_step(&root),
         Task::Schema(command) => schema::run(command, &root).map_err(Into::into),
@@ -152,6 +171,7 @@ fn parse_task() -> Result<Task, XtaskError> {
         Some("fmt") => parse_without_extra_arguments(Task::Fmt, arguments),
         Some("clippy") => parse_without_extra_arguments(Task::Clippy, arguments),
         Some("test") => parse_without_extra_arguments(Task::Test, arguments),
+        Some("check-deps") => parse_without_extra_arguments(Task::CheckDeps, arguments),
         Some("lint-forbidden") => parse_without_extra_arguments(Task::LintForbidden, arguments),
         Some("fixtures") => {
             let Some(subcommand) = arguments.next() else {
@@ -232,14 +252,26 @@ fn run_cargo_step_with_target(
 fn run_forbidden_step(root: &Path) -> Result<(), XtaskError> {
     const STEP: &str = "lint-forbidden";
     announce(STEP)?;
-    let violations = scan_repository(root)?;
-    if !violations.is_empty() {
-        for violation in &violations {
+    let report = scan_repository(root)?;
+    println!(
+        "lint-forbidden: A-2 agent-name-branch exemptions={}",
+        report.agent_name_branch_exemptions
+    );
+    if !report.violations.is_empty() {
+        for violation in &report.violations {
             eprintln!("{violation}");
         }
-        return Err(XtaskError::ForbiddenFound(violations.len()));
+        return Err(XtaskError::ForbiddenFound(report.violations.len()));
     }
     println!("<== {STEP}: ok");
+    Ok(())
+}
+
+fn run_deps_step(root: &Path) -> Result<(), XtaskError> {
+    const STEP: &str = "check-deps";
+    announce(STEP)?;
+    let report = deps::check_workspace(root)?;
+    println!("<== {STEP}: ok; {report}");
     Ok(())
 }
 

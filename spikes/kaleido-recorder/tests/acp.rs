@@ -6,7 +6,7 @@ use serde_json::Value;
 pub use kaleido_recorder::agents::{
     validate_exact_permission_cwd, validate_exact_permission_path, validate_permission_argv,
     validate_permission_argv_as, validate_permission_command, validate_permission_command_as,
-    validate_permission_path, PermissionCommand, PermissionScopeError,
+    validate_permission_path, CompletedRecording, PermissionCommand, PermissionScopeError,
 };
 
 pub mod fixture {
@@ -1981,7 +1981,7 @@ fn public_runner_surface_uses_only_the_preinstalled_pinned_launcher() {
         &Path,
         AcpScenario,
         &mut Sink,
-    ) -> Result<ScenarioOutcome, AcpError>;
+    ) -> Result<CompletedRecording<ScenarioOutcome>, AcpError>;
     let _runner: Runner = acp::record_scenario::<Vec<u8>>;
     type SessionLoadRunner = fn(
         &platform::ResolvedExecutable,
@@ -1990,7 +1990,7 @@ fn public_runner_surface_uses_only_the_preinstalled_pinned_launcher() {
         String,
         &mut Sink,
         std::time::Duration,
-    ) -> Result<ScenarioOutcome, AcpError>;
+    ) -> Result<CompletedRecording<ScenarioOutcome>, AcpError>;
     let _session_load_runner: SessionLoadRunner = acp::record_session_load_with_timeout::<Vec<u8>>;
 }
 

@@ -1,4 +1,4 @@
-# T-004 / T-006：三家 agent 的真实协议录制
+# T-004 / T-006 / T-009：三家 agent 的真实协议录制
 
 录制日期：2026-07-29。所有录制进程的工作目录都是本目录下的 `sandbox/`
 玩具项目；没有主动在 OneKaleidoscope 仓库根目录或其他真实项目中启动录制。
@@ -46,6 +46,23 @@ T-006 在同日完成环境修复后的补录尝试，但没有新增达到场�
   `..` traversal、Windows drive/UNC/drive-relative、junction/reparse、占位符、
   无法解析的命令以及除精确 `cargo run` / `cargo run --` 之外的 shell 命令都会
   在回复 agent 和写 fixture 前被拒绝。
+
+## 录制清理元数据
+
+新录制在严格场景判据通过后，会把 transcript 安装为 `.jsonl`，并同时安装同名
+`.metadata.json` sidecar（例如 `01-simple-turn.metadata.json`）。现有历史 fixture
+早于该元数据约定，不追溯补写。sidecar 字段含义如下：
+
+| 字段 | 取值与含义 |
+|---|---|
+| `cleanup` | `"complete"`：未观察到录制后清理错误；`"incomplete"`：transcript 已合格，但至少一项进程清理无法确认完成 |
+| `unconfirmed_pids` | 排序、去重后的未确认终止 PID；进程在新的 Toolhelp32 快照中已消失时不会列入 |
+| `cleanup_errors` | 清理阶段的原始诊断列表；写入前仍经过与 fixture 相同的确定性脱敏 |
+
+`cleanup: "incomplete"` 会在 stderr 打印醒目警告，但合格 transcript 仍安装且
+recorder 返回退出码 0。清理状态不参与场景合格判定；工具生命周期、权限决策、
+session/turn 关联等 transcript 判据没有放宽。不满足判据的临时 transcript 仍会
+在安装前作废，即使进程清理完全成功也不会产生 `.jsonl` 或 metadata。
 
 ## 确定性替换规则
 

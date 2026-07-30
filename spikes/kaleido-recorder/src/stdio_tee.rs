@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
@@ -10,7 +11,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::fixture::{Direction, FixtureError, FixtureSink, Transport};
-use crate::platform::{self, ProcessError, ResolvedExecutable};
+use crate::platform::{self, ProcessCleanupDiagnostic, ProcessError, ResolvedExecutable};
 
 #[derive(Debug, Error)]
 pub enum StdioError {
@@ -40,6 +41,29 @@ pub enum StdioError {
         source: Box<StdioError>,
         cleanup: ProcessError,
     },
+}
+
+impl ProcessCleanupDiagnostic for StdioError {
+    fn unconfirmed_pids(&self) -> Vec<u32> {
+        let mut process_ids = BTreeSet::new();
+        match self {
+            Self::Process(error) => process_ids.extend(error.unconfirmed_pids()),
+            Self::CleanupAfterError { source, cleanup } => {
+                process_ids.extend(ProcessCleanupDiagnostic::unconfirmed_pids(source.as_ref()));
+                process_ids.extend(cleanup.unconfirmed_pids());
+            }
+            Self::MissingStdin
+            | Self::MissingStdout
+            | Self::MissingStderr
+            | Self::Io(_)
+            | Self::Utf8
+            | Self::Json(_)
+            | Self::Timeout
+            | Self::Closed
+            | Self::Fixture(_) => {}
+        }
+        process_ids.into_iter().collect()
+    }
 }
 
 #[derive(Debug)]

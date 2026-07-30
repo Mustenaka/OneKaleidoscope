@@ -129,6 +129,12 @@ mod process_snapshot_ffi {
     }
 }
 
+#[derive(Debug)]
+struct DescendantFailure {
+    process_id: u32,
+    error: io::Error,
+}
+
 // These process handles bind cleanup to the exact PIDs captured while the recorder-owned
 // launcher is still alive. Holding the handles prevents PID reuse from redirecting cleanup to an
 // unrelated process. No executable names or command lines cross this FFI boundary.
@@ -138,6 +144,8 @@ mod process_handle_ffi {
     use std::io;
     use std::ptr;
     use std::time::{Duration, Instant};
+
+    use super::DescendantFailure;
 
     const PROCESS_TERMINATE: u32 = 0x0000_0001;
     const SYNCHRONIZE: u32 = 0x0010_0000;
@@ -156,6 +164,7 @@ mod process_handle_ffi {
 
     #[derive(Debug)]
     struct OwnedProcessHandle {
+        process_id: u32,
         raw: *mut c_void,
     }
 
@@ -171,7 +180,7 @@ mod process_handle_ffi {
                 }
                 return Err(error);
             }
-            Ok(Some(Self { raw }))
+            Ok(Some(Self { process_id, raw }))
         }
 
         fn is_exited(&self) -> io::Result<bool> {
@@ -230,29 +239,46 @@ mod process_handle_ffi {
     #[derive(Debug)]
     pub(super) struct CapturedDescendants {
         handles: Vec<OwnedProcessHandle>,
+        failures: Vec<DescendantFailure>,
     }
 
     impl CapturedDescendants {
-        pub(super) fn capture(process_ids: impl Iterator<Item = u32>) -> io::Result<Self> {
+        pub(super) fn capture(process_ids: impl Iterator<Item = u32>) -> Self {
             let mut handles = Vec::new();
+            let mut failures = Vec::new();
             for process_id in process_ids {
-                if let Some(handle) = OwnedProcessHandle::open(process_id)? {
-                    handles.push(handle);
+                match OwnedProcessHandle::open(process_id) {
+                    Ok(Some(handle)) => handles.push(handle),
+                    Ok(None) => {}
+                    Err(error) => failures.push(DescendantFailure { process_id, error }),
                 }
             }
-            Ok(Self { handles })
+            Self { handles, failures }
         }
 
-        pub(super) fn terminate_and_wait(&self, timeout: Duration) -> io::Result<()> {
+        pub(super) fn terminate_and_wait(self, timeout: Duration) -> Vec<DescendantFailure> {
+            let mut failures = self.failures;
+            let mut wait_for = Vec::new();
             for handle in &self.handles {
-                handle.terminate()?;
+                match handle.terminate() {
+                    Ok(()) => wait_for.push(handle),
+                    Err(error) => failures.push(DescendantFailure {
+                        process_id: handle.process_id,
+                        error,
+                    }),
+                }
             }
             let started = Instant::now();
-            for handle in &self.handles {
+            for handle in wait_for {
                 let remaining = timeout.saturating_sub(started.elapsed());
-                handle.wait_for_exit(remaining)?;
+                if let Err(error) = handle.wait_for_exit(remaining) {
+                    failures.push(DescendantFailure {
+                        process_id: handle.process_id,
+                        error,
+                    });
+                }
             }
-            Ok(())
+            failures
         }
     }
 }
@@ -1079,16 +1105,7 @@ pub(super) fn terminate_tree(child: &mut Child) -> Result<ExitStatus, ProcessErr
         ))
     })?;
     let family = SpawnedProcessFamily::capture(root_pid, &snapshot);
-    let descendants = process_handle_ffi::CapturedDescendants::capture(family.descendant_pids())
-        .map_err(|error| {
-            ProcessError::Terminate(io::Error::new(
-                error.kind(),
-                format!(
-                    "could not retain exact handles for spawned root PID {root_pid} descendants: \
-                     {error}"
-                ),
-            ))
-        });
+    let descendants = process_handle_ffi::CapturedDescendants::capture(family.descendant_pids());
     let root_termination = terminate_tree_with(child, |process_id| {
         taskkill_command(process_id)
             .stdin(Stdio::null())
@@ -1096,19 +1113,12 @@ pub(super) fn terminate_tree(child: &mut Child) -> Result<ExitStatus, ProcessErr
             .stderr(Stdio::null())
             .status()
     });
-    let descendant_termination = descendants.and_then(|descendants| {
-        descendants
-            .terminate_and_wait(DESCENDANT_FORCE_EXIT_TIMEOUT)
-            .map_err(|error| {
-                ProcessError::Terminate(io::Error::new(
-                    error.kind(),
-                    format!(
-                        "could not terminate exact descendants of spawned root PID {root_pid}: \
-                         {error}"
-                    ),
-                ))
-            })
-    });
+    let descendant_failures = descendants.terminate_and_wait(DESCENDANT_FORCE_EXIT_TIMEOUT);
+    let descendant_termination = reconcile_descendant_failures(
+        root_pid,
+        descendant_failures,
+        process_snapshot_ffi::snapshot_processes,
+    );
     let status = combine_family_termination(root_termination, descendant_termination)?;
     wait_for_spawned_process_family_exit(
         &family,
@@ -1116,6 +1126,72 @@ pub(super) fn terminate_tree(child: &mut Child) -> Result<ExitStatus, ProcessErr
         process_snapshot_ffi::snapshot_processes,
     )?;
     Ok(status)
+}
+
+fn reconcile_descendant_failures(
+    root_pid: u32,
+    failures: Vec<DescendantFailure>,
+    snapshot_processes: impl FnOnce() -> io::Result<Vec<ProcessEntry>>,
+) -> Result<(), ProcessError> {
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    let failed_process_ids = failures
+        .iter()
+        .map(|failure| failure.process_id)
+        .collect::<Vec<_>>();
+    let snapshot = match snapshot_processes() {
+        Ok(snapshot) => snapshot,
+        Err(snapshot_error) => {
+            let detail = format!(
+                "{}; fresh Toolhelp32 confirmation snapshot failed: {snapshot_error}",
+                descendant_failure_detail(&failures)
+            );
+            return Err(ProcessError::IncompleteCleanup {
+                root_pid,
+                unconfirmed_pids: sorted_unique_process_ids(failed_process_ids),
+                detail,
+            });
+        }
+    };
+    let unconfirmed = failures
+        .into_iter()
+        .filter(|failure| {
+            snapshot
+                .iter()
+                .any(|process| process.pid == failure.process_id)
+        })
+        .collect::<Vec<_>>();
+    if unconfirmed.is_empty() {
+        return Ok(());
+    }
+
+    let unconfirmed_pids = sorted_unique_process_ids(
+        unconfirmed
+            .iter()
+            .map(|failure| failure.process_id)
+            .collect(),
+    );
+    Err(ProcessError::IncompleteCleanup {
+        root_pid,
+        unconfirmed_pids,
+        detail: descendant_failure_detail(&unconfirmed),
+    })
+}
+
+fn sorted_unique_process_ids(mut process_ids: Vec<u32>) -> Vec<u32> {
+    process_ids.sort_unstable();
+    process_ids.dedup();
+    process_ids
+}
+
+fn descendant_failure_detail(failures: &[DescendantFailure]) -> String {
+    failures
+        .iter()
+        .map(|failure| format!("descendant PID {}: {}", failure.process_id, failure.error))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn combine_family_termination(
@@ -1126,10 +1202,10 @@ fn combine_family_termination(
         (Ok(status), Ok(())) => Ok(status),
         (Err(root), Ok(())) => Err(root),
         (Ok(_), Err(descendants)) => Err(descendants),
-        (Err(root), Err(descendants)) => Err(ProcessError::Terminate(io::Error::other(format!(
-            "spawned root cleanup failed ({root}); exact descendant cleanup also failed \
-                 ({descendants})"
-        )))),
+        (Err(root), Err(descendants)) => Err(ProcessError::CombinedCleanup {
+            root: Box::new(root),
+            descendants: Box::new(descendants),
+        }),
     }
 }
 
@@ -1269,14 +1345,17 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        command_script_line, decode_diagnostic_bytes, executable_extensions,
-        expand_environment_variables, parse_registry_value, prefer_persistent_environment_value,
-        probe_in, query_registry_value, retry_directory_rename_after_sharing_violation,
+        combine_family_termination, command_script_line, decode_diagnostic_bytes,
+        executable_extensions, expand_environment_variables, parse_registry_value,
+        prefer_persistent_environment_value, probe_in, query_registry_value,
+        reconcile_descendant_failures, retry_directory_rename_after_sharing_violation,
         taskkill_command, terminate_tree_with, terminate_tree_with_tracking,
-        utf8_registry_query_command_line, utf8_where_command_line, where_output, TerminationTarget,
-        ERROR_SHARING_VIOLATION, USER_ENVIRONMENT_KEY,
+        utf8_registry_query_command_line, utf8_where_command_line, where_output, DescendantFailure,
+        TerminationTarget, ERROR_SHARING_VIOLATION, USER_ENVIRONMENT_KEY,
     };
-    use crate::platform::{CandidateStatus, DiscoveryLayer, Launcher, ProbeStatus, ProcessError};
+    use crate::platform::{
+        CandidateStatus, DiscoveryLayer, Launcher, ProbeStatus, ProcessEntry, ProcessError,
+    };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -1687,9 +1766,10 @@ mod tests {
         };
         let result = (|| -> TestResult {
             let handles =
-                super::process_handle_ffi::CapturedDescendants::capture([target.id()].into_iter())?;
-            handles.terminate_and_wait(Duration::from_secs(5))?;
+                super::process_handle_ffi::CapturedDescendants::capture([target.id()].into_iter());
+            let failures = handles.terminate_and_wait(Duration::from_secs(5));
 
+            assert!(failures.is_empty(), "{failures:?}");
             assert!(target.wait()?.code().is_some());
             assert!(
                 unrelated.try_wait()?.is_none(),
@@ -1702,6 +1782,133 @@ mod tests {
         let _ = unrelated.kill();
         let _ = unrelated.wait();
         result
+    }
+
+    #[test]
+    fn access_denied_for_exited_descendant_is_cleared_by_fresh_snapshot() -> TestResult {
+        let snapshot_calls = Cell::new(0_usize);
+        let result = reconcile_descendant_failures(
+            7,
+            vec![DescendantFailure {
+                process_id: 42,
+                error: io::Error::from_raw_os_error(5),
+            }],
+            || {
+                snapshot_calls.set(snapshot_calls.get() + 1);
+                Ok(vec![ProcessEntry {
+                    pid: 99,
+                    parent_pid: 7,
+                }])
+            },
+        );
+
+        result?;
+        assert_eq!(
+            snapshot_calls.get(),
+            1,
+            "a failed termination must be confirmed with exactly one fresh snapshot"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_live_descendant_is_reported_after_fresh_snapshot() -> TestResult {
+        let snapshot_calls = Cell::new(0_usize);
+        let result = reconcile_descendant_failures(
+            7,
+            vec![DescendantFailure {
+                process_id: 42,
+                error: io::Error::from_raw_os_error(5),
+            }],
+            || {
+                snapshot_calls.set(snapshot_calls.get() + 1);
+                Ok(vec![ProcessEntry {
+                    pid: 42,
+                    parent_pid: 7,
+                }])
+            },
+        );
+
+        let Err(ProcessError::IncompleteCleanup {
+            root_pid,
+            unconfirmed_pids,
+            detail,
+        }) = result
+        else {
+            return Err(io::Error::other(
+                "a still-live failed descendant was not reported as incomplete cleanup",
+            )
+            .into());
+        };
+        assert_eq!(root_pid, 7);
+        assert_eq!(unconfirmed_pids, [42]);
+        assert!(detail.contains("os error 5"), "{detail}");
+        assert_eq!(
+            snapshot_calls.get(),
+            1,
+            "a failed termination must be confirmed with exactly one fresh snapshot"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_confirmation_snapshot_keeps_descendant_unconfirmed() -> TestResult {
+        let result = reconcile_descendant_failures(
+            7,
+            vec![DescendantFailure {
+                process_id: 42,
+                error: io::Error::from_raw_os_error(5),
+            }],
+            || Err(io::Error::other("forced fresh snapshot failure")),
+        );
+
+        let Err(ProcessError::IncompleteCleanup {
+            root_pid,
+            unconfirmed_pids,
+            detail,
+        }) = result
+        else {
+            return Err(io::Error::other(
+                "a failed confirmation snapshot incorrectly proved descendant cleanup",
+            )
+            .into());
+        };
+        assert_eq!(root_pid, 7);
+        assert_eq!(unconfirmed_pids, [42]);
+        assert!(detail.contains("os error 5"), "{detail}");
+        assert!(detail.contains("forced fresh snapshot failure"), "{detail}");
+        Ok(())
+    }
+
+    #[test]
+    fn combined_root_failure_keeps_structured_unconfirmed_descendants() -> TestResult {
+        let result = combine_family_termination(
+            Err(ProcessError::Terminate(io::Error::other(
+                "forced root cleanup failure",
+            ))),
+            Err(ProcessError::IncompleteCleanup {
+                root_pid: 7,
+                unconfirmed_pids: vec![42],
+                detail: "forced descendant cleanup failure".to_owned(),
+            }),
+        );
+
+        let Err(ProcessError::CombinedCleanup { root, descendants }) = result else {
+            return Err(io::Error::other(
+                "combined cleanup failures did not preserve their structured errors",
+            )
+            .into());
+        };
+        assert!(matches!(*root, ProcessError::Terminate(_)));
+        assert!(matches!(
+            *descendants,
+            ProcessError::IncompleteCleanup {
+                root_pid: 7,
+                ref unconfirmed_pids,
+                ..
+            } if unconfirmed_pids == &[42]
+        ));
+        Ok(())
     }
 
     struct RecordingTerminationTarget {

@@ -17,7 +17,7 @@ use thiserror::Error;
 
 use super::{
     validate_exact_permission_cwd, validate_exact_permission_path, validate_permission_command_as,
-    validate_permission_path, PermissionCommand, PermissionScopeError,
+    validate_permission_path, CompletedRecording, PermissionCommand, PermissionScopeError,
 };
 use crate::fixture::{
     http_request_payload, http_response_payload, Direction, FixtureError, FixtureSink, Transport,
@@ -158,33 +158,6 @@ pub enum Outcome {
     },
 }
 
-impl Outcome {
-    fn cleanup_diagnostic(&self) -> String {
-        match self {
-            Self::Recorded {
-                event_count,
-                observations,
-                ..
-            } => format!(
-                "strict scenario evidence was observed; events={event_count}; \
-                 observations={observations:?}"
-            ),
-            Self::Unsupported { reason } => {
-                format!("scenario was unsupported; reason={reason}")
-            }
-            Self::NotObserved {
-                event_count,
-                reason,
-                observations,
-                ..
-            } => format!(
-                "strict scenario evidence was not observed; events={event_count}; \
-                 reason={reason}; observations={observations:?}"
-            ),
-        }
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum OpenCodeError {
     #[error(transparent)]
@@ -243,12 +216,6 @@ pub enum OpenCodeError {
         "OpenCode permission request could not be proven safe inside the canonical fixture sandbox"
     )]
     UnsafePermissionScope,
-    #[error("OpenCode protocol attempt finished ({summary}), but server cleanup failed: {source}")]
-    CleanupAfterOutcome {
-        summary: String,
-        #[source]
-        source: ProcessError,
-    },
     #[error("OpenCode operation failed ({source}); server cleanup also failed: {cleanup}")]
     CleanupAfterError {
         #[source]
@@ -263,7 +230,7 @@ pub fn record<W: Write>(
     scenario: Scenario,
     fixture: &mut FixtureSink<W>,
     timeout: Duration,
-) -> Result<Outcome, OpenCodeError> {
+) -> Result<CompletedRecording<Outcome>, OpenCodeError> {
     let sandbox = validate_fixture_sandbox(sandbox)?;
     if scenario != Scenario::SessionLoad {
         validate_prompt_project_isolation(&sandbox)?;
@@ -292,18 +259,15 @@ pub fn record<W: Write>(
 fn finish_recording(
     result: Result<Outcome, OpenCodeError>,
     cleanup: impl FnOnce() -> Result<(), ProcessError>,
-) -> Result<Outcome, OpenCodeError> {
-    match (result, cleanup()) {
+) -> Result<CompletedRecording<Outcome>, OpenCodeError> {
+    let cleanup = cleanup();
+    match (result, cleanup) {
         (Err(error), Err(cleanup)) => Err(OpenCodeError::CleanupAfterError {
             source: Box::new(error),
             cleanup,
         }),
         (Err(error), Ok(())) => Err(error),
-        (Ok(outcome), Err(source)) => Err(OpenCodeError::CleanupAfterOutcome {
-            summary: outcome.cleanup_diagnostic(),
-            source,
-        }),
-        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Ok(outcome), cleanup) => Ok(CompletedRecording::with_cleanup_result(outcome, cleanup)),
     }
 }
 
@@ -2177,6 +2141,37 @@ mod tests {
     use std::net::TcpStream;
 
     #[test]
+    fn completed_protocol_recording_survives_cleanup_failure(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let outcome = Outcome::Recorded {
+            session_id: Some("session-test".to_owned()),
+            event_count: 3,
+            observations: vec!["session.idle".to_owned()],
+        };
+        let completed = finish_recording(Ok(outcome), || {
+            Err(ProcessError::IncompleteCleanup {
+                root_pid: 7,
+                unconfirmed_pids: vec![42],
+                detail: "forced cleanup failure".to_owned(),
+            })
+        })?;
+
+        assert!(matches!(
+            completed.outcome,
+            Outcome::Recorded { event_count: 3, .. }
+        ));
+        assert_eq!(completed.cleanup_issues.len(), 1);
+        assert_eq!(
+            completed
+                .cleanup_issues
+                .first()
+                .map(|issue| issue.unconfirmed_pids.as_slice()),
+            Some([42].as_slice())
+        );
+        Ok(())
+    }
+
+    #[test]
     fn protocol_and_cleanup_failures_are_both_reported() -> Result<(), Box<dyn std::error::Error>> {
         let protocol = OpenCodeError::Protocol("forced protocol failure");
         let cleanup = ProcessError::Terminate(io::Error::other("forced cleanup failure"));
@@ -3934,23 +3929,6 @@ mod tests {
             state.outcome(Scenario::SimpleTurn, "ses_test".to_owned()),
             Outcome::NotObserved { .. }
         ));
-    }
-
-    #[test]
-    fn cleanup_diagnostic_reports_evidence_without_exposing_session_id() {
-        let outcome = Outcome::NotObserved {
-            session_id: Some("ses_private_identifier".to_owned()),
-            event_count: 16,
-            reason: "assistant text was absent".to_owned(),
-            observations: vec!["session.idle".to_owned()],
-        };
-
-        let diagnostic = outcome.cleanup_diagnostic();
-
-        assert!(diagnostic.contains("events=16"));
-        assert!(diagnostic.contains("assistant text was absent"));
-        assert!(diagnostic.contains("session.idle"));
-        assert!(!diagnostic.contains("ses_private_identifier"));
     }
 
     #[test]

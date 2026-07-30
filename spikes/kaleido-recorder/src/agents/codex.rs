@@ -19,7 +19,7 @@ use thiserror::Error;
 use super::{
     validate_exact_permission_cwd, validate_exact_permission_path, validate_permission_argv,
     validate_permission_command, validate_permission_command_as, validate_permission_path,
-    PermissionCommand, PermissionScopeError,
+    CompletedRecording, PermissionCommand, PermissionScopeError,
 };
 use crate::fixture::{Direction, FixtureSink, Transport};
 use crate::platform::{self, ResolvedExecutable};
@@ -409,7 +409,7 @@ pub fn record<W: Write>(
     sandbox: &Path,
     scenario: CodexScenario,
     fixture: &mut FixtureSink<W>,
-) -> Result<CodexRecording, CodexRecorderError> {
+) -> Result<CompletedRecording<CodexRecording>, CodexRecorderError> {
     record_with_config(
         executable,
         sandbox,
@@ -425,7 +425,7 @@ pub fn record_with_config<W: Write>(
     scenario: CodexScenario,
     fixture: &mut FixtureSink<W>,
     config: &CodexRecorderConfig,
-) -> Result<CodexRecording, CodexRecorderError> {
+) -> Result<CompletedRecording<CodexRecording>, CodexRecorderError> {
     if let CodexScenario::SessionLoad { thread_id } = &scenario {
         if thread_id.as_deref().is_none_or(str::is_empty) {
             return Err(CodexRecorderError::ThreadIdRequired);
@@ -448,15 +448,15 @@ pub fn record_with_config<W: Write>(
 fn finish_recording(
     recording: Result<CodexRecording, CodexRecorderError>,
     cleanup: impl FnOnce() -> Result<(), StdioError>,
-) -> Result<CodexRecording, CodexRecorderError> {
-    match (recording, cleanup()) {
-        (Ok(value), Ok(())) => Ok(value),
+) -> Result<CompletedRecording<CodexRecording>, CodexRecorderError> {
+    let cleanup = cleanup();
+    match (recording, cleanup) {
+        (Ok(value), cleanup) => Ok(CompletedRecording::with_cleanup_result(value, cleanup)),
         (Err(source), Err(cleanup)) => Err(CodexRecorderError::CleanupAfterError {
             source: Box::new(source),
             cleanup,
         }),
         (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(error.into()),
     }
 }
 
@@ -2119,6 +2119,52 @@ mod tests {
     use std::{fs, io};
 
     use super::*;
+
+    #[test]
+    fn completed_protocol_recording_survives_cleanup_failure() -> Result<(), Box<dyn Error>> {
+        let recording = CodexRecording {
+            scenario: CodexScenario::SimpleTurn,
+            thread_id: "thread-test".to_owned(),
+            turn_id: Some("turn-test".to_owned()),
+            completion_status: Some("completed".to_owned()),
+            notification_methods: vec!["item/agentMessage/delta".to_owned()],
+            server_request_methods: Vec::new(),
+            permission_requests: 0,
+            elicitation_requests: 0,
+            user_input_requests: 0,
+            item_types_started: Vec::new(),
+            item_types_completed: Vec::new(),
+            command_exit_codes: Vec::new(),
+            diff_updates: 0,
+            nonempty_diff_updates: 0,
+            error_info_count: 0,
+            editable_file_changed: false,
+            item_lifecycles: Vec::new(),
+            permission_flows: Vec::new(),
+            nonempty_diff_turns: Vec::new(),
+        };
+        let expected = recording.clone();
+        let completed = finish_recording(Ok(recording), || {
+            Err(StdioError::Process(
+                platform::ProcessError::IncompleteCleanup {
+                    root_pid: 7,
+                    unconfirmed_pids: vec![42],
+                    detail: "forced cleanup failure".to_owned(),
+                },
+            ))
+        })?;
+
+        assert_eq!(completed.outcome, expected);
+        assert_eq!(completed.cleanup_issues.len(), 1);
+        assert_eq!(
+            completed
+                .cleanup_issues
+                .first()
+                .map(|issue| issue.unconfirmed_pids.as_slice()),
+            Some([42].as_slice())
+        );
+        Ok(())
+    }
 
     #[test]
     fn protocol_and_cleanup_failures_are_both_reported() -> Result<(), Box<dyn Error>> {

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -10,11 +11,11 @@ use thiserror::Error;
 
 use super::{
     validate_exact_permission_cwd, validate_exact_permission_path, validate_permission_argv_as,
-    validate_permission_command_as, validate_permission_path, PermissionCommand,
-    PermissionScopeError,
+    validate_permission_command_as, validate_permission_path, CompletedRecording,
+    PermissionCommand, PermissionScopeError,
 };
 use crate::fixture::{Direction, FixtureSink, Transport};
-use crate::platform::{self, ResolvedExecutable};
+use crate::platform::{self, ProcessCleanupDiagnostic, ResolvedExecutable};
 use crate::stdio_tee::{StdioError, StdioTee};
 
 #[path = "client_services.rs"]
@@ -1707,13 +1708,57 @@ pub enum AcpError {
     },
 }
 
+impl ProcessCleanupDiagnostic for AcpError {
+    fn unconfirmed_pids(&self) -> Vec<u32> {
+        let mut process_ids = BTreeSet::new();
+        match self {
+            Self::Stdio(error) => {
+                process_ids.extend(ProcessCleanupDiagnostic::unconfirmed_pids(error));
+            }
+            Self::ClientTerminalProcess(error) => {
+                process_ids.extend(error.unconfirmed_pids());
+            }
+            Self::ClientTerminalCleanupAfterError { source, cleanup } => {
+                process_ids.extend(ProcessCleanupDiagnostic::unconfirmed_pids(source.as_ref()));
+                process_ids.extend(cleanup.unconfirmed_pids());
+            }
+            Self::ClientServiceCleanupAfterError { source, cleanup } => {
+                process_ids.extend(ProcessCleanupDiagnostic::unconfirmed_pids(source.as_ref()));
+                process_ids.extend(ProcessCleanupDiagnostic::unconfirmed_pids(cleanup.as_ref()));
+            }
+            Self::CleanupAfterError { source, cleanup } => {
+                process_ids.extend(ProcessCleanupDiagnostic::unconfirmed_pids(source.as_ref()));
+                process_ids.extend(ProcessCleanupDiagnostic::unconfirmed_pids(cleanup));
+            }
+            Self::Json(_)
+            | Self::InvalidState(_)
+            | Self::MessageShape(_)
+            | Self::ProtocolVersion { .. }
+            | Self::ResponseId { .. }
+            | Self::SessionIdMismatch
+            | Self::RepeatedCursor(_)
+            | Self::UnsafeSessionList
+            | Self::CounterOverflow
+            | Self::UnsafePermissionScope
+            | Self::UnsafeClientMethodScope
+            | Self::ClientTerminalPipe(_)
+            | Self::ClientTerminalOutputUnavailable
+            | Self::ClientTerminalReaderPanicked
+            | Self::ClientTerminalIo(_)
+            | Self::InvalidSandbox
+            | Self::SandboxNotUtf8 => {}
+        }
+        process_ids.into_iter().collect()
+    }
+}
+
 pub fn record_scenario<W: Write>(
     executable: &ResolvedExecutable,
     arguments: &[OsString],
     sandbox: &Path,
     scenario: AcpScenario,
     fixture: &mut FixtureSink<W>,
-) -> Result<ScenarioOutcome, AcpError> {
+) -> Result<CompletedRecording<ScenarioOutcome>, AcpError> {
     record_scenario_with_timeout(
         executable,
         arguments,
@@ -1731,7 +1776,7 @@ pub fn record_scenario_with_timeout<W: Write>(
     scenario: AcpScenario,
     fixture: &mut FixtureSink<W>,
     message_timeout: Duration,
-) -> Result<ScenarioOutcome, AcpError> {
+) -> Result<CompletedRecording<ScenarioOutcome>, AcpError> {
     let sandbox = validate_fixture_sandbox(sandbox)?;
     let machine = AcpStateMachine::new(sandbox.clone(), scenario);
     run_state_machine(
@@ -1751,7 +1796,7 @@ pub fn record_session_load_with_timeout<W: Write>(
     session_id: String,
     fixture: &mut FixtureSink<W>,
     message_timeout: Duration,
-) -> Result<ScenarioOutcome, AcpError> {
+) -> Result<CompletedRecording<ScenarioOutcome>, AcpError> {
     let sandbox = validate_fixture_sandbox(sandbox)?;
     let machine = AcpStateMachine::for_session_load(sandbox.clone(), session_id);
     run_state_machine(
@@ -1771,10 +1816,10 @@ fn run_state_machine<W: Write>(
     mut machine: AcpStateMachine,
     fixture: &mut FixtureSink<W>,
     message_timeout: Duration,
-) -> Result<ScenarioOutcome, AcpError> {
+) -> Result<CompletedRecording<ScenarioOutcome>, AcpError> {
     let first = machine.start()?;
     let outbound = match first {
-        MachineStep::Complete(outcome) => return Ok(outcome),
+        MachineStep::Complete(outcome) => return Ok(CompletedRecording::clean(outcome)),
         MachineStep::Send(outbound) => outbound,
         MachineStep::Continue => {
             return Err(AcpError::InvalidState(
@@ -1802,30 +1847,33 @@ fn run_state_machine<W: Write>(
 fn finish_client_services(
     recording: Result<ScenarioOutcome, AcpError>,
     cleanup: impl FnOnce() -> Result<(), AcpError>,
-) -> Result<ScenarioOutcome, AcpError> {
-    match (recording, cleanup()) {
-        (Ok(outcome), Ok(())) => Ok(outcome),
+) -> Result<CompletedRecording<ScenarioOutcome>, AcpError> {
+    let cleanup = cleanup();
+    match (recording, cleanup) {
+        (Ok(outcome), cleanup) => Ok(CompletedRecording::with_cleanup_result(outcome, cleanup)),
         (Err(source), Err(cleanup)) => Err(AcpError::ClientServiceCleanupAfterError {
             source: Box::new(source),
             cleanup: Box::new(cleanup),
         }),
         (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
     }
 }
 
 fn finish_recording(
-    recording: Result<ScenarioOutcome, AcpError>,
+    recording: Result<CompletedRecording<ScenarioOutcome>, AcpError>,
     cleanup: impl FnOnce() -> Result<(), StdioError>,
-) -> Result<ScenarioOutcome, AcpError> {
-    match (recording, cleanup()) {
-        (Ok(outcome), Ok(())) => Ok(outcome),
+) -> Result<CompletedRecording<ScenarioOutcome>, AcpError> {
+    let cleanup = cleanup();
+    match (recording, cleanup) {
+        (Ok(mut recording), cleanup) => {
+            recording.add_cleanup_result(cleanup);
+            Ok(recording)
+        }
         (Err(source), Err(cleanup)) => Err(AcpError::CleanupAfterError {
             source: Box::new(source),
             cleanup,
         }),
         (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(error.into()),
     }
 }
 
@@ -1950,6 +1998,52 @@ mod tests {
     use std::io;
 
     use super::*;
+
+    #[test]
+    fn completed_protocol_recording_survives_both_cleanup_layers() -> Result<(), Box<dyn Error>> {
+        let outcome = ScenarioOutcome::Completed {
+            stop_reason: "end_turn".to_owned(),
+            capabilities: CapabilityObservation::default(),
+            observations: ScenarioObservations::default(),
+        };
+        let expected = outcome.clone();
+        let recording = finish_client_services(Ok(outcome), || {
+            Err(AcpError::ClientTerminalProcess(
+                platform::ProcessError::IncompleteCleanup {
+                    root_pid: 7,
+                    unconfirmed_pids: vec![42],
+                    detail: "forced terminal cleanup failure".to_owned(),
+                },
+            ))
+        })?;
+        let completed = finish_recording(Ok(recording), || {
+            Err(StdioError::Process(
+                platform::ProcessError::IncompleteCleanup {
+                    root_pid: 7,
+                    unconfirmed_pids: vec![43],
+                    detail: "forced adapter cleanup failure".to_owned(),
+                },
+            ))
+        })?;
+
+        assert_eq!(completed.outcome, expected);
+        assert_eq!(completed.cleanup_issues.len(), 2);
+        assert_eq!(
+            completed
+                .cleanup_issues
+                .first()
+                .map(|issue| issue.unconfirmed_pids.as_slice()),
+            Some([42].as_slice())
+        );
+        assert_eq!(
+            completed
+                .cleanup_issues
+                .get(1)
+                .map(|issue| issue.unconfirmed_pids.as_slice()),
+            Some([43].as_slice())
+        );
+        Ok(())
+    }
 
     #[test]
     fn protocol_and_cleanup_failures_are_both_reported() -> Result<(), Box<dyn Error>> {

@@ -9,9 +9,12 @@ publish = false
 
 [dependencies]
 chrono = { version = "=0.4.45", default-features = false, features = ["clock"] }
+proc-macro2 = { version = "=1.0.107", features = ["span-locations"] }
 reqwest = { version = "=0.13.4", default-features = false, features = ["blocking", "rustls"] }
+serde.workspace = true
 serde_json.workspace = true
 sha1_smol = "=1.0.1"
+syn = { version = "=2.0.119", features = ["full", "visit"] }
 tempfile = "=3.27.0"
 thiserror.workspace = true
 

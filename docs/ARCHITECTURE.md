@@ -44,8 +44,18 @@
 1. `kaleido-proto` **不依赖**本项目任何其他 crate
 2. `adapter-*` 之间**零依赖**。想复用就上提到 `kaleido-adapter`
 3. `adapter-*` 只依赖 `kaleido-proto` + `kaleido-adapter` + 各自的上游 SDK
-4. UI 层（hostd 托盘、cli、iOS、Android）**禁止**直接依赖任何 `adapter-*`
+4. **装配根与 UI 层要分开看**（T-008 交付时发现本节原文自相矛盾，此处修正）：
+   - `kaleido-hostd` 是**唯一的装配根**，它必须能直接依赖 `adapter-*` —— 它就是那个把
+     具体 adapter 实例化并 spawn 出来的进程，绕不开
+   - `kaleido-cli`、iOS / Android 绑定 crate **禁止**直接依赖任何 `adapter-*`，
+     只能经 `kaleido-core` 拿到 trait 对象
+   - **hostd 内部的 UI 代码（托盘/菜单栏）仍受 A-2 约束** —— 反模式扫描照样扫它。
+     「hostd 可以依赖 adapter」不等于「hostd 的 UI 可以按 agent 名称分支」
 5. 任何 UI 分支必须读 `capabilities()`，**禁止按 adapter 名称硬编码**（`CLAUDE.md §3.2`）
+
+> **v2 可考虑的收敛**：把 adapter 装配抽到独立的 `kaleido-registry`，让 hostd 的 UI
+> 连编译期都看不到 `adapter-*`。v1 不做 —— 多一个 crate 换来的隔离，
+> 目前由 A-2 扫描已能覆盖。
 
 > **执行方式**：`cargo xtask check-deps` 读 cargo metadata 对照本节的允许矩阵，
 > 违反即 CI 失败。这条在 M3 第一张卡里落地。

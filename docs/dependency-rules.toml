@@ -1,0 +1,133 @@
+schema_version = 1
+
+# These paths are exempt only from the requirement to have a `[crates.*]`
+# declaration. Their workspace-internal dependency edges are still checked,
+# with an empty allow-list when no declaration exists.
+coverage_exempt_paths = ["spikes/*", "xtask"]
+
+[[deny_edges]]
+rule = "A-10"
+from = "kaleido-adapter-*"
+to = "kaleido-adapter-*"
+reason = "concrete adapters must share only through kaleido-adapter"
+
+[[exclusive_targets]]
+rule = "UI-ADAPTER"
+to = "kaleido-adapter-*"
+allowed_from = ["kaleido-hostd"]
+reason = "only the hostd composition root may instantiate concrete adapters"
+
+[crates."kaleido-proto"]
+may_depend_on = []
+# This is a direct-dependency deny-list. It supplements the empty internal
+# allow-list and must grow whenever a new IO or upstream SDK crate is proposed.
+deny_dependencies = [
+    "tokio",
+    "tokio-*",
+    "*-sdk",
+    "agent-client-protocol",
+    "codex-*",
+    "opencode-*",
+    "reqwest",
+    "hyper",
+    "hyper-*",
+    "axum",
+    "axum-*",
+    "tower",
+    "tower-*",
+    "tonic",
+    "tonic-*",
+    "iroh",
+    "iroh-*",
+    "quinn",
+    "quinn-*",
+    "rustls",
+    "rustls-*",
+    "notify",
+    "notify-*",
+    "directories",
+    "dirs",
+    "dirs-*",
+    "mio",
+    "async-std",
+    "smol",
+    "tempfile",
+    "fs2",
+    "walkdir",
+]
+
+[crates."kaleido-adapter"]
+may_depend_on = ["kaleido-proto"]
+
+[crates."kaleido-adapter-codex"]
+may_depend_on = ["kaleido-proto", "kaleido-adapter"]
+
+[crates."kaleido-adapter-acp"]
+may_depend_on = ["kaleido-proto", "kaleido-adapter"]
+
+[crates."kaleido-adapter-opencode"]
+may_depend_on = ["kaleido-proto", "kaleido-adapter"]
+
+[crates."kaleido-transport"]
+may_depend_on = ["kaleido-proto"]
+
+[crates."kaleido-core"]
+may_depend_on = ["kaleido-proto", "kaleido-adapter", "kaleido-transport"]
+
+[crates."kaleido-hostd"]
+may_depend_on = [
+    "kaleido-proto",
+    "kaleido-adapter",
+    "kaleido-adapter-*",
+    "kaleido-core",
+    "kaleido-transport",
+]
+
+[crates."kaleido-cli"]
+may_depend_on = ["kaleido-proto", "kaleido-core", "kaleido-transport"]
+
+[crates."kaleido-relay"]
+may_depend_on = []
+
+[antipatterns.a1]
+forbidden_dependencies = [
+    "vte",
+    "ansi-parser",
+    "strip-ansi-escapes",
+    "termwiz",
+]
+source_patterns = [
+    "\u001b[",
+    "\\x1b[",
+    "\\u{1b}[",
+    "strip_ansi",
+    "ansi_parser",
+    "vte",
+]
+
+[antipatterns.a2]
+ui_crates = ["kaleido-cli", "kaleido-hostd"]
+agent_names = ["codex", "opencode", "claude"]
+exemption_prefix = "// #[allow(kaleido::agent_name_branch)] reason:"
+
+[antipatterns.a4]
+crate_name = "kaleido-proto"
+forbidden_literals = [
+    "agent_message_chunk",
+    "tool_call_update",
+    "item/",
+    "thread/",
+    "session/update",
+]
+
+[[antipatterns.a6.sources]]
+crate_pattern = "kaleido-adapter-codex"
+schema_paths = ["schemas/codex"]
+
+[[antipatterns.a6.sources]]
+crate_pattern = "kaleido-adapter-acp"
+schema_paths = ["schemas/acp"]
+
+[[antipatterns.a6.sources]]
+crate_pattern = "kaleido-adapter-opencode"
+schema_paths = ["schemas/opencode"]
