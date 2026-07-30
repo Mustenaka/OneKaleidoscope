@@ -456,6 +456,272 @@ fn a6_uses_json_schema_definition_keys_when_definitions_have_no_titles() {
 }
 
 #[test]
+fn a11_rejects_a_version_comparison_that_controls_a_feature() {
+    let temporary = tempdir().expect("temporary repository must be created");
+    let package = write_package(
+        temporary.path(),
+        "crates/kaleido-adapter-codex",
+        "kaleido-adapter-codex",
+        &[],
+        r#"
+pub fn select_feature(version: &str) {
+    if version >= "1.18.9" {
+        enable_x();
+    }
+}
+
+pub fn select_typed_feature(current: semver::Version) {
+    if current >= MINIMUM {
+        enable_typed_x();
+    }
+}
+
+pub fn select_indirect_feature(version: &str) {
+    let enable_feature = version >= "1.18.9";
+    if enable_feature {
+        enable_indirect_x();
+    }
+}
+"#,
+    );
+    let report = scan_repository_with_inputs(
+        temporary.path(),
+        RULES,
+        &metadata(temporary.path(), &[package]),
+    )
+    .expect("repository must be scanned");
+
+    let a11 = report
+        .violations
+        .iter()
+        .filter(|violation| violation.rule == "A-11")
+        .collect::<Vec<_>>();
+    assert_eq!(a11.len(), 3);
+    assert!(a11.iter().any(|violation| {
+        violation.detail.contains("if expression") && violation.detail.contains("version")
+    }));
+    assert_eq!(report.version_branch_exemptions, 0);
+}
+
+#[test]
+fn a11_rejects_version_match_patterns_and_cmp_control_flow() {
+    let temporary = tempdir().expect("temporary repository must be created");
+    let package = write_package(
+        temporary.path(),
+        "crates/kaleido-adapter-codex",
+        "kaleido-adapter-codex",
+        &[],
+        r#"
+pub fn select_major(version: &semver::Version) {
+    match version.major {
+        2.. => enable_major_x(),
+        _ => {}
+    }
+}
+
+pub fn select_exact(version: &semver::Version) {
+    match version.to_string().as_str() {
+        "1.18.9" => enable_exact_x(),
+        _ => {}
+    }
+}
+
+pub fn select_cmp(version: &semver::Version) {
+    if version.cmp(&MINIMUM).is_ge() {
+        enable_cmp_x();
+    }
+}
+
+pub fn select_cmp_match(version: &semver::Version) {
+    match version.cmp(&MINIMUM) {
+        std::cmp::Ordering::Greater => enable_cmp_match_x(),
+        _ => {}
+    }
+}
+"#,
+    );
+    let report = scan_repository_with_inputs(
+        temporary.path(),
+        RULES,
+        &metadata(temporary.path(), &[package]),
+    )
+    .expect("repository must be scanned");
+
+    let a11 = report
+        .violations
+        .iter()
+        .filter(|violation| violation.rule == "A-11")
+        .collect::<Vec<_>>();
+    assert_eq!(a11.len(), 4);
+    assert_eq!(
+        a11.iter()
+            .filter(|violation| violation.detail.contains("match expression"))
+            .count(),
+        3
+    );
+    assert_eq!(
+        a11.iter()
+            .filter(|violation| violation.detail.contains("if expression"))
+            .count(),
+        1
+    );
+    assert_eq!(report.version_branch_exemptions, 0);
+}
+
+#[test]
+fn a11_accepts_version_recording_and_display_without_control_flow() {
+    let temporary = tempdir().expect("temporary repository must be created");
+    let package = write_package(
+        temporary.path(),
+        "crates/kaleido-adapter-opencode",
+        "kaleido-adapter-opencode",
+        &[],
+        r#"
+pub fn record_observation(version: &str) {
+    let matches_snapshot = version == "1.18.9";
+    let ordering = version.cmp(MINIMUM);
+    println!("observed {version}; matches_snapshot={matches_snapshot}; ordering={ordering:?}");
+}
+"#,
+    );
+    let report = scan_repository_with_inputs(
+        temporary.path(),
+        RULES,
+        &metadata(temporary.path(), &[package]),
+    )
+    .expect("repository must be scanned");
+
+    assert!(!report
+        .violations
+        .iter()
+        .any(|violation| violation.rule == "A-11"));
+    assert_eq!(report.version_branch_exemptions, 0);
+}
+
+#[test]
+fn a11_reasoned_comment_exempts_the_adjacent_branch_and_is_counted() {
+    let temporary = tempdir().expect("temporary repository must be created");
+    let package = write_package(
+        temporary.path(),
+        "crates/kaleido-core",
+        "kaleido-core",
+        &[],
+        r#"
+pub fn select_feature(version: &str) {
+    // #[allow(kaleido::version_branch)] reason: vendor protocol has no capability bit
+    if version >= "1.18.9" {
+        enable_x();
+    }
+}
+"#,
+    );
+    let report = scan_repository_with_inputs(
+        temporary.path(),
+        RULES,
+        &metadata(temporary.path(), &[package]),
+    )
+    .expect("repository must be scanned");
+
+    assert!(!report
+        .violations
+        .iter()
+        .any(|violation| violation.rule == "A-11"));
+    assert_eq!(report.version_branch_exemptions, 1);
+
+    fs::write(
+        temporary.path().join("crates/kaleido-core/src/lib.rs"),
+        r#"
+pub fn select_feature(version: &str) {
+    // #[allow(kaleido::version_branch)] reason:
+    if version >= "1.18.9" {
+        enable_x();
+    }
+}
+"#,
+    )
+    .expect("invalid exemption source must be written");
+    let invalid = scan_repository_with_inputs(
+        temporary.path(),
+        RULES,
+        &metadata(
+            temporary.path(),
+            &[PackageSpec {
+                name: "kaleido-core".to_owned(),
+                relative_manifest: PathBuf::from("crates/kaleido-core/Cargo.toml"),
+                dependencies: Vec::new(),
+            }],
+        ),
+    )
+    .expect("repository must be scanned");
+    assert_eq!(invalid.version_branch_exemptions, 0);
+    assert!(invalid
+        .violations
+        .iter()
+        .any(|violation| violation.rule == "A-11"));
+}
+
+#[test]
+fn a11_excludes_inline_and_integration_test_code() {
+    let temporary = tempdir().expect("temporary repository must be created");
+    let package = write_package(
+        temporary.path(),
+        "crates/kaleido-adapter-acp",
+        "kaleido-adapter-acp",
+        &[],
+        r#"
+pub fn production_path() {}
+
+#[cfg(test)]
+mod tests {
+    pub fn test_only_branch(version: &str) {
+        if version >= "1.18.9" {
+            test_feature();
+        }
+    }
+}
+
+#[test]
+fn test_function(version: &str) {
+    if version >= "1.18.9" {
+        test_feature();
+    }
+}
+"#,
+    );
+    let integration_test = temporary
+        .path()
+        .join("crates/kaleido-adapter-acp/tests/version_gate.rs");
+    fs::create_dir_all(
+        integration_test
+            .parent()
+            .expect("integration test must have a parent"),
+    )
+    .expect("integration test directory must be created");
+    fs::write(
+        integration_test,
+        r#"fn test_only_branch(version: &str) {
+    if version >= "1.18.9" {
+        test_feature();
+    }
+}
+"#,
+    )
+    .expect("integration test source must be written");
+
+    let report = scan_repository_with_inputs(
+        temporary.path(),
+        RULES,
+        &metadata(temporary.path(), &[package]),
+    )
+    .expect("repository must be scanned");
+    assert!(!report
+        .violations
+        .iter()
+        .any(|violation| violation.rule == "A-11"));
+    assert_eq!(report.version_branch_exemptions, 0);
+}
+
+#[test]
 fn fixture_and_root_schema_sources_are_excluded_without_hiding_nested_source_modules() {
     let temporary = tempdir().expect("temporary repository must be created");
     let package = write_package(

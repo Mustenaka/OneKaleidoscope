@@ -123,6 +123,22 @@ fn missing_upstream_tool_exits_two_for_diff_and_refresh() {
     }
 }
 
+#[test]
+fn history_query_does_not_probe_upstream_tools() {
+    let empty_path = tempdir().expect("empty executable path must be created");
+    let output = Command::new(env!("CARGO_BIN_EXE_xtask"))
+        .args(["schema", "history", "opencode", "opencode.type.Session"])
+        .env("PATH", empty_path.path())
+        .output()
+        .expect("xtask must start");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("schema history: tool=opencode entry=opencode.type.Session"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("required tool"));
+}
+
 fn write_json(root: &Path, relative: &str, contents: &str) {
     let path = root.join(relative);
     fs::create_dir_all(path.parent().expect("JSON path must have a parent"))

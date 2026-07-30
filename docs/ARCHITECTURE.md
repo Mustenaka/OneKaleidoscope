@@ -120,6 +120,38 @@
 **G3 的验收因此可机械化**：跑两遍同一会话（一遍不断线、一遍中途飞行模式 30s），
 两份事件序列按 seq 排序后逐字节 diff 必须为空。
 
+### 4.2b 归一化是 join，不是映射（T-011 实录证据）
+
+第一份真实的 Codex 审批报文（`tests/fixtures/codex/03-permission-approve.jsonl`）推翻了
+「UACP 事件 = 上游报文的 1:1 映射」这个假设：
+
+```
+line 48  item/started    → item.changes[] 含 path / kind / diff，status=inProgress
+line 50  item/fileChange/requestApproval (server request, id=0)
+                         → params 只有 threadId / turnId / itemId / startedAtMs
+                            reason=null, grantRoot=null 。**不含任何可展示内容**
+line 52  client reply    → {"id":0,"result":{"decision":"accept"}}
+line 54  item/completed  → 同一 itemId，status=completed
+```
+
+**审批请求本身不携带「批准什么」的信息。** 要在手机上渲染
+「批准修改 `editable.txt`，内容是 …」这张卡片，必须按 `itemId` 把审批请求
+与在它之前到达的 `item/started` **join** 起来。
+
+因此：
+
+1. **adapter 必须维护 item 状态表**，`PermissionRequest` 是
+   *(审批请求 × 它引用的 item)* 的合并结果，不是审批请求的转写
+2. **落进 EventLog 的是已合并的 UACP 事件**，不是上游原始报文 ——
+   否则断线重放时手机只能拿到一串 ID，无法重建卡片。这与 INV-1 一致
+3. `item.changes[].diff` **直接携带文件内容**。按 `REQUIREMENTS.md §6.3`，
+   它绝不能进日志正文，必须走 §4.3 的内容寻址存储，日志里只留引用
+4. `DiffProduced` 与 `ToolCallStart/End` 很可能不是三个独立事件，
+   而是同一个 item 在不同阶段的投影 —— `PROTOCOL.md` 需就此定稿
+
+> 这条只有真实报文能揭示。仅看 schema 会得出「审批请求自带上下文」的错误结论，
+> 进而设计出一个在手机上无法渲染的协议。
+
 ### 4.3 日志的落盘格式
 
 - 每会话一个 append-only 文件：`<data_dir>/events/<session_id>.log`

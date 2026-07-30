@@ -42,7 +42,7 @@ impl fmt::Display for XtaskError {
         match self {
             Self::Usage => write!(
                 formatter,
-                "usage: cargo xtask <ci|fmt|clippy|test|check-deps|lint-forbidden|fixtures verify|schema <refresh|diff>>"
+                "usage: cargo xtask <ci|fmt|clippy|test|check-deps|lint-forbidden|fixtures verify|schema <refresh|diff|history <tool> <entry-id>>>"
             ),
             Self::WorkspaceRoot => write!(formatter, "could not resolve the workspace root"),
             Self::Io(error) => write!(formatter, "I/O failure: {error}"),
@@ -186,12 +186,30 @@ fn parse_task() -> Result<Task, XtaskError> {
             let Some(subcommand) = arguments.next() else {
                 return Err(XtaskError::Usage);
             };
-            let schema_command = match subcommand.to_str() {
-                Some("refresh") => SchemaCommand::Refresh,
-                Some("diff") => SchemaCommand::Diff,
-                _ => return Err(XtaskError::Usage),
-            };
-            parse_without_extra_arguments(Task::Schema(schema_command), arguments)
+            match subcommand.to_str() {
+                Some("refresh") => {
+                    parse_without_extra_arguments(Task::Schema(SchemaCommand::Refresh), arguments)
+                }
+                Some("diff") => {
+                    parse_without_extra_arguments(Task::Schema(SchemaCommand::Diff), arguments)
+                }
+                Some("history") => {
+                    let Some(tool) = arguments.next().and_then(|value| value.into_string().ok())
+                    else {
+                        return Err(XtaskError::Usage);
+                    };
+                    let Some(entry_id) =
+                        arguments.next().and_then(|value| value.into_string().ok())
+                    else {
+                        return Err(XtaskError::Usage);
+                    };
+                    parse_without_extra_arguments(
+                        Task::Schema(SchemaCommand::History { tool, entry_id }),
+                        arguments,
+                    )
+                }
+                _ => Err(XtaskError::Usage),
+            }
         }
         _ => Err(XtaskError::Usage),
     }
@@ -256,6 +274,10 @@ fn run_forbidden_step(root: &Path) -> Result<(), XtaskError> {
     println!(
         "lint-forbidden: A-2 agent-name-branch exemptions={}",
         report.agent_name_branch_exemptions
+    );
+    println!(
+        "lint-forbidden: A-11 version-branch exemptions={}",
+        report.version_branch_exemptions
     );
     if !report.violations.is_empty() {
         for violation in &report.violations {

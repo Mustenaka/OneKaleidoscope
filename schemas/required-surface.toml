@@ -1,0 +1,1122 @@
+schema_version = 1
+
+# Selector contract: method entries cover the method/operation envelope only.
+# Every payload type UACP consumes is declared separately below; type entries
+# include their transitive local $ref closure. This keeps aggregate endpoints
+# such as OpenCode GET /event from importing unrelated event families.
+
+[[tools]]
+name = "codex"
+supported_range = "=0.146.0"
+
+[[tools]]
+name = "opencode"
+supported_range = "=1.18.8"
+
+[[tools]]
+name = "acp"
+supported_range = "=1.18.0"
+
+# Codex wire methods
+
+[[entries]]
+id = "codex.method.initialize"
+tool = "codex"
+kind = "method"
+name = "initialize"
+reason = "Required for the UACP initialization and capability-negotiation method family."
+
+[[entries]]
+id = "codex.method.initialized"
+tool = "codex"
+kind = "method"
+name = "initialized"
+reason = "Required to complete the UACP initialization handshake before session traffic."
+
+[[entries]]
+id = "codex.method.thread-start"
+tool = "codex"
+kind = "method"
+name = "thread/start"
+reason = "Required for the UACP session-create method family."
+
+[[entries]]
+id = "codex.method.thread-started"
+tool = "codex"
+kind = "method"
+name = "thread/started"
+reason = "Required to emit the UACP session-started lifecycle event."
+
+[[entries]]
+id = "codex.method.thread-resume"
+tool = "codex"
+kind = "method"
+name = "thread/resume"
+reason = "Required for the UACP session-load and resume method family."
+
+[[entries]]
+id = "codex.method.thread-list"
+tool = "codex"
+kind = "method"
+name = "thread/list"
+reason = "Required for the UACP session-list method family."
+
+[[entries]]
+id = "codex.method.turn-start"
+tool = "codex"
+kind = "method"
+name = "turn/start"
+reason = "Required to submit a UACP prompt turn."
+
+[[entries]]
+id = "codex.method.turn-started"
+tool = "codex"
+kind = "method"
+name = "turn/started"
+reason = "Required to emit the UACP turn-started lifecycle event."
+
+[[entries]]
+id = "codex.method.turn-completed"
+tool = "codex"
+kind = "method"
+name = "turn/completed"
+reason = "Required to emit successful, failed, or interrupted UACP turn completion."
+
+[[entries]]
+id = "codex.method.turn-interrupt"
+tool = "codex"
+kind = "method"
+name = "turn/interrupt"
+reason = "Required for the UACP cancel-turn method family."
+
+[[entries]]
+id = "codex.method.thread-status-changed"
+tool = "codex"
+kind = "method"
+name = "thread/status/changed"
+reason = "Required to normalize upstream thread state into UACP session status."
+
+[[entries]]
+id = "codex.method.item-started"
+tool = "codex"
+kind = "method"
+name = "item/started"
+reason = "Required to begin UACP item and tool-call lifecycle tracking."
+
+[[entries]]
+id = "codex.method.item-completed"
+tool = "codex"
+kind = "method"
+name = "item/completed"
+reason = "Required to finish UACP item and tool-call lifecycle tracking."
+
+[[entries]]
+id = "codex.method.item-agent-message-delta"
+tool = "codex"
+kind = "method"
+name = "item/agentMessage/delta"
+reason = "Required to emit streamed UACP agent-text chunks."
+
+[[entries]]
+id = "codex.method.item-reasoning-text-delta"
+tool = "codex"
+kind = "method"
+name = "item/reasoning/textDelta"
+reason = "Required to emit streamed UACP thought chunks."
+
+[[entries]]
+id = "codex.method.item-command-output-delta"
+tool = "codex"
+kind = "method"
+name = "item/commandExecution/outputDelta"
+reason = "Required to emit streamed UACP tool-call output."
+
+[[entries]]
+id = "codex.method.item-plan-delta"
+tool = "codex"
+kind = "method"
+name = "item/plan/delta"
+reason = "Required to emit incremental UACP plan updates."
+
+[[entries]]
+id = "codex.method.command-request-approval"
+tool = "codex"
+kind = "method"
+name = "item/commandExecution/requestApproval"
+reason = "Required to normalize command execution approval into UACP permission events."
+
+[[entries]]
+id = "codex.method.file-change-request-approval"
+tool = "codex"
+kind = "method"
+name = "item/fileChange/requestApproval"
+reason = "Required to normalize file-change approval into UACP permission events."
+
+[[entries]]
+id = "codex.method.permissions-request-approval"
+tool = "codex"
+kind = "method"
+name = "item/permissions/requestApproval"
+reason = "Required to normalize granular permission-profile approval into UACP permission events."
+
+[[entries]]
+id = "codex.method.legacy-exec-command-approval"
+tool = "codex"
+kind = "method"
+name = "execCommandApproval"
+reason = "Required for backward-compatible normalization of legacy command approvals."
+
+[[entries]]
+id = "codex.method.legacy-apply-patch-approval"
+tool = "codex"
+kind = "method"
+name = "applyPatchApproval"
+reason = "Required for backward-compatible normalization of legacy patch approvals."
+
+[[entries]]
+id = "codex.method.mcp-elicitation-request"
+tool = "codex"
+kind = "method"
+name = "mcpServer/elicitation/request"
+reason = "Required for capability-gated UACP elicitation requests and outcomes."
+
+# Codex schema types
+
+[[entries]]
+id = "codex.type.InitializeParams"
+tool = "codex"
+kind = "type"
+name = "InitializeParams"
+reason = "Required to encode the Codex side of the UACP initialization handshake."
+
+[[entries]]
+id = "codex.type.InitializeResponse"
+tool = "codex"
+kind = "type"
+name = "InitializeResponse"
+reason = "Required to decode Codex capabilities negotiated during UACP initialization."
+
+[[entries]]
+id = "codex.type.CommandExecutionRequestApprovalParams"
+tool = "codex"
+kind = "type"
+name = "CommandExecutionRequestApprovalParams"
+reason = "Required to inspect the command, scope, and lifecycle of a UACP permission request."
+
+[[entries]]
+id = "codex.type.CommandExecutionRequestApprovalResponse"
+tool = "codex"
+kind = "type"
+name = "CommandExecutionRequestApprovalResponse"
+reason = "Required to return an explicit UACP permission approval or denial for a command."
+
+[[entries]]
+id = "codex.type.FileChangeRequestApprovalParams"
+tool = "codex"
+kind = "type"
+name = "FileChangeRequestApprovalParams"
+reason = "Required to inspect the target and lifecycle of a UACP file-change permission request."
+
+[[entries]]
+id = "codex.type.FileChangeRequestApprovalResponse"
+tool = "codex"
+kind = "type"
+name = "FileChangeRequestApprovalResponse"
+reason = "Required to return an explicit UACP permission approval or denial for file changes."
+
+[[entries]]
+id = "codex.type.PermissionsRequestApprovalParams"
+tool = "codex"
+kind = "type"
+name = "PermissionsRequestApprovalParams"
+reason = "Required to normalize granular permission-profile requests into UACP permission events."
+
+[[entries]]
+id = "codex.type.PermissionsRequestApprovalResponse"
+tool = "codex"
+kind = "type"
+name = "PermissionsRequestApprovalResponse"
+reason = "Required to encode the granted or denied permission profile in a UACP response."
+
+[[entries]]
+id = "codex.type.ExecCommandApprovalParams"
+tool = "codex"
+kind = "type"
+name = "ExecCommandApprovalParams"
+reason = "Required to decode legacy command approval requests without losing permission evidence."
+
+[[entries]]
+id = "codex.type.ExecCommandApprovalResponse"
+tool = "codex"
+kind = "type"
+name = "ExecCommandApprovalResponse"
+reason = "Required to encode the decision for a legacy command approval request."
+
+[[entries]]
+id = "codex.type.ApplyPatchApprovalParams"
+tool = "codex"
+kind = "type"
+name = "ApplyPatchApprovalParams"
+reason = "Required to decode legacy patch approval requests without losing file-change evidence."
+
+[[entries]]
+id = "codex.type.ApplyPatchApprovalResponse"
+tool = "codex"
+kind = "type"
+name = "ApplyPatchApprovalResponse"
+reason = "Required to encode the decision for a legacy patch approval request."
+
+[[entries]]
+id = "codex.type.McpServerElicitationRequestParams"
+tool = "codex"
+kind = "type"
+name = "McpServerElicitationRequestParams"
+reason = "Required to normalize capability-gated Codex elicitation prompts into UACP."
+
+[[entries]]
+id = "codex.type.McpServerElicitationRequestResponse"
+tool = "codex"
+kind = "type"
+name = "McpServerElicitationRequestResponse"
+reason = "Required to return a UACP elicitation answer, decline, or cancellation."
+
+[[entries]]
+id = "codex.type.JSONRPCMessage"
+tool = "codex"
+kind = "type"
+name = "JSONRPCMessage"
+reason = "Required to discriminate all structured Codex JSON-RPC traffic."
+
+[[entries]]
+id = "codex.type.JSONRPCRequest"
+tool = "codex"
+kind = "type"
+name = "JSONRPCRequest"
+reason = "Required to correlate UACP-originated requests with Codex responses."
+
+[[entries]]
+id = "codex.type.JSONRPCNotification"
+tool = "codex"
+kind = "type"
+name = "JSONRPCNotification"
+reason = "Required to receive Codex lifecycle and streaming notifications."
+
+[[entries]]
+id = "codex.type.JSONRPCResponse"
+tool = "codex"
+kind = "type"
+name = "JSONRPCResponse"
+reason = "Required to complete correlated Codex requests without terminal scraping."
+
+[[entries]]
+id = "codex.type.JSONRPCError"
+tool = "codex"
+kind = "type"
+name = "JSONRPCError"
+reason = "Required to normalize structured Codex failures into UACP error events."
+
+[[entries]]
+id = "codex.type.RequestId"
+tool = "codex"
+kind = "type"
+name = "RequestId"
+reason = "Required to correlate Codex requests, responses, and permission lifecycles."
+
+[[entries]]
+id = "codex.type.ServerRequest"
+tool = "codex"
+kind = "type"
+name = "ServerRequest"
+reason = "Required to dispatch the approved Codex server-request subset through UACP."
+
+[[entries]]
+id = "codex.type.ReviewDecision"
+tool = "codex"
+kind = "type"
+name = "ReviewDecision"
+reason = "Required to normalize legacy Codex approve and deny decisions."
+
+[[entries]]
+id = "codex.type.ThreadStartParams"
+tool = "codex"
+kind = "type"
+name = "ThreadStartParams"
+reason = "Required to create a Codex thread for the UACP session-create method."
+
+[[entries]]
+id = "codex.type.ThreadStartResponse"
+tool = "codex"
+kind = "type"
+name = "ThreadStartResponse"
+reason = "Required to obtain the upstream identity for a newly created UACP session."
+
+[[entries]]
+id = "codex.type.ThreadStartedNotification"
+tool = "codex"
+kind = "type"
+name = "ThreadStartedNotification"
+reason = "Required to emit the UACP session-started lifecycle event."
+
+[[entries]]
+id = "codex.type.ThreadResumeParams"
+tool = "codex"
+kind = "type"
+name = "ThreadResumeParams"
+reason = "Required to load an existing Codex thread as a UACP session."
+
+[[entries]]
+id = "codex.type.ThreadResumeResponse"
+tool = "codex"
+kind = "type"
+name = "ThreadResumeResponse"
+reason = "Required to restore the resumed session state into UACP."
+
+[[entries]]
+id = "codex.type.ThreadListParams"
+tool = "codex"
+kind = "type"
+name = "ThreadListParams"
+reason = "Required to request the Codex thread subset exposed by UACP session listing."
+
+[[entries]]
+id = "codex.type.ThreadListResponse"
+tool = "codex"
+kind = "type"
+name = "ThreadListResponse"
+reason = "Required to normalize Codex threads into UACP session summaries."
+
+[[entries]]
+id = "codex.type.TurnStartParams"
+tool = "codex"
+kind = "type"
+name = "TurnStartParams"
+reason = "Required to submit UACP prompt input to a Codex turn."
+
+[[entries]]
+id = "codex.type.TurnStartResponse"
+tool = "codex"
+kind = "type"
+name = "TurnStartResponse"
+reason = "Required to correlate an accepted UACP prompt with its Codex turn."
+
+[[entries]]
+id = "codex.type.TurnStartedNotification"
+tool = "codex"
+kind = "type"
+name = "TurnStartedNotification"
+reason = "Required to emit the UACP turn-started lifecycle event."
+
+[[entries]]
+id = "codex.type.TurnCompletedNotification"
+tool = "codex"
+kind = "type"
+name = "TurnCompletedNotification"
+reason = "Required to emit completed, failed, and interrupted UACP turn outcomes."
+
+[[entries]]
+id = "codex.type.TurnInterruptParams"
+tool = "codex"
+kind = "type"
+name = "TurnInterruptParams"
+reason = "Required to identify the Codex turn targeted by a UACP cancellation."
+
+[[entries]]
+id = "codex.type.TurnInterruptResponse"
+tool = "codex"
+kind = "type"
+name = "TurnInterruptResponse"
+reason = "Required to confirm acceptance of a UACP turn cancellation."
+
+[[entries]]
+id = "codex.type.ThreadStatusChangedNotification"
+tool = "codex"
+kind = "type"
+name = "ThreadStatusChangedNotification"
+reason = "Required to normalize Codex thread state into UACP session status."
+
+[[entries]]
+id = "codex.type.ItemStartedNotification"
+tool = "codex"
+kind = "type"
+name = "ItemStartedNotification"
+reason = "Required to begin UACP item and tool-call lifecycle tracking."
+
+[[entries]]
+id = "codex.type.ItemCompletedNotification"
+tool = "codex"
+kind = "type"
+name = "ItemCompletedNotification"
+reason = "Required to finish UACP item and tool-call lifecycle tracking."
+
+[[entries]]
+id = "codex.type.AgentMessageDeltaNotification"
+tool = "codex"
+kind = "type"
+name = "AgentMessageDeltaNotification"
+reason = "Required to normalize Codex agent message deltas into UACP text chunks."
+
+[[entries]]
+id = "codex.type.ReasoningTextDeltaNotification"
+tool = "codex"
+kind = "type"
+name = "ReasoningTextDeltaNotification"
+reason = "Required to normalize Codex reasoning deltas into UACP thought chunks."
+
+[[entries]]
+id = "codex.type.CommandExecutionOutputDeltaNotification"
+tool = "codex"
+kind = "type"
+name = "CommandExecutionOutputDeltaNotification"
+reason = "Required to normalize Codex command output into UACP tool-call output."
+
+[[entries]]
+id = "codex.type.PlanDeltaNotification"
+tool = "codex"
+kind = "type"
+name = "PlanDeltaNotification"
+reason = "Required to normalize Codex plan deltas into UACP plan updates."
+
+# ACP v1 wire methods
+
+[[entries]]
+id = "acp.method.initialize"
+tool = "acp"
+kind = "method"
+name = "initialize"
+reason = "Required for ACP protocol negotiation and UACP capability discovery."
+
+[[entries]]
+id = "acp.method.session-new"
+tool = "acp"
+kind = "method"
+name = "session/new"
+reason = "Required for the UACP session-create method family."
+
+[[entries]]
+id = "acp.method.session-load"
+tool = "acp"
+kind = "method"
+name = "session/load"
+reason = "Required for the UACP session-load method family."
+
+[[entries]]
+id = "acp.method.session-list"
+tool = "acp"
+kind = "method"
+name = "session/list"
+reason = "Required for the UACP session-list method family."
+
+[[entries]]
+id = "acp.method.session-prompt"
+tool = "acp"
+kind = "method"
+name = "session/prompt"
+reason = "Required to run a UACP prompt turn through ACP."
+
+[[entries]]
+id = "acp.method.session-cancel"
+tool = "acp"
+kind = "method"
+name = "session/cancel"
+reason = "Required to cancel an active UACP prompt turn."
+
+[[entries]]
+id = "acp.method.session-request-permission"
+tool = "acp"
+kind = "method"
+name = "session/request_permission"
+reason = "Required to normalize ACP permission requests and outcomes into UACP."
+
+[[entries]]
+id = "acp.method.fs-read-text-file"
+tool = "acp"
+kind = "method"
+name = "fs/read_text_file"
+reason = "Required for hostd's ACP filesystem-read role and file tool calls."
+
+[[entries]]
+id = "acp.method.fs-write-text-file"
+tool = "acp"
+kind = "method"
+name = "fs/write_text_file"
+reason = "Required for hostd's ACP filesystem-write role and file-change events."
+
+[[entries]]
+id = "acp.method.terminal-create"
+tool = "acp"
+kind = "method"
+name = "terminal/create"
+reason = "Required to begin an ACP terminal-backed UACP tool call."
+
+[[entries]]
+id = "acp.method.terminal-output"
+tool = "acp"
+kind = "method"
+name = "terminal/output"
+reason = "Required to stream ACP terminal output as UACP tool-call output."
+
+[[entries]]
+id = "acp.method.terminal-release"
+tool = "acp"
+kind = "method"
+name = "terminal/release"
+reason = "Required to release terminal resources after a UACP tool call."
+
+[[entries]]
+id = "acp.method.terminal-wait-for-exit"
+tool = "acp"
+kind = "method"
+name = "terminal/wait_for_exit"
+reason = "Required to determine the terminal exit outcome of a UACP tool call."
+
+[[entries]]
+id = "acp.method.terminal-kill"
+tool = "acp"
+kind = "method"
+name = "terminal/kill"
+reason = "Required to cancel a terminal-backed UACP tool call."
+
+# ACP v1 schema types
+
+[[entries]]
+id = "acp.type.SessionUpdate"
+tool = "acp"
+kind = "type"
+name = "SessionUpdate"
+reason = "Required to discriminate all eleven ACP session-update variants consumed by UACP."
+
+[[entries]]
+id = "acp.type.ContentChunk"
+tool = "acp"
+kind = "type"
+name = "ContentChunk"
+reason = "Required by ACP user, agent, and thought chunk variants normalized into UACP."
+
+[[entries]]
+id = "acp.type.ToolCall"
+tool = "acp"
+kind = "type"
+name = "ToolCall"
+reason = "Required to emit the initial UACP tool-call event from ACP."
+
+[[entries]]
+id = "acp.type.ToolCallUpdate"
+tool = "acp"
+kind = "type"
+name = "ToolCallUpdate"
+reason = "Required to emit UACP tool-call progress, output, and completion from ACP."
+
+[[entries]]
+id = "acp.type.Plan"
+tool = "acp"
+kind = "type"
+name = "Plan"
+reason = "Required to normalize the ACP plan session update into UACP."
+
+[[entries]]
+id = "acp.type.AvailableCommandsUpdate"
+tool = "acp"
+kind = "type"
+name = "AvailableCommandsUpdate"
+reason = "Required to preserve ACP available-command capability updates used by UACP clients."
+
+[[entries]]
+id = "acp.type.CurrentModeUpdate"
+tool = "acp"
+kind = "type"
+name = "CurrentModeUpdate"
+reason = "Required to preserve ACP session-mode changes in UACP session state."
+
+[[entries]]
+id = "acp.type.ConfigOptionUpdate"
+tool = "acp"
+kind = "type"
+name = "ConfigOptionUpdate"
+reason = "Required to preserve ACP session configuration updates in UACP session state."
+
+[[entries]]
+id = "acp.type.SessionInfoUpdate"
+tool = "acp"
+kind = "type"
+name = "SessionInfoUpdate"
+reason = "Required to update UACP session title, timestamps, and metadata."
+
+[[entries]]
+id = "acp.type.UsageUpdate"
+tool = "acp"
+kind = "type"
+name = "UsageUpdate"
+reason = "Required to expose ACP context-window and cost updates through UACP."
+
+[[entries]]
+id = "acp.type.PermissionOption"
+tool = "acp"
+kind = "type"
+name = "PermissionOption"
+reason = "Required to present the exact ACP permission choices to a UACP client."
+
+[[entries]]
+id = "acp.type.PermissionOptionKind"
+tool = "acp"
+kind = "type"
+name = "PermissionOptionKind"
+reason = "Required to retain approve, deny, and related ACP permission semantics."
+
+[[entries]]
+id = "acp.type.RequestPermissionOutcome"
+tool = "acp"
+kind = "type"
+name = "RequestPermissionOutcome"
+reason = "Required to normalize selected and cancelled ACP permission outcomes into UACP."
+
+[[entries]]
+id = "acp.type.AgentCapabilities"
+tool = "acp"
+kind = "type"
+name = "AgentCapabilities"
+reason = "Required for runtime ACP capability negotiation instead of version-gated features."
+
+# OpenCode HTTP and SSE methods
+
+[[entries]]
+id = "opencode.method.session-list"
+tool = "opencode"
+kind = "method"
+name = "GET /session"
+reason = "Required for the UACP session-list method family."
+
+[[entries]]
+id = "opencode.method.session-get"
+tool = "opencode"
+kind = "method"
+name = "GET /session/{sessionID}"
+reason = "Required to load the metadata for a selected UACP session."
+
+[[entries]]
+id = "opencode.method.session-messages"
+tool = "opencode"
+kind = "method"
+name = "GET /session/{sessionID}/message"
+reason = "Required to replay persisted messages when loading a UACP session."
+
+[[entries]]
+id = "opencode.method.session-prompt"
+tool = "opencode"
+kind = "method"
+name = "POST /session/{sessionID}/message"
+reason = "Required to submit a UACP prompt turn to OpenCode."
+
+[[entries]]
+id = "opencode.method.session-abort"
+tool = "opencode"
+kind = "method"
+name = "POST /session/{sessionID}/abort"
+reason = "Required to cancel an active OpenCode turn through UACP."
+
+[[entries]]
+id = "opencode.method.session-permission-respond"
+tool = "opencode"
+kind = "method"
+name = "POST /session/{sessionID}/permissions/{permissionID}"
+reason = "Required by the provisional UACP OpenCode permission-response method family."
+
+[[entries]]
+id = "opencode.method.permission-reply"
+tool = "opencode"
+kind = "method"
+name = "POST /permission/{requestID}/reply"
+reason = "Required by the recorder-observed legacy OpenCode permission approval and denial path."
+
+[[entries]]
+id = "opencode.method.v2-session-permission-reply"
+tool = "opencode"
+kind = "method"
+name = "POST /api/session/{sessionID}/permission/{requestID}/reply"
+reason = "Required by the recorder's v2 OpenCode permission approval and denial path."
+
+[[entries]]
+id = "opencode.method.event-subscribe"
+tool = "opencode"
+kind = "method"
+name = "GET /event"
+reason = "Required to receive the structured SSE source for UACP session events."
+
+[[entries]]
+id = "opencode.method.project-current"
+tool = "opencode"
+kind = "method"
+name = "GET /project/current"
+reason = "Required to prove the active OpenCode project root is the protected fixture sandbox."
+
+# OpenCode core, permission, and question schema types
+
+[[entries]]
+id = "opencode.type.Session"
+tool = "opencode"
+kind = "type"
+name = "Session"
+reason = "Required to normalize OpenCode session identity, state, and summaries into UACP."
+
+[[entries]]
+id = "opencode.type.Message"
+tool = "opencode"
+kind = "type"
+name = "Message"
+reason = "Required to normalize persisted OpenCode user and assistant messages into UACP."
+
+[[entries]]
+id = "opencode.type.Part"
+tool = "opencode"
+kind = "type"
+name = "Part"
+reason = "Required to normalize OpenCode text, reasoning, tool, and file-change parts into UACP."
+
+[[entries]]
+id = "opencode.type.EventPermissionAsked"
+tool = "opencode"
+kind = "type"
+name = "EventPermissionAsked"
+reason = "Required to recognize legacy permission requests on the OpenCode SSE event stream."
+
+[[entries]]
+id = "opencode.type.EventPermissionReplied"
+tool = "opencode"
+kind = "type"
+name = "EventPermissionReplied"
+reason = "Required to recognize legacy permission outcomes on the OpenCode SSE event stream."
+
+[[entries]]
+id = "opencode.type.EventPermissionV2Asked"
+tool = "opencode"
+kind = "type"
+name = "EventPermissionV2Asked"
+reason = "Required to recognize v2 permission requests on the OpenCode SSE event stream."
+
+[[entries]]
+id = "opencode.type.EventPermissionV2Replied"
+tool = "opencode"
+kind = "type"
+name = "EventPermissionV2Replied"
+reason = "Required to recognize v2 permission outcomes on the OpenCode SSE event stream."
+
+[[entries]]
+id = "opencode.type.EventQuestionAsked"
+tool = "opencode"
+kind = "type"
+name = "EventQuestionAsked"
+reason = "Required to recognize legacy question requests as UACP elicitation events."
+
+[[entries]]
+id = "opencode.type.EventQuestionRejected"
+tool = "opencode"
+kind = "type"
+name = "EventQuestionRejected"
+reason = "Required to recognize rejected legacy questions as UACP elicitation outcomes."
+
+[[entries]]
+id = "opencode.type.EventQuestionReplied"
+tool = "opencode"
+kind = "type"
+name = "EventQuestionReplied"
+reason = "Required to recognize answered legacy questions as UACP elicitation outcomes."
+
+[[entries]]
+id = "opencode.type.EventQuestionV2Asked"
+tool = "opencode"
+kind = "type"
+name = "EventQuestionV2Asked"
+reason = "Required to recognize v2 question requests as UACP elicitation events."
+
+[[entries]]
+id = "opencode.type.EventQuestionV2Rejected"
+tool = "opencode"
+kind = "type"
+name = "EventQuestionV2Rejected"
+reason = "Required to recognize rejected v2 questions as UACP elicitation outcomes."
+
+[[entries]]
+id = "opencode.type.EventQuestionV2Replied"
+tool = "opencode"
+kind = "type"
+name = "EventQuestionV2Replied"
+reason = "Required to recognize answered v2 questions as UACP elicitation outcomes."
+
+[[entries]]
+id = "opencode.type.PermissionAction"
+tool = "opencode"
+kind = "type"
+name = "PermissionAction"
+reason = "Required to retain the action governed by an OpenCode permission request."
+
+[[entries]]
+id = "opencode.type.PermissionActionConfig"
+tool = "opencode"
+kind = "type"
+name = "PermissionActionConfig"
+reason = "Required to interpret action-specific OpenCode permission policy."
+
+[[entries]]
+id = "opencode.type.PermissionAsked"
+tool = "opencode"
+kind = "type"
+name = "PermissionAsked"
+reason = "Required to normalize a location-aware legacy OpenCode permission request."
+
+[[entries]]
+id = "opencode.type.PermissionConfig"
+tool = "opencode"
+kind = "type"
+name = "PermissionConfig"
+reason = "Required to interpret the effective OpenCode permission configuration."
+
+[[entries]]
+id = "opencode.type.PermissionNotFoundError"
+tool = "opencode"
+kind = "type"
+name = "PermissionNotFoundError"
+reason = "Required to report a vanished OpenCode permission request without fabricating an outcome."
+
+[[entries]]
+id = "opencode.type.PermissionObjectConfig"
+tool = "opencode"
+kind = "type"
+name = "PermissionObjectConfig"
+reason = "Required to preserve object-form OpenCode permission policy."
+
+[[entries]]
+id = "opencode.type.PermissionReplied"
+tool = "opencode"
+kind = "type"
+name = "PermissionReplied"
+reason = "Required to normalize a location-aware legacy OpenCode permission outcome."
+
+[[entries]]
+id = "opencode.type.PermissionRequest"
+tool = "opencode"
+kind = "type"
+name = "PermissionRequest"
+reason = "Required to normalize the legacy OpenCode permission request payload into UACP."
+
+[[entries]]
+id = "opencode.type.PermissionRule"
+tool = "opencode"
+kind = "type"
+name = "PermissionRule"
+reason = "Required to preserve the rule governing an OpenCode permission decision."
+
+[[entries]]
+id = "opencode.type.PermissionRuleConfig"
+tool = "opencode"
+kind = "type"
+name = "PermissionRuleConfig"
+reason = "Required to interpret configured OpenCode permission rules."
+
+[[entries]]
+id = "opencode.type.PermissionRuleset"
+tool = "opencode"
+kind = "type"
+name = "PermissionRuleset"
+reason = "Required to retain the permission rules attached to an OpenCode session."
+
+[[entries]]
+id = "opencode.type.PermissionSavedInfo"
+tool = "opencode"
+kind = "type"
+name = "PermissionSavedInfo"
+reason = "Required to represent saved OpenCode permission decisions exposed to UACP."
+
+[[entries]]
+id = "opencode.type.PermissionV2Asked"
+tool = "opencode"
+kind = "type"
+name = "PermissionV2Asked"
+reason = "Required to normalize a location-aware v2 OpenCode permission request."
+
+[[entries]]
+id = "opencode.type.PermissionV2Effect"
+tool = "opencode"
+kind = "type"
+name = "PermissionV2Effect"
+reason = "Required to retain the effect of a v2 OpenCode permission rule."
+
+[[entries]]
+id = "opencode.type.PermissionV2Replied"
+tool = "opencode"
+kind = "type"
+name = "PermissionV2Replied"
+reason = "Required to normalize a location-aware v2 OpenCode permission outcome."
+
+[[entries]]
+id = "opencode.type.PermissionV2Reply"
+tool = "opencode"
+kind = "type"
+name = "PermissionV2Reply"
+reason = "Required to encode approve-once, approve-always, and reject v2 outcomes."
+
+[[entries]]
+id = "opencode.type.PermissionV2Request"
+tool = "opencode"
+kind = "type"
+name = "PermissionV2Request"
+reason = "Required to normalize v2 OpenCode action and resource requests into UACP."
+
+[[entries]]
+id = "opencode.type.PermissionV2Rule"
+tool = "opencode"
+kind = "type"
+name = "PermissionV2Rule"
+reason = "Required to preserve an individual v2 OpenCode permission rule."
+
+[[entries]]
+id = "opencode.type.PermissionV2Ruleset"
+tool = "opencode"
+kind = "type"
+name = "PermissionV2Ruleset"
+reason = "Required to preserve the v2 permission rules attached to an OpenCode session."
+
+[[entries]]
+id = "opencode.type.PermissionV2Source"
+tool = "opencode"
+kind = "type"
+name = "PermissionV2Source"
+reason = "Required to correlate a v2 permission request with its originating tool call."
+
+[[entries]]
+id = "opencode.type.question-rejected-envelope"
+tool = "opencode"
+kind = "type"
+name = "question.rejected"
+reason = "Required to normalize the durable legacy question-rejected event into UACP."
+
+[[entries]]
+id = "opencode.type.question-replied-envelope"
+tool = "opencode"
+kind = "type"
+name = "question.replied"
+reason = "Required to normalize the durable legacy question-replied event into UACP."
+
+[[entries]]
+id = "opencode.type.QuestionAnswer"
+tool = "opencode"
+kind = "type"
+name = "QuestionAnswer"
+reason = "Required to encode answers to a legacy OpenCode elicitation question."
+
+[[entries]]
+id = "opencode.type.QuestionAsked"
+tool = "opencode"
+kind = "type"
+name = "QuestionAsked"
+reason = "Required to normalize a location-aware legacy question request into UACP elicitation."
+
+[[entries]]
+id = "opencode.type.QuestionInfo"
+tool = "opencode"
+kind = "type"
+name = "QuestionInfo"
+reason = "Required to present legacy OpenCode question text and choices to a UACP client."
+
+[[entries]]
+id = "opencode.type.QuestionNotFoundError"
+tool = "opencode"
+kind = "type"
+name = "QuestionNotFoundError"
+reason = "Required to report a vanished OpenCode question without fabricating an outcome."
+
+[[entries]]
+id = "opencode.type.QuestionOption"
+tool = "opencode"
+kind = "type"
+name = "QuestionOption"
+reason = "Required to preserve each selectable option in a legacy OpenCode question."
+
+[[entries]]
+id = "opencode.type.QuestionRejected"
+tool = "opencode"
+kind = "type"
+name = "QuestionRejected"
+reason = "Required to normalize rejection of a legacy OpenCode question."
+
+[[entries]]
+id = "opencode.type.QuestionReplied"
+tool = "opencode"
+kind = "type"
+name = "QuestionReplied"
+reason = "Required to normalize answers to a legacy OpenCode question."
+
+[[entries]]
+id = "opencode.type.QuestionRequest"
+tool = "opencode"
+kind = "type"
+name = "QuestionRequest"
+reason = "Required to normalize a legacy OpenCode question request into UACP elicitation."
+
+[[entries]]
+id = "opencode.type.QuestionTool"
+tool = "opencode"
+kind = "type"
+name = "QuestionTool"
+reason = "Required to correlate a legacy OpenCode question with its originating tool call."
+
+[[entries]]
+id = "opencode.type.QuestionV2Answer"
+tool = "opencode"
+kind = "type"
+name = "QuestionV2Answer"
+reason = "Required to encode answers to a v2 OpenCode elicitation question."
+
+[[entries]]
+id = "opencode.type.QuestionV2Asked"
+tool = "opencode"
+kind = "type"
+name = "QuestionV2Asked"
+reason = "Required to normalize a location-aware v2 question request into UACP elicitation."
+
+[[entries]]
+id = "opencode.type.QuestionV2Info"
+tool = "opencode"
+kind = "type"
+name = "QuestionV2Info"
+reason = "Required to present v2 OpenCode question text and choices to a UACP client."
+
+[[entries]]
+id = "opencode.type.QuestionV2Option"
+tool = "opencode"
+kind = "type"
+name = "QuestionV2Option"
+reason = "Required to preserve each selectable option in a v2 OpenCode question."
+
+[[entries]]
+id = "opencode.type.QuestionV2Rejected"
+tool = "opencode"
+kind = "type"
+name = "QuestionV2Rejected"
+reason = "Required to normalize rejection of a v2 OpenCode question."
+
+[[entries]]
+id = "opencode.type.QuestionV2Replied"
+tool = "opencode"
+kind = "type"
+name = "QuestionV2Replied"
+reason = "Required to normalize answers to a v2 OpenCode question."
+
+[[entries]]
+id = "opencode.type.QuestionV2Reply"
+tool = "opencode"
+kind = "type"
+name = "QuestionV2Reply"
+reason = "Required to encode the complete reply payload for a v2 OpenCode question."
+
+[[entries]]
+id = "opencode.type.QuestionV2Request"
+tool = "opencode"
+kind = "type"
+name = "QuestionV2Request"
+reason = "Required to normalize a v2 OpenCode question request into UACP elicitation."
+
+[[entries]]
+id = "opencode.type.QuestionV2Tool"
+tool = "opencode"
+kind = "type"
+name = "QuestionV2Tool"
+reason = "Required to correlate a v2 OpenCode question with its originating tool call."

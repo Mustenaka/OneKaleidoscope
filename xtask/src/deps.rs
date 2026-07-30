@@ -1076,7 +1076,7 @@ fn dependency_rules_from_document(
             }
             [scope, rule]
                 if scope == "antipatterns"
-                    && matches!(rule.as_str(), "a1" | "a2" | "a4" | "a6") => {}
+                    && matches!(rule.as_str(), "a1" | "a2" | "a4" | "a6" | "a11") => {}
             _ => {
                 return Err(DependencyCheckError::InvalidRules(format!(
                     "unsupported table `[{}]`",

@@ -131,3 +131,10 @@ schema_paths = ["schemas/acp"]
 [[antipatterns.a6.sources]]
 crate_pattern = "kaleido-adapter-opencode"
 schema_paths = ["schemas/opencode"]
+
+[antipatterns.a11]
+# A-11 governs product runtime decisions. Snapshot tooling and pre-M3 spikes
+# validate wire/schema formats but do not select UACP features.
+source_roots = ["crates"]
+version_identifier_fragments = ["version", "semver"]
+exemption_prefix = "// #[allow(kaleido::version_branch)] reason:"

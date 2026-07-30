@@ -4,6 +4,15 @@ name: Schema drift
   schedule:
     - cron: '17 3 * * *'
   workflow_dispatch:
+    inputs:
+      codex_version:
+        description: Exact Codex version to reproduce; blank observes the current release
+        required: false
+        type: string
+      opencode_version:
+        description: Exact OpenCode version to reproduce; blank observes the current release
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -31,14 +40,71 @@ jobs:
           node-version: 22.13.1
           package-manager-cache: false
 
-      - name: Install pinned upstream CLIs
-        run: npm install --global @openai/codex@0.146.0 opencode-ai@1.18.8
-
-      - name: Verify upstream CLI versions
+      - name: Resolve observed upstream CLI versions
+        id: upstream
         shell: bash
+        env:
+          CODEX_VERSION_OVERRIDE: ${{ inputs.codex_version }}
+          OPENCODE_VERSION_OVERRIDE: ${{ inputs.opencode_version }}
         run: |
-          test "$(codex --version)" = "codex-cli 0.146.0"
-          test "$(opencode --version)" = "1.18.8"
+          set -euo pipefail
+
+          codex_version="${CODEX_VERSION_OVERRIDE:-}"
+          opencode_version="${OPENCODE_VERSION_OVERRIDE:-}"
+          if [[ -z "$codex_version" ]]; then
+            codex_version="$(npm view @openai/codex dist-tags.latest)"
+          fi
+          if [[ -z "$opencode_version" ]]; then
+            opencode_version="$(npm view opencode-ai dist-tags.latest)"
+          fi
+
+          version_pattern='^[0-9]+(\.[0-9]+){2}([+-][0-9A-Za-z.-]+)?$'
+          if [[ ! "$codex_version" =~ $version_pattern ]]; then
+            echo "invalid Codex package version: $codex_version" >&2
+            exit 2
+          fi
+          if [[ ! "$opencode_version" =~ $version_pattern ]]; then
+            echo "invalid OpenCode package version: $opencode_version" >&2
+            exit 2
+          fi
+
+          echo "codex_version=$codex_version" >> "$GITHUB_OUTPUT"
+          echo "opencode_version=$opencode_version" >> "$GITHUB_OUTPUT"
+          echo "observed Codex package version: $codex_version"
+          echo "observed OpenCode package version: $opencode_version"
+
+      - name: Install exactly the observed upstream CLIs
+        shell: bash
+        env:
+          CODEX_VERSION: ${{ steps.upstream.outputs.codex_version }}
+          OPENCODE_VERSION: ${{ steps.upstream.outputs.opencode_version }}
+        run: |
+          npm install --global \
+            "@openai/codex@$CODEX_VERSION" \
+            "opencode-ai@$OPENCODE_VERSION"
+
+      - name: Verify installed upstream CLI versions
+        shell: bash
+        env:
+          CODEX_VERSION: ${{ steps.upstream.outputs.codex_version }}
+          OPENCODE_VERSION: ${{ steps.upstream.outputs.opencode_version }}
+        run: |
+          test "$(codex --version)" = "codex-cli $CODEX_VERSION"
+          test "$(opencode --version)" = "$OPENCODE_VERSION"
 
       - name: Check semantic schema drift
-        run: cargo xtask schema diff
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo xtask schema diff 2>&1 | tee schema-diff.log
+
+      - name: Retain drift report and observed surface history
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: schema-drift-${{ github.run_id }}
+          path: |
+            schema-diff.log
+            schemas/surface-history.jsonl
+          if-no-files-found: error
+          retention-days: 30

@@ -12,8 +12,9 @@ use serde::Deserialize;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{
-    BinOp, ExprBinary, ExprLet, ExprMacro, ExprMatch, ExprMethodCall, File, ItemEnum, ItemStruct,
-    ItemType, ItemUnion, LitByteStr, LitStr,
+    Attribute, BinOp, Expr, ExprBinary, ExprIf, ExprLet, ExprMacro, ExprMatch, ExprMethodCall,
+    ExprWhile, File, ImplItemFn, ItemEnum, ItemFn, ItemMod, ItemStruct, ItemType, ItemUnion,
+    LitByteStr, LitStr,
 };
 use thiserror::Error;
 
@@ -48,6 +49,7 @@ impl fmt::Display for Violation {
 pub struct ScanReport {
     pub violations: Vec<Violation>,
     pub agent_name_branch_exemptions: usize,
+    pub version_branch_exemptions: usize,
 }
 
 #[derive(Debug, Error)]
@@ -79,6 +81,7 @@ struct AntipatternRules {
     a2: A2Rules,
     a4: A4Rules,
     a6: A6Rules,
+    a11: A11Rules,
 }
 
 #[derive(Debug)]
@@ -109,6 +112,13 @@ struct A6Rules {
 struct A6Source {
     crate_pattern: String,
     schema_paths: Vec<String>,
+}
+
+#[derive(Debug)]
+struct A11Rules {
+    source_roots: Vec<PathBuf>,
+    version_identifier_fragments: Vec<String>,
+    exemption_prefix: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,6 +181,7 @@ pub fn scan_repository_with_inputs(
     scan_a2(root, &packages, &rules.a2, &mut report)?;
     scan_a4(root, &packages, &rules.a4, &mut report.violations)?;
     scan_a6(root, &packages, &rules.a6, &mut report.violations)?;
+    scan_a11(root, &packages, &rules.a11, &mut report)?;
 
     report.violations.sort();
     report.violations.dedup();
@@ -200,6 +211,16 @@ fn antipattern_rules(source: &str) -> Result<AntipatternRules, AntipatternError>
     if let Some(a6_table) = document.table(&["antipatterns", "a6"]) {
         reject_unknown_keys(a6_table, &[], "[antipatterns.a6]")?;
     }
+    let a11_table = required_table(&document, &["antipatterns", "a11"])?;
+    reject_unknown_keys(
+        a11_table,
+        &[
+            "source_roots",
+            "version_identifier_fragments",
+            "exemption_prefix",
+        ],
+        "[antipatterns.a11]",
+    )?;
 
     let source_tables = document
         .array_tables(&["antipatterns", "a6", "sources"])
@@ -235,6 +256,49 @@ fn antipattern_rules(source: &str) -> Result<AntipatternRules, AntipatternError>
             })
         })
         .collect::<Result<Vec<_>, AntipatternError>>()?;
+    let source_roots = required_string_array(a11_table, "source_roots", "[antipatterns.a11]")?
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    if source_roots.is_empty()
+        || source_roots.iter().any(|root| {
+            root.as_os_str().is_empty()
+                || root.is_absolute()
+                || root.components().any(|component| {
+                    matches!(
+                        component,
+                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                    )
+                })
+        })
+    {
+        return Err(AntipatternError::InvalidRules(
+            "[antipatterns.a11].source_roots must contain only non-empty relative paths".to_owned(),
+        ));
+    }
+    let version_identifier_fragments = required_string_array(
+        a11_table,
+        "version_identifier_fragments",
+        "[antipatterns.a11]",
+    )?
+    .into_iter()
+    .map(|fragment| fragment.trim().to_ascii_lowercase())
+    .collect::<Vec<_>>();
+    if version_identifier_fragments.is_empty()
+        || version_identifier_fragments.iter().any(String::is_empty)
+    {
+        return Err(AntipatternError::InvalidRules(
+            "[antipatterns.a11].version_identifier_fragments must contain non-empty strings"
+                .to_owned(),
+        ));
+    }
+    let a11_exemption_prefix =
+        required_string(a11_table, "exemption_prefix", "[antipatterns.a11]")?;
+    if a11_exemption_prefix.trim().is_empty() {
+        return Err(AntipatternError::InvalidRules(
+            "[antipatterns.a11].exemption_prefix must not be empty".to_owned(),
+        ));
+    }
 
     Ok(AntipatternRules {
         a1: A1Rules {
@@ -265,6 +329,11 @@ fn antipattern_rules(source: &str) -> Result<AntipatternRules, AntipatternError>
             )?,
         },
         a6: A6Rules { sources },
+        a11: A11Rules {
+            source_roots,
+            version_identifier_fragments,
+            exemption_prefix: a11_exemption_prefix,
+        },
     })
 }
 
@@ -607,6 +676,82 @@ fn scan_a6(
         }
     }
     Ok(())
+}
+
+fn scan_a11(
+    root: &Path,
+    packages: &[WorkspacePackage],
+    rules: &A11Rules,
+    report: &mut ScanReport,
+) -> Result<(), AntipatternError> {
+    for package in packages {
+        if !rules
+            .source_roots
+            .iter()
+            .any(|source_root| package.manifest_relative.starts_with(source_root))
+        {
+            continue;
+        }
+        for source in package_source_files(root, package)? {
+            if source_is_test_code(&source.relative) {
+                continue;
+            }
+            let contents = fs::read_to_string(&source.absolute)?;
+            let syntax = parse_rust(&source.relative, &contents)?;
+            let mut binding_collector =
+                VersionBindingCollector::new(&rules.version_identifier_fragments);
+            binding_collector.visit_file(&syntax);
+            let mut predicate_collector = VersionPredicateBindingCollector::new(
+                &rules.version_identifier_fragments,
+                &binding_collector.bindings,
+            );
+            predicate_collector.visit_file(&syntax);
+            let mut visitor = A11Visitor::new(
+                &rules.version_identifier_fragments,
+                &binding_collector.bindings,
+                &predicate_collector.bindings,
+            );
+            visitor.visit_file(&syntax);
+            let lines = contents.lines().collect::<Vec<_>>();
+            for hit in visitor.hits {
+                if has_reasoned_exemption(&lines, hit.line, &rules.exemption_prefix) {
+                    report.version_branch_exemptions += 1;
+                } else {
+                    let evidence = if hit.identifiers.is_empty() {
+                        "version-shaped literal".to_owned()
+                    } else {
+                        hit.identifiers.join(", ")
+                    };
+                    report.violations.push(Violation {
+                        path: source.relative.clone(),
+                        line: hit.line,
+                        rule: "A-11".to_owned(),
+                        detail: format!(
+                            "{} branches on version evidence ({evidence}); negotiate capabilities \
+                             or inspect the live schema instead, or add a reasoned A-11 exemption \
+                             comment",
+                            hit.control_flow
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn source_is_test_code(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component,
+            Component::Normal(name) if name == OsStr::new("tests")
+        )
+    }) || path.file_stem().is_some_and(|stem| {
+        stem == OsStr::new("tests")
+            || stem
+                .to_str()
+                .is_some_and(|name| name.ends_with("_test") || name.ends_with("_tests"))
+    })
 }
 
 fn schema_type_names(
@@ -1001,6 +1146,556 @@ fn collect_token_literals(
             }
             _ => {}
         }
+    }
+}
+
+#[derive(Debug)]
+struct A11Hit {
+    line: usize,
+    control_flow: &'static str,
+    identifiers: Vec<String>,
+}
+
+struct A11Visitor<'a> {
+    version_identifier_fragments: &'a [String],
+    version_bindings: &'a BTreeSet<String>,
+    predicate_bindings: &'a BTreeSet<String>,
+    hits: Vec<A11Hit>,
+}
+
+impl<'a> A11Visitor<'a> {
+    fn new(
+        version_identifier_fragments: &'a [String],
+        version_bindings: &'a BTreeSet<String>,
+        predicate_bindings: &'a BTreeSet<String>,
+    ) -> Self {
+        Self {
+            version_identifier_fragments,
+            version_bindings,
+            predicate_bindings,
+            hits: Vec::new(),
+        }
+    }
+
+    fn record_control_flow(&mut self, expression: &Expr, line: usize, control_flow: &'static str) {
+        let mut collector = VersionComparisonCollector::new(
+            self.version_identifier_fragments,
+            self.version_bindings,
+        );
+        collector.visit_expr(expression);
+        let predicate_bindings = identifiers_used(expression, self.predicate_bindings);
+        if collector.comparison_count == 0 && predicate_bindings.is_empty() {
+            return;
+        }
+        collector.identifiers.extend(predicate_bindings);
+        self.hits.push(A11Hit {
+            line,
+            control_flow,
+            identifiers: collector.identifiers.into_iter().collect(),
+        });
+    }
+}
+
+impl<'ast> Visit<'ast> for A11Visitor<'_> {
+    fn visit_expr_if(&mut self, expression: &'ast ExprIf) {
+        self.record_control_flow(
+            &expression.cond,
+            expression.span().start().line,
+            "if expression",
+        );
+        visit::visit_expr_if(self, expression);
+    }
+
+    fn visit_expr_while(&mut self, expression: &'ast ExprWhile) {
+        self.record_control_flow(
+            &expression.cond,
+            expression.span().start().line,
+            "while expression",
+        );
+        visit::visit_expr_while(self, expression);
+    }
+
+    fn visit_expr_match(&mut self, expression: &'ast ExprMatch) {
+        let mut collector = VersionComparisonCollector::new(
+            self.version_identifier_fragments,
+            self.version_bindings,
+        );
+        collector.visit_expr(&expression.expr);
+        let scrutinee_evidence = VersionOperandEvidence::collect(
+            &expression.expr,
+            self.version_identifier_fragments,
+            self.version_bindings,
+        );
+        let version_pattern = scrutinee_evidence.has_version_identifier()
+            && expression
+                .arms
+                .iter()
+                .any(|arm| pattern_has_constant_discriminator(&arm.pat));
+        let mut predicate_bindings = identifiers_used(&expression.expr, self.predicate_bindings);
+        for arm in &expression.arms {
+            if let Some((_, guard)) = &arm.guard {
+                collector.visit_expr(guard);
+                predicate_bindings.extend(identifiers_used(guard, self.predicate_bindings));
+            }
+        }
+        if collector.comparison_count > 0 || !predicate_bindings.is_empty() || version_pattern {
+            collector.identifiers.extend(predicate_bindings);
+            if version_pattern {
+                collector
+                    .identifiers
+                    .extend(scrutinee_evidence.version_identifiers);
+            }
+            self.hits.push(A11Hit {
+                line: expression.span().start().line,
+                control_flow: "match expression",
+                identifiers: collector.identifiers.into_iter().collect(),
+            });
+        }
+        visit::visit_expr_match(self, expression);
+    }
+
+    fn visit_item_fn(&mut self, item: &'ast ItemFn) {
+        if !attributes_are_test_only(&item.attrs) {
+            visit::visit_item_fn(self, item);
+        }
+    }
+
+    fn visit_item_mod(&mut self, item: &'ast ItemMod) {
+        if !attributes_are_test_only(&item.attrs) {
+            visit::visit_item_mod(self, item);
+        }
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &'ast ImplItemFn) {
+        if !attributes_are_test_only(&item.attrs) {
+            visit::visit_impl_item_fn(self, item);
+        }
+    }
+}
+
+struct VersionBindingCollector<'a> {
+    version_identifier_fragments: &'a [String],
+    bindings: BTreeSet<String>,
+}
+
+impl<'a> VersionBindingCollector<'a> {
+    fn new(version_identifier_fragments: &'a [String]) -> Self {
+        Self {
+            version_identifier_fragments,
+            bindings: BTreeSet::new(),
+        }
+    }
+
+    fn record_typed_pattern(&mut self, pattern: &syn::Pat, ty: &syn::Type) {
+        if type_mentions_version(ty, self.version_identifier_fragments) {
+            self.bindings.extend(pattern_identifiers(pattern));
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for VersionBindingCollector<'_> {
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        if local.init.as_ref().is_some_and(|initializer| {
+            expression_mentions_version(&initializer.expr, self.version_identifier_fragments)
+        }) {
+            self.bindings.extend(pattern_identifiers(&local.pat));
+        }
+        visit::visit_local(self, local);
+    }
+
+    fn visit_pat_type(&mut self, pattern: &'ast syn::PatType) {
+        self.record_typed_pattern(&pattern.pat, &pattern.ty);
+        visit::visit_pat_type(self, pattern);
+    }
+
+    fn visit_field(&mut self, field: &'ast syn::Field) {
+        if type_mentions_version(&field.ty, self.version_identifier_fragments) {
+            if let Some(identifier) = &field.ident {
+                self.bindings
+                    .insert(identifier.to_string().to_ascii_lowercase());
+            }
+        }
+        visit::visit_field(self, field);
+    }
+
+    fn visit_item_fn(&mut self, item: &'ast ItemFn) {
+        if !attributes_are_test_only(&item.attrs) {
+            visit::visit_item_fn(self, item);
+        }
+    }
+
+    fn visit_item_mod(&mut self, item: &'ast ItemMod) {
+        if !attributes_are_test_only(&item.attrs) {
+            visit::visit_item_mod(self, item);
+        }
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &'ast ImplItemFn) {
+        if !attributes_are_test_only(&item.attrs) {
+            visit::visit_impl_item_fn(self, item);
+        }
+    }
+}
+
+struct VersionPredicateBindingCollector<'a> {
+    version_identifier_fragments: &'a [String],
+    version_bindings: &'a BTreeSet<String>,
+    bindings: BTreeSet<String>,
+}
+
+impl<'a> VersionPredicateBindingCollector<'a> {
+    fn new(
+        version_identifier_fragments: &'a [String],
+        version_bindings: &'a BTreeSet<String>,
+    ) -> Self {
+        Self {
+            version_identifier_fragments,
+            version_bindings,
+            bindings: BTreeSet::new(),
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for VersionPredicateBindingCollector<'_> {
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        if let Some(initializer) = &local.init {
+            let mut comparison = VersionComparisonCollector::new(
+                self.version_identifier_fragments,
+                self.version_bindings,
+            );
+            comparison.visit_expr(&initializer.expr);
+            if comparison.comparison_count > 0 {
+                self.bindings.extend(pattern_identifiers(&local.pat));
+            }
+        }
+        visit::visit_local(self, local);
+    }
+
+    fn visit_item_fn(&mut self, item: &'ast ItemFn) {
+        if !attributes_are_test_only(&item.attrs) {
+            visit::visit_item_fn(self, item);
+        }
+    }
+
+    fn visit_item_mod(&mut self, item: &'ast ItemMod) {
+        if !attributes_are_test_only(&item.attrs) {
+            visit::visit_item_mod(self, item);
+        }
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &'ast ImplItemFn) {
+        if !attributes_are_test_only(&item.attrs) {
+            visit::visit_impl_item_fn(self, item);
+        }
+    }
+}
+
+fn type_mentions_version(ty: &syn::Type, version_identifier_fragments: &[String]) -> bool {
+    let mut collector = FragmentIdentifierCollector {
+        fragments: version_identifier_fragments,
+        identifiers: BTreeSet::new(),
+    };
+    collector.visit_type(ty);
+    !collector.identifiers.is_empty()
+}
+
+fn expression_mentions_version(expression: &Expr, version_identifier_fragments: &[String]) -> bool {
+    let mut collector = FragmentIdentifierCollector {
+        fragments: version_identifier_fragments,
+        identifiers: BTreeSet::new(),
+    };
+    collector.visit_expr(expression);
+    !collector.identifiers.is_empty()
+}
+
+fn pattern_identifiers(pattern: &syn::Pat) -> BTreeSet<String> {
+    let mut collector = PatternIdentifierCollector::default();
+    collector.visit_pat(pattern);
+    collector.identifiers
+}
+
+fn pattern_has_constant_discriminator(pattern: &syn::Pat) -> bool {
+    match pattern {
+        syn::Pat::Const(_) | syn::Pat::Lit(_) | syn::Pat::Path(_) | syn::Pat::Range(_) => true,
+        syn::Pat::Ident(pattern) => {
+            constant_identifier(&pattern.ident.to_string())
+                || pattern
+                    .subpat
+                    .as_ref()
+                    .is_some_and(|(_, child)| pattern_has_constant_discriminator(child))
+        }
+        syn::Pat::Or(pattern) => pattern.cases.iter().any(pattern_has_constant_discriminator),
+        syn::Pat::Paren(pattern) => pattern_has_constant_discriminator(&pattern.pat),
+        syn::Pat::Reference(pattern) => pattern_has_constant_discriminator(&pattern.pat),
+        syn::Pat::Slice(pattern) => pattern.elems.iter().any(pattern_has_constant_discriminator),
+        syn::Pat::Struct(pattern) => pattern
+            .fields
+            .iter()
+            .any(|field| pattern_has_constant_discriminator(&field.pat)),
+        syn::Pat::Tuple(pattern) => pattern.elems.iter().any(pattern_has_constant_discriminator),
+        syn::Pat::TupleStruct(pattern) => {
+            pattern.elems.iter().any(pattern_has_constant_discriminator)
+        }
+        syn::Pat::Type(pattern) => pattern_has_constant_discriminator(&pattern.pat),
+        syn::Pat::Macro(_) | syn::Pat::Rest(_) | syn::Pat::Verbatim(_) | syn::Pat::Wild(_) => false,
+        _ => false,
+    }
+}
+
+#[derive(Default)]
+struct PatternIdentifierCollector {
+    identifiers: BTreeSet<String>,
+}
+
+impl Visit<'_> for PatternIdentifierCollector {
+    fn visit_pat_ident(&mut self, pattern: &syn::PatIdent) {
+        self.identifiers
+            .insert(pattern.ident.to_string().to_ascii_lowercase());
+        visit::visit_pat_ident(self, pattern);
+    }
+}
+
+struct FragmentIdentifierCollector<'a> {
+    fragments: &'a [String],
+    identifiers: BTreeSet<String>,
+}
+
+impl Visit<'_> for FragmentIdentifierCollector<'_> {
+    fn visit_ident(&mut self, identifier: &syn::Ident) {
+        let text = identifier.to_string();
+        let lowercase = text.to_ascii_lowercase();
+        if self
+            .fragments
+            .iter()
+            .any(|fragment| lowercase.contains(fragment))
+        {
+            self.identifiers.insert(lowercase);
+        }
+    }
+}
+
+fn identifiers_used(expression: &Expr, allowed: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut collector = AllowedIdentifierCollector {
+        allowed,
+        identifiers: BTreeSet::new(),
+    };
+    collector.visit_expr(expression);
+    collector.identifiers
+}
+
+struct AllowedIdentifierCollector<'a> {
+    allowed: &'a BTreeSet<String>,
+    identifiers: BTreeSet<String>,
+}
+
+impl Visit<'_> for AllowedIdentifierCollector<'_> {
+    fn visit_ident(&mut self, identifier: &syn::Ident) {
+        let text = identifier.to_string();
+        if self.allowed.contains(&text.to_ascii_lowercase()) {
+            self.identifiers.insert(text);
+        }
+    }
+}
+
+struct VersionComparisonCollector<'a> {
+    version_identifier_fragments: &'a [String],
+    version_bindings: &'a BTreeSet<String>,
+    comparison_count: usize,
+    identifiers: BTreeSet<String>,
+}
+
+impl<'a> VersionComparisonCollector<'a> {
+    fn new(
+        version_identifier_fragments: &'a [String],
+        version_bindings: &'a BTreeSet<String>,
+    ) -> Self {
+        Self {
+            version_identifier_fragments,
+            version_bindings,
+            comparison_count: 0,
+            identifiers: BTreeSet::new(),
+        }
+    }
+
+    fn record_comparison(&mut self, left: &Expr, right: &Expr) {
+        let left_evidence = VersionOperandEvidence::collect(
+            left,
+            self.version_identifier_fragments,
+            self.version_bindings,
+        );
+        let right_evidence = VersionOperandEvidence::collect(
+            right,
+            self.version_identifier_fragments,
+            self.version_bindings,
+        );
+        let identifiers = left_evidence
+            .version_identifiers
+            .union(&right_evidence.version_identifiers)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let named_version_compared_to_constant =
+            !identifiers.is_empty() && (left_evidence.has_constant || right_evidence.has_constant);
+        let two_named_versions =
+            left_evidence.has_version_identifier() && right_evidence.has_version_identifier();
+        let shaped_literal_comparison =
+            left_evidence.has_version_literal || right_evidence.has_version_literal;
+        if named_version_compared_to_constant || two_named_versions || shaped_literal_comparison {
+            self.comparison_count += 1;
+            self.identifiers.extend(identifiers);
+        }
+    }
+
+    fn record_method_comparison(&mut self, expression: &ExprMethodCall) {
+        for argument in &expression.args {
+            self.record_comparison(&expression.receiver, argument);
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for VersionComparisonCollector<'_> {
+    fn visit_expr_binary(&mut self, expression: &'ast ExprBinary) {
+        if matches!(
+            expression.op,
+            BinOp::Eq(_) | BinOp::Ne(_) | BinOp::Lt(_) | BinOp::Le(_) | BinOp::Gt(_) | BinOp::Ge(_)
+        ) {
+            self.record_comparison(&expression.left, &expression.right);
+        }
+        visit::visit_expr_binary(self, expression);
+    }
+
+    fn visit_expr_method_call(&mut self, expression: &'ast ExprMethodCall) {
+        if matches!(
+            expression.method.to_string().as_str(),
+            "cmp" | "partial_cmp" | "eq" | "ne" | "lt" | "le" | "gt" | "ge"
+        ) {
+            self.record_method_comparison(expression);
+        }
+        visit::visit_expr_method_call(self, expression);
+    }
+}
+
+#[derive(Default)]
+struct VersionOperandEvidence {
+    version_identifiers: BTreeSet<String>,
+    has_constant: bool,
+    has_version_literal: bool,
+}
+
+impl VersionOperandEvidence {
+    fn collect(
+        expression: &Expr,
+        version_identifier_fragments: &[String],
+        version_bindings: &BTreeSet<String>,
+    ) -> Self {
+        let mut collector = VersionOperandCollector {
+            version_identifier_fragments,
+            version_bindings,
+            evidence: Self::default(),
+        };
+        collector.visit_expr(expression);
+        collector.evidence
+    }
+
+    fn has_version_identifier(&self) -> bool {
+        !self.version_identifiers.is_empty()
+    }
+}
+
+struct VersionOperandCollector<'a> {
+    version_identifier_fragments: &'a [String],
+    version_bindings: &'a BTreeSet<String>,
+    evidence: VersionOperandEvidence,
+}
+
+impl Visit<'_> for VersionOperandCollector<'_> {
+    fn visit_ident(&mut self, identifier: &syn::Ident) {
+        let text = identifier.to_string();
+        let lowercase = text.to_ascii_lowercase();
+        if constant_identifier(&text) {
+            self.evidence.has_constant = true;
+        }
+        if self
+            .version_identifier_fragments
+            .iter()
+            .any(|fragment| lowercase.contains(fragment))
+            || self.version_bindings.contains(&lowercase)
+        {
+            self.evidence.version_identifiers.insert(text);
+        }
+    }
+
+    fn visit_lit_str(&mut self, literal: &LitStr) {
+        self.evidence.has_constant = true;
+        self.evidence.has_version_literal |= looks_like_version_literal(&literal.value());
+    }
+
+    fn visit_lit_int(&mut self, _literal: &syn::LitInt) {
+        self.evidence.has_constant = true;
+    }
+
+    fn visit_lit_float(&mut self, _literal: &syn::LitFloat) {
+        self.evidence.has_constant = true;
+    }
+}
+
+fn constant_identifier(identifier: &str) -> bool {
+    identifier
+        .chars()
+        .any(|character| character.is_ascii_uppercase())
+        && identifier.chars().all(|character| {
+            character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_'
+        })
+}
+
+fn looks_like_version_literal(value: &str) -> bool {
+    let candidate = value
+        .strip_prefix('v')
+        .or_else(|| value.strip_prefix('V'))
+        .unwrap_or(value);
+    let core = candidate
+        .split_once(['-', '+'])
+        .map_or(candidate, |(core, _)| core);
+    let components = core.split('.').collect::<Vec<_>>();
+    components.len() >= 2
+        && components.iter().all(|component| {
+            !component.is_empty()
+                && component
+                    .chars()
+                    .all(|character| character.is_ascii_digit())
+        })
+}
+
+fn attributes_are_test_only(attributes: &[Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        attribute
+            .path()
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "test")
+            || (attribute.path().is_ident("cfg")
+                && attribute
+                    .parse_args::<syn::Meta>()
+                    .is_ok_and(|meta| cfg_requires_test(&meta)))
+    })
+}
+
+fn cfg_requires_test(meta: &syn::Meta) -> bool {
+    match meta {
+        syn::Meta::Path(path) => path.is_ident("test"),
+        syn::Meta::List(list) if list.path.is_ident("all") || list.path.is_ident("any") => {
+            use syn::parse::Parser;
+
+            let parser = syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated;
+            let Ok(nested) = parser.parse2(list.tokens.clone()) else {
+                return false;
+            };
+            if list.path.is_ident("all") {
+                nested.iter().any(cfg_requires_test)
+            } else {
+                !nested.is_empty() && nested.iter().all(cfg_requires_test)
+            }
+        }
+        syn::Meta::List(_) | syn::Meta::NameValue(_) => false,
     }
 }
 

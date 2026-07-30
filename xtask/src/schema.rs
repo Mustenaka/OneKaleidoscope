@@ -13,41 +13,38 @@ use std::time::{Duration, Instant};
 use chrono::{SecondsFormat, Utc};
 use reqwest::blocking::Client;
 use reqwest::header::ACCEPT;
+use semver::Version;
 use serde_json::Value;
 use sha1_smol::Sha1;
 use tempfile::{Builder as TempDirBuilder, TempDir};
 use thiserror::Error;
 
-pub const CODEX_VERSION: &str = "0.146.0";
-pub const OPENCODE_VERSION: &str = "1.18.8";
+use crate::schema_history::{self, SurfaceHistoryRecord};
+use crate::schema_surface::{
+    self, RawChangeDisposition, RequiredSurface, SurfaceChange, SurfaceChangeKind,
+    SurfaceComparison, SurfaceTool, VersionSupport,
+};
+
 pub const ACP_CRATE_VERSION: &str = "1.3.0";
 pub const ACP_SCHEMA_VERSION: &str = "1.18.0";
 pub const ACP_COMMIT: &str = "48b2abf1ac750fece26e03e92e773ccbd4754f5d";
 
-const CODEX_VERSION_OUTPUT: &str = "codex-cli 0.146.0";
-const OPENCODE_VERSION_OUTPUT: &str = "1.18.8";
 const CODEX_EXECUTABLE_ENVIRONMENT: &str = "KALEIDO_CODEX_EXECUTABLE";
 const OPENCODE_EXECUTABLE_ENVIRONMENT: &str = "KALEIDO_OPENCODE_EXECUTABLE";
 const ACP_SNAPSHOT_ENVIRONMENT: &str = "KALEIDO_ACP_SNAPSHOT_DIRECTORY";
+const REQUIRED_SURFACE_FILE: &str = "required-surface.toml";
+const SURFACE_HISTORY_FILE: &str = "surface-history.jsonl";
 const ACP_REPOSITORY: &str = "https://github.com/agentclientprotocol/agent-client-protocol.git";
 const ACP_SCHEMA_URL: &str = "https://raw.githubusercontent.com/agentclientprotocol/agent-client-protocol/48b2abf1ac750fece26e03e92e773ccbd4754f5d/schema/v1/schema.json";
 const ACP_META_URL: &str = "https://raw.githubusercontent.com/agentclientprotocol/agent-client-protocol/48b2abf1ac750fece26e03e92e773ccbd4754f5d/schema/v1/meta.json";
 const ACP_SCHEMA_BLOB: &str = "0a830142717b69fbd1da2e67b5540636fc6e51dc";
 const ACP_META_BLOB: &str = "670d27876133a37cc1cc476c1ea685351422e07f";
 
-#[cfg(windows)]
-const CODEX_INSTALL_COMMAND: &str = "npm.cmd install --global @openai/codex@0.146.0";
-#[cfg(not(windows))]
-const CODEX_INSTALL_COMMAND: &str = "npm install --global @openai/codex@0.146.0";
-#[cfg(windows)]
-const OPENCODE_INSTALL_COMMAND: &str = "npm.cmd install --global opencode-ai@1.18.8";
-#[cfg(not(windows))]
-const OPENCODE_INSTALL_COMMAND: &str = "npm install --global opencode-ai@1.18.8";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SchemaCommand {
     Refresh,
     Diff,
+    History { tool: String, entry_id: String },
 }
 
 #[derive(Debug, Error)]
@@ -61,16 +58,7 @@ pub enum SchemaError {
     ToolUnavailable {
         tool: &'static str,
         detail: String,
-        install: &'static str,
-    },
-    #[error(
-        "tool `{tool}` has version `{actual}`, expected `{expected}`; install exactly with: {install}"
-    )]
-    ToolVersion {
-        tool: &'static str,
-        expected: &'static str,
-        actual: String,
-        install: &'static str,
+        install: String,
     },
     #[error("`{tool}` failed with status {status}")]
     ProcessFailed {
@@ -105,6 +93,12 @@ pub enum SchemaError {
     Server(String),
     #[error("schema drift detected at {} path(s)", .0.len())]
     Drift(Vec<SchemaChange>),
+    #[error("required-surface drift detected at {} path(s)", .0.len())]
+    RequiredSurfaceDrift(Vec<SurfaceChange>),
+    #[error(transparent)]
+    RequiredSurface(#[from] schema_surface::RequiredSurfaceError),
+    #[error(transparent)]
+    SurfaceHistory(#[from] schema_history::SurfaceHistoryError),
 }
 
 impl SchemaError {
@@ -112,8 +106,9 @@ impl SchemaError {
         match self {
             Self::ToolConfiguration { .. }
             | Self::ToolUnavailable { .. }
-            | Self::ToolVersion { .. } => 2,
-            Self::Drift(_) => 1,
+            | Self::ProcessFailed { .. }
+            | Self::Server(_) => 2,
+            Self::Drift(_) | Self::RequiredSurfaceDrift(_) => 1,
             _ => 3,
         }
     }
@@ -150,9 +145,22 @@ impl fmt::Display for SchemaChange {
 }
 
 #[derive(Debug)]
-struct ToolVersions {
+struct SnapshotVersions {
     codex: String,
     opencode: String,
+    acp: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ToolObservation {
+    output: String,
+    version: String,
+}
+
+#[derive(Debug)]
+struct ToolVersions {
+    codex: ToolObservation,
+    opencode: ToolObservation,
 }
 
 #[derive(Debug)]
@@ -163,7 +171,17 @@ struct SnapshotStats {
 }
 
 pub fn run(command: SchemaCommand, workspace_root: &Path) -> Result<(), SchemaError> {
-    let versions = verify_tool_versions()?;
+    if let SchemaCommand::History { tool, entry_id } = &command {
+        return run_history(workspace_root, tool, entry_id);
+    }
+
+    let snapshot_root = workspace_root.join("schemas");
+    let snapshot_versions = load_snapshot_versions(&snapshot_root.join("VERSIONS.md"))?;
+    let surface = schema_surface::load_required_surface(workspace_root)?;
+    schema_surface::validate_baseline(&surface, &snapshot_root)?;
+    let versions = verify_tool_versions(&snapshot_versions)?;
+    print_version_report(&surface, &snapshot_versions, &versions);
+
     let target = workspace_root.join("target");
     fs::create_dir_all(&target)?;
     let staging = TempDirBuilder::new()
@@ -173,13 +191,25 @@ pub fn run(command: SchemaCommand, workspace_root: &Path) -> Result<(), SchemaEr
 
     println!(
         "schema: fetching Codex {}, OpenCode {}, ACP crate {} / schema {}",
-        CODEX_VERSION, OPENCODE_VERSION, ACP_CRATE_VERSION, ACP_SCHEMA_VERSION
+        versions.codex.version, versions.opencode.version, ACP_CRATE_VERSION, snapshot_versions.acp
     );
     let stats = fetch_all(workspace_root, &staged_schemas, &versions)?;
+    let comparison =
+        schema_surface::compare_required_surface(&surface, &snapshot_root, &staged_schemas)?;
 
     match command {
         SchemaCommand::Refresh => {
-            install_snapshot(&staging, &staged_schemas, &workspace_root.join("schemas"))?;
+            let raw_changes = semantic_changes(&snapshot_root, &staged_schemas)?;
+            print_partitioned_report(&comparison, &raw_changes);
+            schema_surface::validate_baseline(&surface, &staged_schemas)?;
+            preserve_control_files(&snapshot_root, &staged_schemas)?;
+            record_observed_history(
+                &staged_schemas.join(SURFACE_HISTORY_FILE),
+                &versions,
+                &snapshot_versions.acp,
+                comparison.observed_digests(),
+            )?;
+            install_snapshot(&staging, &staged_schemas, &snapshot_root)?;
             println!(
                 "schema refresh: wrote {} Codex, {} OpenCode, and {} ACP JSON file(s)",
                 stats.codex_files, stats.opencode_files, stats.acp_files
@@ -187,25 +217,218 @@ pub fn run(command: SchemaCommand, workspace_root: &Path) -> Result<(), SchemaEr
             Ok(())
         }
         SchemaCommand::Diff => {
-            let snapshot = workspace_root.join("schemas");
-            match verify_semantic_match(&snapshot, &staged_schemas) {
-                Ok(()) => {
-                    println!(
-                        "schema diff: no semantic drift ({} JSON files compared)",
-                        stats.codex_files + stats.opencode_files + stats.acp_files
-                    );
-                    Ok(())
-                }
-                Err(SchemaError::Drift(changes)) => {
-                    for change in &changes {
-                        println!("{change}");
-                    }
-                    Err(SchemaError::Drift(changes))
-                }
-                Err(error) => Err(error),
+            let raw_changes = semantic_changes(&snapshot_root, &staged_schemas)?;
+            print_partitioned_report(&comparison, &raw_changes);
+            record_observed_history(
+                &snapshot_root.join(SURFACE_HISTORY_FILE),
+                &versions,
+                &snapshot_versions.acp,
+                comparison.observed_digests(),
+            )?;
+            let result = required_surface_result(&comparison);
+            if result.is_ok() {
+                println!(
+                    "schema diff: required surface is compatible ({} JSON files compared)",
+                    stats.codex_files + stats.opencode_files + stats.acp_files
+                );
             }
+            result
+        }
+        SchemaCommand::History { .. } => Err(SchemaError::InvalidSnapshot(
+            "history command reached schema acquisition unexpectedly".to_owned(),
+        )),
+    }
+}
+
+fn required_surface_result(comparison: &SurfaceComparison) -> Result<(), SchemaError> {
+    if comparison.changes().is_empty() {
+        Ok(())
+    } else {
+        Err(SchemaError::RequiredSurfaceDrift(
+            comparison.changes().to_vec(),
+        ))
+    }
+}
+
+fn print_version_report(
+    surface: &RequiredSurface,
+    snapshot: &SnapshotVersions,
+    observed: &ToolVersions,
+) {
+    for line in version_report_lines(surface, snapshot, observed) {
+        println!("{line}");
+    }
+}
+
+fn version_report_lines(
+    surface: &RequiredSurface,
+    snapshot: &SnapshotVersions,
+    observed: &ToolVersions,
+) -> Vec<String> {
+    let mut lines = vec![format!(
+        "schema: observed codex {} (snapshot {}), opencode {} (snapshot {}), acp {} (snapshot {})",
+        observed.codex.version,
+        snapshot.codex,
+        observed.opencode.version,
+        snapshot.opencode,
+        snapshot.acp,
+        snapshot.acp
+    )];
+    for (tool, observed_version, snapshot_version) in [
+        (
+            SurfaceTool::Codex,
+            observed.codex.version.as_str(),
+            snapshot.codex.as_str(),
+        ),
+        (
+            SurfaceTool::OpenCode,
+            observed.opencode.version.as_str(),
+            snapshot.opencode.as_str(),
+        ),
+        (
+            SurfaceTool::Acp,
+            snapshot.acp.as_str(),
+            snapshot.acp.as_str(),
+        ),
+    ] {
+        if observed_version != snapshot_version {
+            lines.push(format!(
+                "schema: NOTICE {tool} version differs: observed {observed_version}, snapshot {snapshot_version}; comparison will continue"
+            ));
+        }
+        match surface.version_support(tool, observed_version) {
+            Some(VersionSupport::Supported) | None => {}
+            Some(VersionSupport::Unverified { supported_range }) => lines.push(format!(
+                "schema: WARNING unverified version for {tool}: observed {observed_version}, supported range {supported_range}; comparison will continue"
+            )),
+            Some(VersionSupport::Unparseable { supported_range }) => lines.push(format!(
+                "schema: WARNING {tool} version `{observed_version}` cannot be matched against supported range {supported_range}; comparison will continue"
+            )),
         }
     }
+    lines
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ChangeCounts {
+    added: usize,
+    changed: usize,
+    removed: usize,
+}
+
+impl ChangeCounts {
+    const fn total(self) -> usize {
+        self.added + self.changed + self.removed
+    }
+
+    fn record(&mut self, kind: ChangeKind) {
+        match kind {
+            ChangeKind::Added => self.added += 1,
+            ChangeKind::Changed => self.changed += 1,
+            ChangeKind::Removed => self.removed += 1,
+        }
+    }
+}
+
+fn print_partitioned_report(comparison: &SurfaceComparison, raw_changes: &[SchemaChange]) {
+    let outside = out_of_surface_counts(comparison, raw_changes);
+    println!("  in-surface    : {} drift", comparison.changes().len());
+    for change in comparison.changes() {
+        println!("    {change}");
+    }
+    println!(
+        "  out-of-surface: {} drift ({} added / {} changed / {} removed)",
+        outside.total(),
+        outside.added,
+        outside.changed,
+        outside.removed
+    );
+}
+
+fn out_of_surface_counts(
+    comparison: &SurfaceComparison,
+    raw_changes: &[SchemaChange],
+) -> ChangeCounts {
+    let mut outside = ChangeCounts::default();
+    for change in raw_changes {
+        let kind = match change.kind {
+            ChangeKind::Added => SurfaceChangeKind::Added,
+            ChangeKind::Changed => SurfaceChangeKind::Changed,
+            ChangeKind::Removed => SurfaceChangeKind::Removed,
+        };
+        if comparison.classify_full_change(&change.file, &change.pointer, kind)
+            == RawChangeDisposition::OutOfSurface
+        {
+            outside.record(change.kind);
+        }
+    }
+    outside
+}
+
+fn preserve_control_files(source_root: &Path, target_root: &Path) -> Result<(), SchemaError> {
+    for file in [REQUIRED_SURFACE_FILE, SURFACE_HISTORY_FILE] {
+        let source = source_root.join(file);
+        if !source.is_file() {
+            return Err(SchemaError::InvalidSnapshot(format!(
+                "schema control file `{file}` is missing"
+            )));
+        }
+        fs::copy(source, target_root.join(file))?;
+    }
+    Ok(())
+}
+
+fn record_observed_history(
+    path: &Path,
+    versions: &ToolVersions,
+    acp_version: &str,
+    digests: &BTreeMap<String, BTreeMap<String, String>>,
+) -> Result<(), SchemaError> {
+    let observed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let mut records = Vec::new();
+    for (tool, version) in [
+        ("codex", versions.codex.version.as_str()),
+        ("opencode", versions.opencode.version.as_str()),
+        ("acp", acp_version),
+    ] {
+        let surface_digests = digests.get(tool).cloned().ok_or_else(|| {
+            SchemaError::InvalidSnapshot(format!(
+                "required-surface digest output omitted tool `{tool}`"
+            ))
+        })?;
+        records.push(SurfaceHistoryRecord {
+            observed_at: observed_at.clone(),
+            tool: tool.to_owned(),
+            version: version.to_owned(),
+            surface_digests,
+        });
+    }
+    let summary = schema_history::append_observations(path, &records)?;
+    println!(
+        "schema history: appended {} new observation(s), deduplicated {} existing observation(s)",
+        summary.appended, summary.deduplicated
+    );
+    Ok(())
+}
+
+fn run_history(workspace_root: &Path, tool: &str, entry_id: &str) -> Result<(), SchemaError> {
+    let surface = schema_surface::load_required_surface(workspace_root)?;
+    let declared = surface
+        .entries()
+        .iter()
+        .any(|entry| entry.tool.as_str() == tool && entry.id == entry_id);
+    if !declared {
+        return Err(SchemaError::InvalidSnapshot(format!(
+            "`{entry_id}` is not a required-surface entry for tool `{tool}`"
+        )));
+    }
+    let history_path = workspace_root.join("schemas").join(SURFACE_HISTORY_FILE);
+    let entries = schema_history::timeline(&history_path, tool, entry_id)?;
+    print!(
+        "{}",
+        schema_history::format_timeline(tool, entry_id, &entries)
+    );
+    Ok(())
 }
 
 pub fn verify_semantic_match(expected: &Path, actual: &Path) -> Result<(), SchemaError> {
@@ -250,21 +473,107 @@ pub fn semantic_changes(
     Ok(changes)
 }
 
-fn verify_tool_versions() -> Result<ToolVersions, SchemaError> {
-    let codex = verify_tool("codex", CODEX_VERSION_OUTPUT, CODEX_INSTALL_COMMAND)?;
+fn load_snapshot_versions(path: &Path) -> Result<SnapshotVersions, SchemaError> {
+    let source = fs::read_to_string(path)?;
+    let codex = markdown_package_version(&source, "@openai/codex@").ok_or_else(|| {
+        SchemaError::InvalidSnapshot(
+            "schemas/VERSIONS.md does not contain an exact @openai/codex package version"
+                .to_owned(),
+        )
+    })?;
+    let opencode = markdown_package_version(&source, "opencode-ai@").ok_or_else(|| {
+        SchemaError::InvalidSnapshot(
+            "schemas/VERSIONS.md does not contain an exact opencode-ai package version".to_owned(),
+        )
+    })?;
+    let acp = markdown_package_version(&source, "agent-client-protocol-json-schema-v1@")
+        .ok_or_else(|| {
+            SchemaError::InvalidSnapshot(
+                "schemas/VERSIONS.md does not contain an exact ACP schema artifact version"
+                    .to_owned(),
+            )
+        })?;
+    for (label, version) in [
+        ("Codex", codex.as_str()),
+        ("OpenCode", opencode.as_str()),
+        ("ACP", acp.as_str()),
+    ] {
+        Version::parse(version).map_err(|error| {
+            SchemaError::InvalidSnapshot(format!(
+                "{label} snapshot version `{version}` is not valid semver: {error}"
+            ))
+        })?;
+    }
+    Ok(SnapshotVersions {
+        codex,
+        opencode,
+        acp,
+    })
+}
+
+fn markdown_package_version(source: &str, marker: &str) -> Option<String> {
+    source.lines().find_map(|line| {
+        let (_, suffix) = line.split_once(marker)?;
+        let version = suffix.split('`').next()?.trim();
+        (!version.is_empty()).then(|| version.to_owned())
+    })
+}
+
+fn install_command(tool: &str, version: &str) -> String {
+    #[cfg(windows)]
+    let npm = "npm.cmd";
+    #[cfg(not(windows))]
+    let npm = "npm";
+
+    match tool {
+        "codex" => format!("{npm} install --global @openai/codex@{version}"),
+        "opencode" => format!("{npm} install --global opencode-ai@{version}"),
+        _ => format!("{npm} install --global {tool}@{version}"),
+    }
+}
+
+fn parse_tool_observation(
+    tool: &'static str,
+    _snapshot_version: &str,
+    stdout: &[u8],
+    stderr: &[u8],
+    install: &str,
+) -> Result<ToolObservation, SchemaError> {
+    let stdout = String::from_utf8_lossy(stdout).trim().to_owned();
+    let stderr = String::from_utf8_lossy(stderr).trim().to_owned();
+    let output = if stdout.is_empty() { stderr } else { stdout };
+    let version = output
+        .split_ascii_whitespace()
+        .rev()
+        .find(|candidate| Version::parse(candidate).is_ok())
+        .map(str::to_owned)
+        .ok_or_else(|| SchemaError::ToolUnavailable {
+            tool,
+            detail: format!("version probe returned an unrecognized version string `{output}`"),
+            install: install.to_owned(),
+        })?;
+    Ok(ToolObservation { output, version })
+}
+
+fn verify_tool_versions(snapshot: &SnapshotVersions) -> Result<ToolVersions, SchemaError> {
+    let codex = verify_tool(
+        "codex",
+        &install_command("codex", &snapshot.codex),
+        &snapshot.codex,
+    )?;
     let opencode = verify_tool(
         "opencode",
-        OPENCODE_VERSION_OUTPUT,
-        OPENCODE_INSTALL_COMMAND,
+        &install_command("opencode", &snapshot.opencode),
+        &snapshot.opencode,
     )?;
     Ok(ToolVersions { codex, opencode })
 }
 
 fn verify_tool(
     tool: &'static str,
-    expected: &'static str,
-    install: &'static str,
-) -> Result<String, SchemaError> {
+    install: &str,
+    snapshot_version: &str,
+) -> Result<ToolObservation, SchemaError> {
     let isolated_state = if tool == "opencode" {
         Some(
             TempDirBuilder::new()
@@ -285,28 +594,24 @@ fn verify_tool(
             .map_err(|error| SchemaError::ToolUnavailable {
                 tool,
                 detail: error.to_string(),
-                install,
+                install: install.to_owned(),
             })?;
 
     if !output.status.success() {
         return Err(SchemaError::ToolUnavailable {
             tool,
             detail: format!("version probe exited with {}", output.status),
-            install,
+            install: install.to_owned(),
         });
     }
 
-    let actual = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if actual != expected {
-        return Err(SchemaError::ToolVersion {
-            tool,
-            expected,
-            actual,
-            install,
-        });
-    }
-
-    Ok(actual)
+    parse_tool_observation(
+        tool,
+        snapshot_version,
+        &output.stdout,
+        &output.stderr,
+        install,
+    )
 }
 
 fn fetch_all(
@@ -316,8 +621,8 @@ fn fetch_all(
 ) -> Result<SnapshotStats, SchemaError> {
     fs::create_dir_all(schemas_root)?;
 
-    let codex_files = fetch_codex(workspace_root, schemas_root)?;
-    let opencode_files = fetch_opencode(schemas_root)?;
+    let codex_files = fetch_codex(workspace_root, schemas_root, &versions.codex.version)?;
+    let opencode_files = fetch_opencode(schemas_root, &versions.opencode.version)?;
     let acp_files = fetch_acp(schemas_root)?;
     let stats = SnapshotStats {
         codex_files,
@@ -333,13 +638,22 @@ fn fetch_all(
     Ok(stats)
 }
 
-fn fetch_codex(workspace_root: &Path, schemas_root: &Path) -> Result<usize, SchemaError> {
+fn fetch_codex(
+    workspace_root: &Path,
+    schemas_root: &Path,
+    observed_version: &str,
+) -> Result<usize, SchemaError> {
     let codex_dir = schemas_root.join("codex");
     let status = child_command(tool_executable("codex")?)
         .args(["app-server", "generate-json-schema", "--out"])
         .arg(&codex_dir)
         .current_dir(workspace_root)
-        .status()?;
+        .status()
+        .map_err(|error| SchemaError::ToolUnavailable {
+            tool: "codex",
+            detail: error.to_string(),
+            install: install_command("codex", observed_version),
+        })?;
     if !status.success() {
         return Err(SchemaError::ProcessFailed {
             tool: "codex app-server generate-json-schema",
@@ -356,7 +670,7 @@ fn fetch_codex(workspace_root: &Path, schemas_root: &Path) -> Result<usize, Sche
     validate_json_tree(&codex_dir)
 }
 
-fn fetch_opencode(schemas_root: &Path) -> Result<usize, SchemaError> {
+fn fetch_opencode(schemas_root: &Path, observed_version: &str) -> Result<usize, SchemaError> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
     drop(listener);
@@ -390,7 +704,7 @@ fn fetch_opencode(schemas_root: &Path) -> Result<usize, SchemaError> {
         .map_err(|error| SchemaError::ToolUnavailable {
             tool: "opencode",
             detail: error.to_string(),
-            install: OPENCODE_INSTALL_COMMAND,
+            install: install_command("opencode", observed_version),
         })?;
     let mut server = ChildGuard::new(child);
     let url = format!("http://127.0.0.1:{port}/doc");
@@ -452,7 +766,7 @@ fn fetch_opencode(schemas_root: &Path) -> Result<usize, SchemaError> {
     if openapi != "3.1.0" {
         return Err(SchemaError::InvalidSnapshot(format!(
             "OpenCode {} returned OpenAPI {openapi}, expected 3.1.0",
-            OPENCODE_VERSION
+            observed_version
         )));
     }
     let info_version = value
@@ -467,7 +781,7 @@ fn fetch_opencode(schemas_root: &Path) -> Result<usize, SchemaError> {
     if info_version != "1.0.0" {
         return Err(SchemaError::InvalidSnapshot(format!(
             "OpenCode {} returned info.version {info_version}, expected 1.0.0",
-            OPENCODE_VERSION
+            observed_version
         )));
     }
     validate_json_tree(&opencode_dir)
@@ -711,16 +1025,16 @@ curl --fail --location --silent --show-error {} --output schemas/acp/schema.json
 curl --fail --location --silent --show-error {} --output schemas/acp/meta.json
 ```
 "#,
-        versions.codex,
-        CODEX_VERSION,
+        versions.codex.output,
+        versions.codex.version,
         stats.codex_files,
-        CODEX_VERSION,
-        CODEX_VERSION,
-        versions.opencode,
-        OPENCODE_VERSION,
+        versions.codex.version,
+        versions.codex.version,
+        versions.opencode.output,
+        versions.opencode.version,
         stats.opencode_files,
-        OPENCODE_VERSION,
-        OPENCODE_VERSION,
+        versions.opencode.version,
+        versions.opencode.version,
         ACP_CRATE_VERSION,
         ACP_SCHEMA_VERSION,
         ACP_COMMIT,
@@ -1134,6 +1448,214 @@ mod executable_tests {
             })
         ));
         assert!(!destination.path().join("schema.json").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn different_observed_version_is_data_not_tool_unavailable(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let observation =
+            parse_tool_observation("opencode", "1.18.8", b"1.18.9\r\n", b"", "install command")?;
+
+        assert_eq!(observation.version, "1.18.9");
+        assert_eq!(observation.output, "1.18.9");
+        Ok(())
+    }
+
+    #[test]
+    fn executable_tool_failures_use_exit_two() {
+        assert_eq!(
+            SchemaError::ProcessFailed {
+                tool: "codex app-server generate-json-schema",
+                status: synthetic_exit_status(1),
+            }
+            .exit_code(),
+            2
+        );
+        assert_eq!(
+            SchemaError::Server("OpenCode exited before /doc was ready".to_owned()).exit_code(),
+            2
+        );
+    }
+
+    #[test]
+    fn version_report_shows_snapshot_observed_and_unverified_warning(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let surface = schema_surface::parse_required_surface(
+            r#"
+schema_version = 1
+[[tools]]
+name = "codex"
+supported_range = "=0.146.0"
+[[tools]]
+name = "opencode"
+supported_range = "=1.18.8"
+[[tools]]
+name = "acp"
+supported_range = "=1.18.0"
+[[entries]]
+id = "codex.type.Dummy"
+tool = "codex"
+kind = "type"
+name = "Dummy"
+reason = "Required by a synthetic UACP test surface."
+[[entries]]
+id = "opencode.type.Dummy"
+tool = "opencode"
+kind = "type"
+name = "Dummy"
+reason = "Required by a synthetic UACP test surface."
+[[entries]]
+id = "acp.type.Dummy"
+tool = "acp"
+kind = "type"
+name = "Dummy"
+reason = "Required by a synthetic UACP test surface."
+"#,
+        )?;
+        let snapshot = SnapshotVersions {
+            codex: "0.146.0".to_owned(),
+            opencode: "1.18.8".to_owned(),
+            acp: "1.18.0".to_owned(),
+        };
+        let observed = ToolVersions {
+            codex: ToolObservation {
+                output: "codex-cli 0.146.0".to_owned(),
+                version: "0.146.0".to_owned(),
+            },
+            opencode: ToolObservation {
+                output: "1.18.9".to_owned(),
+                version: "1.18.9".to_owned(),
+            },
+        };
+
+        let output = version_report_lines(&surface, &snapshot, &observed).join("\n");
+
+        assert!(output.contains("opencode 1.18.9 (snapshot 1.18.8)"));
+        assert!(output.contains("unverified version for opencode"));
+        assert!(output.contains("comparison will continue"));
+        Ok(())
+    }
+
+    #[test]
+    fn out_of_surface_drift_is_informational_but_in_surface_drift_exits_one(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let surface = schema_surface::parse_required_surface(
+            r#"
+schema_version = 1
+[[tools]]
+name = "opencode"
+supported_range = "=1.18.8"
+[[entries]]
+id = "opencode.type.Session"
+tool = "opencode"
+kind = "type"
+name = "Session"
+reason = "Required by the UACP session method family."
+"#,
+        )?;
+        let baseline = tempfile::tempdir()?;
+        let observed_outside = tempfile::tempdir()?;
+        let observed_inside = tempfile::tempdir()?;
+        let snapshot_versions = SnapshotVersions {
+            codex: "0.146.0".to_owned(),
+            opencode: "1.18.8".to_owned(),
+            acp: "1.18.0".to_owned(),
+        };
+        let observed_versions = ToolVersions {
+            codex: ToolObservation {
+                output: "codex-cli 0.146.0".to_owned(),
+                version: "0.146.0".to_owned(),
+            },
+            opencode: ToolObservation {
+                output: "1.18.9".to_owned(),
+                version: "1.18.9".to_owned(),
+            },
+        };
+        write_opencode_schema(baseline.path(), "string", "baseline")?;
+        write_opencode_schema(observed_outside.path(), "string", "observed")?;
+        write_opencode_schema(observed_inside.path(), "integer", "baseline")?;
+
+        let outside_comparison = schema_surface::compare_required_surface(
+            &surface,
+            baseline.path(),
+            observed_outside.path(),
+        )?;
+        let outside_raw = semantic_changes(baseline.path(), observed_outside.path())?;
+        let outside_counts = out_of_surface_counts(&outside_comparison, &outside_raw);
+
+        assert!(outside_comparison.changes().is_empty());
+        assert_eq!(outside_counts.total(), 1);
+        assert!(required_surface_result(&outside_comparison).is_ok());
+
+        let inside_comparison = schema_surface::compare_required_surface(
+            &surface,
+            baseline.path(),
+            observed_inside.path(),
+        )?;
+        let inside_raw = semantic_changes(baseline.path(), observed_inside.path())?;
+        let inside_counts = out_of_surface_counts(&inside_comparison, &inside_raw);
+        let Err(error) = required_surface_result(&inside_comparison) else {
+            return Err("required-surface drift unexpectedly returned success".into());
+        };
+
+        assert_eq!(error.exit_code(), 1);
+        assert_eq!(inside_counts.total(), 0);
+        assert!(
+            version_report_lines(&surface, &snapshot_versions, &observed_versions)
+                .join("\n")
+                .contains("opencode 1.18.9 (snapshot 1.18.8)")
+        );
+        assert!(inside_comparison
+            .changes()
+            .iter()
+            .map(ToString::to_string)
+            .any(|change| change.contains("opencode.type.Session")
+                && change.contains("#/components/schemas/Session")));
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_control_files_are_preserved() -> Result<(), Box<dyn std::error::Error>> {
+        let source = tempfile::tempdir()?;
+        let staged = tempfile::tempdir()?;
+        fs::write(source.path().join(REQUIRED_SURFACE_FILE), "surface")?;
+        fs::write(source.path().join(SURFACE_HISTORY_FILE), "history")?;
+
+        preserve_control_files(source.path(), staged.path())?;
+
+        assert_eq!(
+            fs::read_to_string(staged.path().join(REQUIRED_SURFACE_FILE))?,
+            "surface"
+        );
+        assert_eq!(
+            fs::read_to_string(staged.path().join(SURFACE_HISTORY_FILE))?,
+            "history"
+        );
+        Ok(())
+    }
+
+    fn write_opencode_schema(
+        root: &Path,
+        id_type: &str,
+        title: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = root.join("opencode");
+        fs::create_dir_all(&directory)?;
+        let schema = serde_json::json!({
+            "openapi": "3.1.0",
+            "info": {"title": title, "version": "1.0.0"},
+            "paths": {},
+            "components": {
+                "schemas": {
+                    "Session": {
+                        "type": "object",
+                        "properties": {"id": {"type": id_type}}
+                    }
+                }
+            }
+        });
+        fs::write(directory.join("openapi.json"), serde_json::to_vec(&schema)?)?;
         Ok(())
     }
 }
