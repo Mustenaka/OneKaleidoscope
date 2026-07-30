@@ -1,105 +1,148 @@
-# MILESTONES — 里程碑与门禁映射
+# MILESTONES — 重新定基线后的实施顺序
 
-> 工作方式：主管按里程碑下发**一串连贯的任务卡**，负责人排队交给 Codex 依次执行，
-> 全部完成后整批交回主管审核。审核通过才进入门禁，门禁通过才进入下一里程碑。
+> 生效：2026-07-30
+> 原 M1 与 T-001～T-014 已冻结。当前没有授权执行的产品代码任务。
 
----
+## 总原则
 
-## 里程碑总览
+每个里程碑交付一个可操作的端到端纵切，不再以 schema 数量、fixture 格子或 recorder 完整度为进度。
+每个能力必须同时有成功路径、错误路径、重连路径和真实 runtime 证据。
 
-| 里程碑 | 目标 | 任务卡 | 结束于门禁 | 状态 |
-|---|---|---|---|---|
-| **M1** | 地基与实测材料 | T-001 ~ T-012 | **G0**【人工】 | 🧊 **已冻结**（见下） |
-| **M2** | 协议定稿（**主管亲自产出**，不下发 Codex） | ARCHITECTURE.md / PROTOCOL.md / `kaleido-proto` | **G1**【审核】 | ⚪ 待 M1 |
-| **M3** | hostd + CLI 客户端 + 三家 adapter | 待 M2 后拆 | **G2**【人工】 | ⚪ |
-| **M4** | 传输层 + 配对 + 事件重放 | 待 M3 后拆 | **G3**【人工】 | ⚪ |
-| **M5** | Android App（含 Figma 设计评审） | 待 M4 后拆 | **G4**【人工】 | ⚪ |
-| **M6** | fs / git / diff 全量 | 待 M5 后拆 | **G5**【人工】 | ⚪ |
-| **M7** | iOS 对齐 | 待 M6 后拆 | **G6**【人工】 | ⚪ |
-| **M8** | 安全审查 + 跨平台构建 | 待 M7 后拆 | **G7**【审核】/ **G8**【人工】 | ⚪ |
+## R0 — 文档重新定基线
 
-> 平台顺序（Android 先于 iOS）见 [ADR-0002](adr/0002-android-first.md)。
+状态：**本次完成**
 
----
+- 固定不可降级产品需求；
+- 确定 Session Broker、canonical state、跨 Agent workflow；
+- 确定自有 Ubuntu 协调/relay 是 v1 组件；
+- 冻结旧任务与数据提取路线；
+- 记录六个 provider × surface 验收格。
 
-## 🧊 M1 已冻结（2026-07-30）
+门禁：需求、架构、ADR、里程碑和主管交接说明之间无活动冲突。
 
-**冻结理由**：M1 被执行成了「把三家上游的事件形状提取完整」的数据工程，
-结果是 `spikes/` + `xtask/` 累积 **40,105 行 Rust**，而 `crates/` 为空、
-`docs/PROTOCOL.md` 不存在、**产品代码零行**。这是主管的管理错误：
-把 fixture 完整度设成了协议设计的前置门禁，而那 12 个事件变体本身只是
-`REQUIREMENTS §4.5` 里的一个猜测。
+## R1 — 合同定稿（项目主管负责）
 
-**已产出的真实资产（保留，继续使用）**
+产出：
 
-| 资产 | 价值 |
-|---|---|
-| `tests/fixtures/codex/01,03,04` + `acp-claude/06` + `opencode/08` | 5 份真实报文，证明了 join 语义与 declined 终态（ARCHITECTURE §4.2b/§4.2c） |
-| `schemas/` 三家快照 + `required-surface.toml` + 漂移监控 | 协议设计的类型依据 |
-| `xtask` 的 check-deps / 反模式扫描 A-1~A-11 | 架构纪律的机器强制 |
-| 五层 agent 发现 + Windows `.cmd`/PATHEXT/进程树处理 | **将来 hostd 要用的同一套逻辑** |
-| ADR-0001 ~ 0009 | 九次架构决策，含四次自我纠错 |
+- `docs/PROTOCOL.md`；
+- `crates/kaleido-proto`；
+- canonical state、command、projection、cursor、capability、workflow 合同；
+- Swift/Kotlin 的最小 UniFFI 编译探针；
+- T-100 起的新任务卡。
 
-**冻结的内容**
+门禁：
 
-- `spikes/kaleido-recorder` **不再接任何任务卡**。它那条环境依赖的红测试
-  （`outside_permission_target_is_rejected_with_redacted_structured_diagnostics`，
-  脱敏规则顺序在 TEMP 位于家目录的机器上会先命中 `<HOME>`）**就让它红着**，
-  并从 `cargo xtask ci` 的默认流程中摘出
-- **T-012 降级为可选工具债**，与产品开发并行，永不阻塞
-- **12×3 覆盖门禁作废**。每家保留三组黄金场景即可：文本 turn / 工具+审批 / 恢复重连。
-  上游没有的能力用 capability 表达并进 `REQUIREMENTS §11` 登记，**不制造覆盖格子**
+- 合同能表达项目索引、历史、活动会话、队列、Attention Inbox、工作流；
+- 明确 queue 与 steer、history 与 live、decline 与 error；
+- 用现有真实 fixture 验证至少两个 reducer 难点，但不要求补齐矩阵；
+- 移动端绑定对最小真实类型编译通过。
 
-**唯一仍然欠着的 M1 交付物**：G0 的 20 轮实测。它不依赖任何 agent、沙箱或环境。
+禁止：在 R1 前恢复 T-014 或创建 adapter 自有临时全局模型。
 
----
+## R2 — 单 Provider 本地纵切
 
-## M1 — 地基与实测材料
+优先以 Codex Broker 管理的 app-server 会话完成：
 
-**目标**：产出 G0 的判定数字，并把主管设计协议所需的**一手材料**备齐。
+```
+provider → reducer → canonical state → durable log → Rust diagnostic client
+```
 
-M1 刻意不写任何产品代码。理由：`kaleido-proto` 是全项目的合同，一旦定错，后面每个 crate 都要跟着返工。
-与其凭想象设计，不如先把三家上游的 schema 与真实报文摆到桌面上。
+验收：
 
-| 卡 | 内容 | 产出对谁有用 |
-|---|---|---|
-| [T-001](tasks/T-001.md) | iroh 1.0 打洞测量 spike | → **G0 的百分比**，决定 relay 是否必做 |
-| [T-002](tasks/T-002.md) | Workspace 骨架、lint 强制、`cargo xtask ci` | → 把 AGENTS.md 的规范变成机器强制 |
-| [T-003](tasks/T-003.md) | 三家 schema 快照 + 语义漂移监控（**已 descope**，不含生成器） | → 主管设计 PROTOCOL 的类型依据；R-4 漂移基准 |
-| [T-004](tasks/T-004.md) | 三家真实事件录制 fixture + 覆盖度表 | → **UACP 12 个事件变体的形状依据**；R-8 的一手证据 |
-| [T-005](tasks/T-005.md) | 规范化层 + 生成器选型（**T-003 阻塞后新增**） | → 决定 adapter 类型能否自动生成；R-4 的实际缓解方案 |
+- 项目与会话列表；
+- 一次流式 turn；
+- 工具生命周期与 approve/deny；
+- plan/diff/状态至少按真实能力呈现；
+- queue、steer、interrupt 的能力差异诚实可见；
+- 进程重启后恢复状态；
+- 未知消息和 join 失败有错误路径。
 
-**依赖**：严格串行 T-001 → T-002 → T-003 → T-004 → T-005。
+这一步只做一个 provider，证明架构纵切；不先并排写三套 adapter。
 
-T-002 会给 T-001 的代码套上新 lint；T-003 的 schema 用于校验 T-004 的 fixture；
-**T-005 需要 T-004 的真实报文做生成物的往返验证** —— 这是判断生成链是否真能用的唯一硬标准，
-所以它必须排在 T-004 之后，不能提前。
+## R3 — Android 局域网纵切
 
-> **T-003 阻塞记录（2026-07-28）**：Codex 实测证明 typify 与 progenitor 均无法消化当前上游 schema。
-> 主管签发 [ADR-0005](adr/0005-schema-normalization-layer.md)，把生成链部分从 T-003 移出为 T-005，
-> 并把 `AGENTS.md §3.2` 的钦定工具降级为首选候选。R-4 由「未来风险」改为「已发生」。
+产出最小 hostd + Android App：
 
-**并行项**：T-001 交付后，负责人即可开始跑 20 轮 G0 实测，不必等 T-002~T-004 完成。
+- 配对；
+- ProjectIndex、SessionIndex、Transcript、LiveActivity；
+- InputQueue、AttentionInbox；
+- approve/deny、question、prompt/steer/interrupt；
+- LAN 断线重连。
 
-### M1 结束时主管会拿到
+门禁：用户离开 PC 后可以只用 Android 完成一次会话干预。
 
-1. `docs/gates/G0-result.md` 所需的直连成功率
-2. 三家上游 schema 的确切版本快照
-3. 12 个事件变体 × 3 家 agent 的覆盖度表
-4. 三家权限审批报文的实际形状差异（R-8）
-5. 上游 schema 与实际报文是否一致的结论（决定能否信任自动生成的类型）
-6. 生成链选型结论与证据表（T-005），含「生成物能否反序列化真实 fixture」的通过率
+## R4 — 自有 Ubuntu 远程连接
 
-### M1 之后
+产出：
 
-- **G0**【人工】：负责人跑 20 轮，反馈成功率。< 60% 则 L2 relay 升为 v1 必做，`ARCHITECTURE.md` 相应调整
-- **M2 由主管亲自执行**：`CLAUDE.md §1` 规定 `kaleido-proto` 与 `PROTOCOL.md` 是合同，不下发 Codex
+- rendezvous、P2P 连接信息交换；
+- relay 密文回退；
+- 设备注册、吊销与推送；
+- E2EE 与日志/推送脱敏；
+- 网络切换和 PC 离线状态。
 
----
+门禁：家宽 PC ↔ 蜂窝网络手机连续运行，直连失败时自动 relay；服务器无法解密采样载荷。
 
-## M5 的额外约定（Android App）
+NAT 20 轮测试属于性能与容量数据，不再决定 relay 是否开发，也不阻塞 R1～R3。
 
-负责人已明确：**App 界面表现是重点审核项**，且设计流程为「先出 Figma 设计 → 参考 codex remote 做减法与加法 → 再实现」。
+## R5 — 三家 Broker 管理会话
 
-因此 M5 的任务卡拆分必须把**设计评审作为独立门禁前置**，不许 Codex 直接开写界面。
-具体拆分待 M4 完成后再定。
+依次加入 OpenCode、Claude Code：
+
+- OpenCode server REST + SSE；
+- Claude Agent SDK streaming、sessions、permissions；
+- ACP 作为额外兼容路径。
+
+每加入一家，都必须复用相同 canonical state 和移动端投影，不能复制一套 provider 专属 UI。
+
+门禁：三家各完成流式 turn、历史、等待人工、断线恢复；缺失能力由 runtime capability 明示。
+
+## R6 — 跨 Agent 工作流
+
+完成：
+
+- workflow DAG 与持久化；
+- Claude 规划 → Codex 执行 → Claude 审核；
+- Artifact 交接；
+- 人工 gate、返工、重试、取消和重新指派；
+- Android WorkflowBoard 和关联会话跳转。
+
+门禁：用户离开 PC 后，只用手机将一次真实工作从计划推进到审核完成。
+
+## R7 — 原生 CLI/GUI 六格闭环
+
+逐格验证 [REQUIREMENTS.md](REQUIREMENTS.md) §8：
+
+- 优先使用 provider 公开的共享 runtime、attach、订阅或插件机制；
+- 每格保留版本、启动方式、runtime 身份和端到端录屏/fixture；
+- 上游没有公开路径时登记阻塞，不得用 PTY、磁盘轮询或产品文案绕过。
+
+本里程碑可与 R3～R6 的 provider 工作并行研究，但 v1 最终验收不能跳过。
+
+## R8 — iOS 对齐
+
+在 Android 核心交互稳定后对齐 iOS：
+
+- 相同的共享核心与 projection；
+- APNs 冷启动恢复；
+- Keychain、后台限制、Biometric；
+- 功能和错误语义与 Android 一致。
+
+## R9 — 编辑器预览、Git 与发布硬化
+
+最后加入：
+
+- 文件树、搜索、只读代码预览；
+- diff、Git status/stage/commit/push；
+- Windows/macOS/Linux 打包与服务生命周期；
+- 安全审计、恢复演练、性能和发布。
+
+编辑器不是前序里程碑的阻塞项。
+
+## 任务规则
+
+- 新任务编号从 **T-100** 开始。
+- 每张卡只属于一个纵切，必须写清对应 projection、command 和真实验收。
+- fixture 只在需要证明具体语义时补录，不能创建“先录完再开发”的总门禁。
+- 外部原生 GUI/CLI 的研究任务和 Broker 管理会话实现任务分开，避免一个未知阻塞全项目。
+- 任何修改 `kaleido-proto` 的任务必须先由主管更新协议/ADR。

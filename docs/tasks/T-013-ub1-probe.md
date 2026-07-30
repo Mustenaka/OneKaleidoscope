@@ -1,5 +1,7 @@
 # T-013: UB-1 探针 —— Codex Desktop 是否连接共享 daemon
 
+> **🧊 已冻结：不得执行。** 该探针混入第一方 Remote Control 假设；原生 GUI 能力将在 R7 以公开合同重新取证。
+>
 > 执行人：**项目负责人本人**，在自己的交互式 PowerShell 里
 > 不下发 Codex（需真实 Codex + Desktop + 网络）
 > 预计耗时：10 分钟

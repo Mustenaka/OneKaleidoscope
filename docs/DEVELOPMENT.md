@@ -1,5 +1,9 @@
 # Development
 
+> Current phase: documentation and protocol rebaseline. There is no active
+> production-code task. See `docs/STATUS.md` and `docs/tasks/README.md` before
+> using the instructions below.
+
 ## Rust toolchain
 
 Run Rust commands from the repository root. `rust-toolchain.toml` selects Rust
@@ -54,11 +58,11 @@ The forbidden-pattern scanner checks Rust source files under `crates/`,
 
 ## Adding a crate
 
-Every production crate belongs under `crates/` and must be represented in all
-of these places in the same change:
+After R1 defines `PROTOCOL.md`, every production crate created by a T-100+
+task belongs under `crates/` and must be represented in all of these places in
+the same change:
 
-1. the root workspace `members` list (the first M3 crate should add the
-   `crates/*` member glob);
+1. the root workspace `members` list;
 2. a `[crates."<package-name>"]` entry in
    `docs/dependency-rules.toml`;
 3. that entry's complete `may_depend_on` allow-list and, where required,
@@ -115,6 +119,5 @@ listed first as the primary platform. Each job checks out the repository,
 installs the toolchain described by `rust-toolchain.toml`, restores the Rust
 build cache, and runs `cargo xtask ci`. No matrix entry permits failure.
 
-The repository currently has no configured remote, so the workflow has not run
-on GitHub Actions. Windows is verified locally; macOS and Linux execution is
-deferred until the repository is hosted.
+GitHub Actions status is evidence only when linked to the exact commit under
+review. Local Windows success must not be reported as macOS/Linux success.

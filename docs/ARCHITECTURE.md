@@ -1,339 +1,245 @@
-# ARCHITECTURE — OneKaleidoscope 架构
+# ARCHITECTURE — OneKaleidoscope v2
 
-> 状态：**v0.1 草案**（2026-07-29）。由项目主管产出。
-> 与 `REQUIREMENTS.md` 冲突时以需求文档为准；本文件的变更走 ADR。
->
-> **待 G0 定稿的部分**：§9 relay 的定位（可选组件 vs v1 必做）。其余部分不依赖 G0。
+> 状态：**重新定基线，2026-07-30**
+> 需求真源是 [REQUIREMENTS.md](REQUIREMENTS.md)，当前执行状态见 [STATUS.md](STATUS.md)。
 
----
+## 1. 架构结论
 
-## 1. 一句话架构
-
-> **三条 adapter 把各家私有协议归一化成 UACP 事件 → 事件先落 append-only 日志再出网 →
-> iroh 加密通道投送到手机 → 手机按 cursor 拉齐。**
-
-所有设计决定都服务于这条主线上的两个不变量：
-
-| 不变量 | 出处 | 违反的后果 |
-|---|---|---|
-| **INV-1 事件先落盘，后发送**（write-ahead） | F-8 / G3「逐字节一致」 | 断线瞬间的事件可能已发出但未落盘，重放时凭空消失 |
-| **INV-2 UACP 的类型不依赖任何上游协议的字符串** | ADR-0004 P-3 | 上游改名会穿透 proto 波及三端 UI |
-
----
-
-## 2. 依赖方向（硬性，CI 应当强制）
+OneKaleidoscope 是控制平面，不是终端镜像：
 
 ```
-                    ┌──────────────┐
-                    │ kaleido-proto│  ← 合同。不依赖任何本项目 crate
-                    └──────┬───────┘
-             ┌─────────────┼──────────────┬────────────────┐
-             ▼             ▼              ▼                ▼
-      kaleido-transport  kaleido-adapter  kaleido-adapter-*  (mobile bindings)
-             │           (trait 定义)      (codex/acp/opencode)
-             └─────────────┬──────────────┘
-                           ▼
-                    kaleido-core        ← 会话状态机、事件日志、重放
-                    ┌──────┴───────┐
-                    ▼              ▼
-              kaleido-hostd   kaleido-cli     (+ UniFFI → iOS / Android)
+Native CLI / GUI ─┐
+Broker launcher ──┼── Public provider protocol ──► Session Broker
+Mobile command ───┘                                  │
+                                                     ├─ Canonical state + reducers
+                                                     ├─ Workflow engine
+                                                     ├─ Durable log + projections
+                                                     └─ E2EE transport
+                                                               │
+                                      Android / iOS ◄── P2P / own relay
 ```
 
-**规则**
+核心转变是：先定义手机真正需要的状态，再从 provider 协议归约到这些状态。不能再从“抓到多少事件”
+倒推产品模型。
 
-1. `kaleido-proto` **不依赖**本项目任何其他 crate
-2. `adapter-*` 之间**零依赖**。想复用就上提到 `kaleido-adapter`
-3. `adapter-*` 只依赖 `kaleido-proto` + `kaleido-adapter` + 各自的上游 SDK
-4. **装配根与 UI 层要分开看**（T-008 交付时发现本节原文自相矛盾，此处修正）：
-   - `kaleido-hostd` 是**唯一的装配根**，它必须能直接依赖 `adapter-*` —— 它就是那个把
-     具体 adapter 实例化并 spawn 出来的进程，绕不开
-   - `kaleido-cli`、iOS / Android 绑定 crate **禁止**直接依赖任何 `adapter-*`，
-     只能经 `kaleido-core` 拿到 trait 对象
-   - **hostd 内部的 UI 代码（托盘/菜单栏）仍受 A-2 约束** —— 反模式扫描照样扫它。
-     「hostd 可以依赖 adapter」不等于「hostd 的 UI 可以按 agent 名称分支」
-5. 任何 UI 分支必须读 `capabilities()`，**禁止按 adapter 名称硬编码**（`CLAUDE.md §3.2`）
+## 2. 六条不变量
 
-> **v2 可考虑的收敛**：把 adapter 装配抽到独立的 `kaleido-registry`，让 hostd 的 UI
-> 连编译期都看不到 `adapter-*`。v1 不做 —— 多一个 crate 换来的隔离，
-> 目前由 A-2 扫描已能覆盖。
-
-> **执行方式**：`cargo xtask check-deps` 读 cargo metadata 对照本节的允许矩阵，
-> 违反即 CI 失败。这条在 M3 第一张卡里落地。
-
----
-
-## 3. crate 清单
-
-| crate | 职责 | 不该出现在这里的东西 |
-|---|---|---|
-| `kaleido-proto` | UACP 全部类型；`serde` + `schemars`；版本/能力协商结构 | 任何 IO、任何 tokio、任何上游 SDK 类型 |
-| `kaleido-adapter` | `AgentAdapter` trait、`AdapterCaps`、`AgentDiscovery` trait、进程监管的公共部分 | 具体 agent 的知识 |
-| `kaleido-adapter-codex` | app-server JSON-RPC ↔ UACP | 其他 adapter 的类型 |
-| `kaleido-adapter-acp` | ACP v1 ↔ UACP（服务 Claude Code 及其余 ACP agent） | 同上 |
-| `kaleido-adapter-opencode` | REST + SSE ↔ UACP | 同上 |
-| `kaleido-transport` | iroh endpoint、配对、L0~L2 分层与降级、连接状态上报 | 会话语义、事件语义 |
-| `kaleido-core` | **事件日志（核心）**、会话状态机、重放、fs/git/diff 服务、UniFFI 导出面 | 平台专属路径逻辑（进 `platform/`） |
-| `kaleido-hostd` | 进程生命周期、托盘/headless、配置、推送触发 | 协议实现 |
-| `kaleido-cli` | G2 的验证客户端（含交互式审批 TUI） | 任何 hostd 才有的逻辑 |
-| `kaleido-relay` | 配对验证、rendezvous、推送转发 | **任何明文业务内容** |
-
----
-
-## 4. hostd 内部：事件流水线
-
-这是整个项目最关键的一段，`REQUIREMENTS.md` 只在 §5 一句话带过，但它决定 F-8 能否成立。
-
-```
- agent 进程
-     │  各家私有报文
-     ▼
-┌─────────────────┐
-│  adapter-*      │  归一化 → SessionEvent（尚无 seq）
-└────────┬────────┘
-         ▼
-┌─────────────────────────────────────────┐
-│  EventLog（kaleido-core）                │
-│  1. 分配会话内单调递增 seq: u64          │
-│  2. **fsync 落盘**（append-only）        │  ← INV-1 的执行点
-│  3. 才向订阅者广播                       │
-└────────┬────────────────────────────────┘
-         ├──────────────► 本地订阅者（hostd 托盘 UI、CLI）
-         └──────────────► transport → 手机
-```
-
-### 4.1 为什么日志必须在 adapter 与 transport 之间
-
-- 放在 transport 之后：断线时正在途中的事件不会落盘 → 违反 INV-1
-- 放在 adapter 之内：三家各自实现一遍定序逻辑 → 必然出现三种不同的 bug
-- **只有放在中间，「不丢」才是结构性保证，而不是靠小心**
-
-### 4.2 重放语义（`event.replay`）
-
-| 保证 | 实现 |
+| ID | 不变量 |
 |---|---|
-| **不丢** | 日志 append-only 且写盘先于发送；任何被发出去过的事件必然在日志里 |
-| **不重** | 客户端只接受 `seq > last_cursor`，其余丢弃（幂等） |
-| **有序** | 服务端按 seq 严格升序重发 |
+| INV-1 | Agent 数据只来自公开结构化协议；PTY/TUI/ANSI/屏幕/窗口文字不进入数据路径 |
+| INV-2 | 历史来源与实时运行时分离；能恢复历史不等于能附着活动 turn |
+| INV-3 | provider 报文先归约成规范化状态，再产生 UI 投影；不是 1:1 事件改名 |
+| INV-4 | 每个可见状态都可由快照 + cursor 后的日志重建；断线后不丢不重 |
+| INV-5 | 能力属于具体 runtime 连接；UI 不按 provider 名字或版本分支 |
+| INV-6 | 自有服务器只协调和中继密文，不拥有 Agent、不执行任务、不读取业务内容 |
 
-客户端重连发 `event.replay { session_id, since: last_cursor }`，服务端从日志取 `seq > since` 顺序重发。
+## 3. Session Broker
 
-**G3 的验收因此可机械化**：跑两遍同一会话（一遍不断线、一遍中途飞行模式 30s），
-两份事件序列按 seq 排序后逐字节 diff 必须为空。
+### 3.1 会话所有权
 
-### 4.2b 归一化是 join，不是映射（T-011 实录证据）
+Broker 支持三种模式：
 
-第一份真实的 Codex 审批报文（`tests/fixtures/codex/03-permission-approve.jsonl`）推翻了
-「UACP 事件 = 上游报文的 1:1 映射」这个假设：
+- `broker_managed`：Broker 创建并拥有 provider runtime。
+- `shared_runtime`：Broker 和原生 CLI/GUI 连接同一公开 server。
+- `external_native`：独立原生表面创建；只有公开协议允许实时订阅和控制时才能附着。
 
-```
-line 48  item/started    → item.changes[] 含 path / kind / diff，status=inProgress
-line 50  item/fileChange/requestApproval (server request, id=0)
-                         → params 只有 threadId / turnId / itemId / startedAtMs
-                            reason=null, grantRoot=null 。**不含任何可展示内容**
-line 52  client reply    → {"id":0,"result":{"decision":"accept"}}
-line 54  item/completed  → 同一 itemId，status=completed
-```
+每个 session 都要记录：
 
-**审批请求本身不携带「批准什么」的信息。** 要在手机上渲染
-「批准修改 `editable.txt`，内容是 …」这张卡片，必须按 `itemId` 把审批请求
-与在它之前到达的 `item/started` **join** 起来。
+- `history_source`：历史由哪个公开 API/store adapter 提供；
+- `live_runtime_id`：当前实际执行的 runtime；
+- `ownership_mode`；
+- `capabilities`；
+- `connection_state` 与最后一次能力探测证据。
 
-因此：
+不能通过读磁盘 transcript、猜窗口标题或扫描 PID 将 `external_native` 伪装成实时会话。
 
-1. **adapter 必须维护 item 状态表**，`PermissionRequest` 是
-   *(审批请求 × 它引用的 item)* 的合并结果，不是审批请求的转写
-2. **落进 EventLog 的是已合并的 UACP 事件**，不是上游原始报文 ——
-   否则断线重放时手机只能拿到一串 ID，无法重建卡片。这与 INV-1 一致
-3. `item.changes[].diff` **直接携带文件内容**。按 `REQUIREMENTS.md §6.3`，
-   它绝不能进日志正文，必须走 §4.3 的内容寻址存储，日志里只留引用
-4. `DiffProduced` 与 `ToolCallStart/End` 很可能不是三个独立事件，
-   而是同一个 item 在不同阶段的投影 —— `PROTOCOL.md` 需就此定稿
+### 3.2 Provider 策略
 
-> 这条只有真实报文能揭示。仅看 schema 会得出「审批请求自带上下文」的错误结论，
-> 进而设计出一个在手机上无法渲染的协议。
-
-### 4.2c 拒绝不是错误（`04-permission-deny.jsonl` 实录证据）
-
-批准与拒绝两份 fixture 逐字对比，差异**只在 item 的终态**：
-
-| | approve | deny |
+| Provider | Broker 管理路径 | 共享/外部表面策略 |
 |---|---|---|
-| 服务端请求 | `item/fileChange/requestApproval` | **形状完全相同** |
-| 客户端响应 | `{"decision":"accept"}` | `{"decision":"decline"}` |
-| `item/completed` 的 `item.status` | `completed` | **`declined`** |
-| `turn/completed` 的 `status` | `completed` | **`completed`**（不是 failed） |
-| `turn.error` | `null` | **`null`** |
-| agent 收场 | — | 一条 `final_answer`：「Unable to modify `editable.txt`: the file-editing operation was rejected, so no files were changed.」 |
+| Codex | app-server JSON-RPC；Thread → Turn → Item | 只在公开的同实例发现/订阅机制被端到端证明后声明原生 CLI/GUI 附着 |
+| Claude Code | Agent SDK 流式会话、permissions、session resume/list | 官方 Remote Control 不是第三方接口；独立原生表面当前只承诺公开能力可证明的部分 |
+| OpenCode | server REST 命令 + global/session SSE | 优先把原生 TUI/GUI 与 Broker 接到同一 server；分别验收 |
+| ACP | 兼容适配层 | 用于 ACP-compatible agent，不强迫三家都降到 ACP 交集 |
 
-**推论（都会写进 `PROTOCOL.md`）**
-
-1. **UACP 绝不能把 deny 映射成 `Error` 事件。** 上游明确把它当正常流程收场
-   （`turn.status=completed`、`error=null`），agent 还会自己解释一句。
-   映射成 `Error` 会在手机上渲染成红色故障，与事实相反
-2. **拒绝的信号是 `item.status = "declined"`**，属于 item 生命周期的终态之一，不是独立事件。
-   因此 `ToolCallEnd` 必须能表达 `completed | declined | failed | …` 一族终态，
-   而不是只有成功/失败两态
-3. **拒绝时 `item/completed` 仍携带完整 `changes[]`（含 `diff`）**，尽管什么都没写盘。
-   手机因此可以显示「你拒绝了这个修改，它本来要写的是 …」——
-   但这也意味着**拒绝路径上的 diff 同样是文件内容**，同样必须走内容寻址存储
-4. `turn/completed` 自带 `itemsView: "summary"` 与该 turn 全部 item 的摘要数组，
-   对断线重连后的状态重建有用，`event.replay` 的设计可以利用它
-
-### 4.3 日志的落盘格式
-
-- 每会话一个 append-only 文件：`<data_dir>/events/<session_id>.log`
-- 一行一个事件，行首为 seq，便于 `seek` 与截断修复
-- **不写入**：文件内容、工具参数明文、密钥（`REQUIREMENTS.md §6.3`）。
-  大载荷（diff、文件内容）另存内容寻址存储，日志里只放引用
-
----
-
-## 5. hostd 的双重 fs 角色（容易被忽略，且是安全高危区）
-
-hostd 在文件系统上同时扮演两个角色：
+## 4. 规范化领域模型
 
 ```
-   agent ──── fs/read_text_file ────►  hostd  ◄──── fs.* ──── 手机
-           （ACP client 方法，我们是提供方）      （UACP，我们是提供方）
+Host
+├── ProviderRuntime
+├── Project
+│   ├── Session*
+│   └── Workflow*
+├── Workflow
+│   └── Step* ──► Session / Artifact / HumanGate
+└── AttentionItem*
+
+Session
+└── Turn
+    └── Item
 ```
 
-- **对 agent**：ACP 要求客户端实现 `fs/read_text_file`、`fs/write_text_file`、`terminal/*`。
-  hostd 必须实现它们，否则 agent 无法完成工具调用（T-004 的 ACP 全列为空，
-  最可疑的原因就是录制器把这些能力声明成了 `false`）
-- **对手机**：`REQUIREMENTS.md §2` 端 A 规定「文件树、文件读取、diff 由 hostd 直接读盘，
-  **不经由 agent 的 fs 能力**」
+### 4.1 Session 状态
 
-**两条路径共用一个受限的文件访问层**，统一执行：
-
-1. 路径必须落在已授权的项目根内（防目录穿越）
-2. 尊重 `.gitignore`（F-4）
-3. **日志里只记路径的哈希与字节数，不记内容、不记完整路径**
-
----
-
-## 6. Agent 发现与进程监管
-
-按 [ADR-0006](adr/0006-agent-discovery.md)，`AgentDiscovery` 是一等公民，返回**结构化结果**而非布尔值：
+Session 自身只表达运行状态，不混入任务清单：
 
 ```
-显式配置 → 继承 PATH → 平台持久化环境变量 → 已知安装位置 → hostd 自备
+offline | idle | running | waiting_user | waiting_approval
+queued | failed | completed | cancelled
 ```
 
-**hostd 以托盘 / LaunchAgent / systemd user unit 启动，不执行用户的 shell profile**（R-12）。
-因此发现失败时必须能报告「五处分别看到什么」，UI 呈现发现来源而非可用/不可用。
+Turn 与 Item 有各自生命周期。审批拒绝是 Item 的正常终态，不自动等于 Turn 失败。
 
-### 6.1 发现不是找到「一个」二进制，而是在多个候选中做选择（R-13）
+### 4.2 三类容易混淆的状态
 
-T-006 实测：同一台机器上 `codex` 至少有三个实例 —— Store/GUI 版、npm CLI 版、npx 临时版，
-**各自持有独立的登录态**。`where.exe codex` 命中的是 Store GUI 版，在录制进程里返回
-`Not logged in`；而用户终端里的 CLI 版是 `Logged in using ChatGPT`。
+必须独立建模：
 
-**推论：`AgentDiscovery` 返回的是候选列表，不是单个路径。** 每个候选必须携带：
+1. **运行状态**：Agent 是否正在工作、离线、等待或失败。
+2. **Agent plan/tasks**：Agent 对当前任务的分解及完成度。
+3. **用户输入队列**：尚未注入 runtime 的 prompt/steer；可编辑、排序和取消。
 
-| 字段 | 用途 |
+第四类 `AttentionItem` 聚合等待人工处理的 approval、question、review gate 和连接故障，
+供手机全局 Inbox 使用。
+
+### 4.3 工作流
+
+Workflow 是跨 Agent 的持久化有向图，不是聊天文本里的约定。Step 至少包含：
+
+- provider/runtime 选择；
+- role（plan / implement / review / verify / custom）；
+- 输入 Artifact 引用；
+- 输出合同与完成条件；
+- 依赖与人工 gate；
+- 重试策略、返工目标和关联 Session；
+- 审计记录：谁在何时从什么状态推进到什么状态。
+
+Broker 只能在依赖、能力和 gate 均满足后调度 Step。手机和 PC 使用同一组工作流命令。
+
+## 5. Decoder、Reducer、Projection
+
+数据路径：
+
+```
+Provider message
+  → generated/minimal decoder
+  → provider reducer
+  → canonical state transition
+  → write-ahead durable log
+  → subscriber-specific projection
+```
+
+- decoder 负责上游形状和前向兼容；
+- reducer 负责 join、生命周期和不变量；
+- durable log 保存规范化状态转移或命令结果；
+- projection 面向会话列表、transcript、live activity、queue、inbox、workflow 等 UI。
+
+真实 fixture 的作用是证明特定 reducer 语义。例如现有 Codex fixture 已证明：
+
+- 审批请求可能只有 `itemId`，必须与已有 Item join；
+- `decline` 是 Item 终态，不等于 Turn error；
+- diff 是敏感大载荷，日志和推送只保存内容引用。
+
+未知 provider 消息必须保留诊断计数并安全忽略或降级，不能 panic；但也不能被伪造成已支持的投影。
+
+## 6. Durable State 与重放
+
+写路径遵循：
+
+```
+validate command
+  → provider accepted / local transition
+  → assign monotonic cursor
+  → durable append
+  → publish projection
+```
+
+需要同时支持：
+
+- 周期性快照，避免长会话从零回放；
+- `since_cursor` 增量同步；
+- 客户端幂等命令键；
+- projection 版本；
+- 慢客户端背压和重连；
+- 内容寻址大载荷，正文与元数据分离。
+
+“飞行模式前后逐字节相同”不是合理的状态验收；正确口径是相同命令序列收敛到相同规范化状态，
+且 cursor 无缺口、无重复应用。
+
+## 7. 移动端读模型
+
+核心读模型至少有：
+
+| Projection | 用途 |
 |---|---|
-| 路径与来源层级 | 用户能看懂「从哪找到的」 |
-| 版本 | 与 `schemas/` 快照对照 |
-| **登录态** | 决定它能不能真的干活 |
-| 选中理由 | 排障时最关键的一条 |
+| `ProjectIndex` | provider/项目分类、在线与计数 |
+| `SessionIndex` | 历史、活动、归档、运行状态 |
+| `Transcript` | Turn/Item、文本、工具、diff 引用 |
+| `LiveActivity` | 当前增量、进度、计划和任务 |
+| `InputQueue` | 待发送消息、顺序、可编辑状态 |
+| `AttentionInbox` | 审批、问题、审核 gate、错误 |
+| `WorkflowBoard` | 步骤依赖、角色、产物、返工 |
+| `RuntimeCapabilities` | 当前连接能做什么及原因 |
 
-选择策略：**已认证 > 版本匹配快照 > 来源层级靠前**。
-UI 必须显示「选中了哪一个、为什么」，并允许用户显式指定（发现优先级①）。
+Swift/Kotlin 只渲染这些读模型并发命令；协议、状态机和 provider 逻辑必须位于共享核心。
 
-> 这条对 OBJ-1 是硬约束：用户在终端里看到「已登录」，hostd 却报「未登录」，
-> 而且给不出原因 —— 这是最难自查的一类故障。
-
-进程监管的平台差异（`REQUIREMENTS.md §2` 端 A）：
-
-| 关注点 | 收敛位置 |
-|---|---|
-| `.cmd` / `PATHEXT` 解析、`CREATE_NO_WINDOW`、杀进程树 | `kaleido-adapter/src/platform/windows.rs` |
-| 配置/数据目录 | `directories` crate，**禁止手写字面量** |
-| 文件监听 | `notify` crate |
-
-> 进程清理只针对**本次 spawn 的进程树**（按 PID 家族），
-> 绝不按可执行文件名匹配全系统进程 —— 否则用户开着 GUI 就无法工作。
-
----
-
-## 7. UniFFI 边界
-
-**边界画在 `kaleido-core` 的外沿。** 手机侧只拿到会话语义，不碰协议细节。
-
-### 7.1 跨 FFI 的类型
-
-| 跨 | 不跨 |
-|---|---|
-| `SessionEvent`（12 个变体，enum with payload） | `AgentAdapter` trait 对象 |
-| `SessionSummary` / `AdapterCaps` / `ConnectionLayer` | 任何 `tokio` 类型 |
-| `PermissionRequest` / `Decision` | 任何 `BoxStream` |
-| `Cursor`（u64 newtype） | 上游 SDK 的任何类型 |
-
-### 7.2 async 流的桥接（R-5 的正面处理）
-
-UniFFI 对 `Stream` 表达力有限。**不把 `BoxStream` 直接跨 FFI**，改用回调 trait：
+## 8. 连接与服务器
 
 ```
-Rust 侧：core 持有事件流 → 逐条调用 EventSink::on_event(SessionEvent)
-Swift  ：实现 EventSink，内部转 AsyncStream
-Kotlin ：实现 EventSink，内部转 Flow
+Mobile ── LAN direct ───────────────► hostd
+   └──── public P2P, rendezvous ────► hostd
+   └──── Ubuntu relay (ciphertext) ─► hostd
 ```
 
-**硬性要求（ADR-0001 D-6 / ADR-0002 D-2）**：G1 必须用真实类型
-**同时生成 Swift 与 Kotlin 绑定并双双编译通过**。只验证 Kotlin 是不允许的 ——
-Android 先行指的是 UI 与真机验收先行，不是核心类型只对 Android 负责。
+Ubuntu 服务从 v1 开始就是必需的可靠性后备，不以打洞率阈值决定是否存在。P2P 仍为首选，
+relay 是现实移动网络下的确定性回退。
 
----
+控制面包含配对、吊销、在线信号、push token 和 relay 路由；数据面端到端加密。
+离线信封若实现，也只能保存有上限、有过期时间的密文。
 
-## 8. 传输分层与降级
+## 9. 初步模块边界
+
+名称可在 `PROTOCOL.md` 后细化，但依赖方向必须保持：
 
 ```
-L0 局域网 mDNS + iroh 直连   （iroh-mdns-address-lookup，不需要 relay）
-L1 iroh NAT 打洞             （仅需 rendezvous）
-L2 iroh relay 加密中转       （零知识）
-L3 用户自备隧道              （Tailscale / Cloudflare，用户自理）
+kaleido-proto              canonical types and commands
+      ↑
+kaleido-state              reducers, workflow, projections
+      ↑
+kaleido-provider           provider-neutral runtime traits
+      ↑
+kaleido-provider-*         Codex / Claude / OpenCode
+      ↑
+kaleido-hostd              composition root and local services
+
+kaleido-transport ─────────► kaleido-hostd / kaleido-core
+kaleido-core ──────────────► UniFFI ─► Android / iOS
+kaleido-relay               independent ciphertext relay
 ```
 
-- 客户端自动按 L0 → L1 → L2 尝试，**UI 明示当前层级**（`REQUIREMENTS.md §6.1`）
-- 层级判定用 iroh 1.0 的 `Connection::paths()` + `Path::is_ip()` / `is_relay()` / `is_selected()`
-  （`conn_type()` 在 1.0 已删除，见 ADR-0001 C-1）
+上游生成类型只存在于对应 provider crate，不能穿透到 canonical 或移动端。
 
----
+## 10. 明确禁止
 
-## 9. relay 的定位 —— **待 G0 定稿**
+- 为了“看起来通了”转发终端或 tmux；
+- 把 transcript 文件轮询称为实时；
+- 按 provider 名字隐藏功能缺口；
+- 先实现三家完整 schema，再写产品纵切；
+- 用固定事件数量当架构完成度；
+- 在 proto 未定稿前创建 adapter 自有的临时全局模型；
+- 让服务器持有 provider 凭据、项目文件或业务明文；
+- 把“手机消息已排队”显示成“已 steer 到当前 turn”。
 
-| G0 结果 | relay 定位 | 影响 |
-|---|---|---|
-| 直连成功率 **≥ 60%** | 可选组件。局域网与多数外网场景不部署也能用 | `kaleido-relay` 排在 M8 |
-| 直连成功率 **< 60%** | **v1 必做**。默认路径就要过 relay | `kaleido-relay` 提前到 M4，零知识约束成为 G3 的验收项 |
+## 11. 仍需协议定稿的内容
 
-**本节在 G0 数字拿到前不填。** 这也是 `MILESTONES.md` 把 G0 排在最前的唯一理由。
+项目主管必须在 `docs/PROTOCOL.md` 决定：
 
----
+- 全部对象 ID、快照、cursor、命令确认和错误模型；
+- canonical state transition 与 projection 的边界；
+- workflow/step/artifact/human gate；
+- queue 与 steer；
+- approval/question 的关联与过期；
+- capability 证据和变化通知；
+- 内容引用、脱敏和保留策略；
+- UniFFI 可表达性。
 
-## 10. 反模式清单（审核时逐条查）
-
-| # | 反模式 | 依据 |
-|---|---|---|
-| A-1 | ANSI 转义解析 / 屏幕抓取获取 agent 输出 | OBJ-2，立项前提 |
-| A-2 | UI 按 agent 名称分支，而非 `capabilities()` | `CLAUDE.md §3.2` |
-| A-3 | 事件先发后写盘 | 违反 INV-1，F-8 失效 |
-| A-4 | UACP 复用上游协议的判别字符串 | 违反 INV-2，ADR-0004 P-3 |
-| A-5 | 平台专属逻辑散落在跨平台模块 | `AGENTS.md §3.5` |
-| A-6 | 手写上游类型 | `AGENTS.md §3.2`（规范化层例外见 ADR-0005） |
-| A-7 | 日志/推送载荷含文件内容、工具参数、密钥、完整用户路径 | `REQUIREMENTS.md §6.3` |
-| A-8 | 因 PATH 上没有 CLI 就判定 agent 不可用 | ADR-0006 D-3 |
-| A-9 | 按可执行文件名匹配全系统进程做清理 | 本文 §6 |
-| A-10 | adapter 之间互相依赖 | 本文 §2 |
-
----
-
-## 11. 尚未定稿的部分
-
-| 项 | 阻塞于 | 预计 |
-|---|---|---|
-| relay 定位（§9） | **G0** | 20 轮实测 |
-| `SessionEvent` 各变体的确切字段 | **T-006 的 fixture** | 补录完成 |
-| 权限审批的统一形状 | T-006 的 P0 场景（R-8） | 已有 schema 骨架，缺字段可选性证据 |
-| 大载荷（diff/文件）的内容寻址存储细节 | `PROTOCOL.md` | M2 后半 |
-| 推送载荷的确切结构 | `PROTOCOL.md` + APNs/FCM 双端约束 | M2 后半 |
+这些问题解决前，没有产品实现任务卡处于活动状态。

@@ -1,5 +1,10 @@
 # Upstream schema compatibility
 
+> **Rebaseline notice (2026-07-30):** this file and `schemas/` are frozen
+> upstream evidence and drift-monitoring assets. They are not an active product
+> gate. A product slice may use only the protocol surface derived from
+> `PROTOCOL.md`; collecting or generating every upstream type must not block it.
+
 The JSON files under `schemas/codex/`, `schemas/opencode/`, and `schemas/acp/`
 are byte-preserving upstream snapshots. They are the baseline for protocol
 design and drift review. Generated or normalized schema must never be written
