@@ -23,6 +23,7 @@ use super::{
 };
 use crate::fixture::{Direction, FixtureSink, Transport};
 use crate::platform::{self, ResolvedExecutable};
+use crate::redact::Redactor;
 use crate::stdio_tee::{StdioError, StdioTee};
 
 const INITIALIZE_ID: i64 = 1;
@@ -123,9 +124,10 @@ impl CodexScenario {
                  the current sandbox.",
             ),
             Self::PermissionApprove | Self::PermissionDeny => Some(
-                "Create permission-probe.txt in the current sandbox containing \
-                 exactly KALEIDO PERMISSION PROBE. Do not access any path outside \
-                 the current sandbox.",
+                "Use the file-editing tool to replace the complete contents of editable.txt \
+                 with exactly KALEIDO PERMISSION PROBE. Do not run a shell command, do not \
+                 create or touch any other file, and do not access any path outside the \
+                 current sandbox.",
             ),
             Self::FileChange => Some(
                 "Edit editable.txt in the current sandbox by replacing the marker \
@@ -192,6 +194,7 @@ struct ItemLifecycleObservation {
     exact_notes_read: bool,
     exact_editable_change: bool,
     exact_failure_command: bool,
+    permission_target_paths: Vec<String>,
     meaningful_update_seen: bool,
     terminal_status: Option<String>,
     exit_code: Option<i64>,
@@ -204,6 +207,7 @@ struct PermissionFlowObservation {
     target_item_id: String,
     decision: PermissionDecision,
     target_started_before_reply: bool,
+    exact_editable_change: bool,
     terminal_status_after_reply: Option<String>,
 }
 
@@ -290,6 +294,7 @@ impl CodexRecording {
                     && self.turn_id.as_deref() == Some(flow.turn_id.as_str())
                     && flow.decision == PermissionDecision::Approve
                     && flow.target_started_before_reply
+                    && flow.exact_editable_change
                     && flow.terminal_status_after_reply.as_deref() == Some("completed")
             })
     }
@@ -305,6 +310,7 @@ impl CodexRecording {
                     && self.turn_id.as_deref() == Some(flow.turn_id.as_str())
                     && flow.decision == PermissionDecision::Deny
                     && flow.target_started_before_reply
+                    && flow.exact_editable_change
                     && matches!(
                         flow.terminal_status_after_reply.as_deref(),
                         Some("declined" | "failed")
@@ -391,9 +397,10 @@ pub enum CodexRecorderError {
     #[error("cancel scenario completed before a commandExecution item started")]
     CancelToolDidNotStart,
     #[error(
-        "Codex permission request could not be proven safe inside the canonical fixture sandbox"
+        "Codex permission request could not be proven safe inside the canonical fixture sandbox\n\
+         {diagnostic}"
     )]
-    UnsafePermissionScope,
+    UnsafePermissionScope { diagnostic: String },
     #[error("Codex active turn contained a tool lifecycle whose scope could not be proven safe")]
     UnsafeToolLifecycleScope,
     #[error("Codex protocol attempt failed ({source}); child cleanup also failed: {cleanup}")]
@@ -1258,6 +1265,7 @@ fn observe_item_started(message: &Value, observations: &mut Observations) {
     let item = message.pointer("/params/item").unwrap_or(&Value::Null);
     let permission_scope_safe =
         item_permission_scope_is_safe(item, item_type, &observations.sandbox);
+    let permission_target_paths = item_permission_target_paths(item, item_type);
     observations.item_lifecycles.push(ItemLifecycleObservation {
         thread_id: thread_id.to_owned(),
         turn_id: turn_id.to_owned(),
@@ -1279,10 +1287,38 @@ fn observe_item_started(message: &Value, observations: &mut Observations) {
             &observations.sandbox,
             PermissionCommand::Fail,
         ),
+        permission_target_paths,
         meaningful_update_seen: false,
         terminal_status: None,
         exit_code: None,
     });
+}
+
+fn item_permission_target_paths(item: &Value, item_type: &str) -> Vec<String> {
+    let values = match item_type {
+        "commandExecution" => item
+            .get("commandActions")
+            .and_then(Value::as_array)
+            .map(|actions| {
+                actions
+                    .iter()
+                    .filter_map(|action| action.get("path").and_then(Value::as_str))
+                    .map(str::to_owned)
+                    .collect()
+            }),
+        "fileChange" => item
+            .get("changes")
+            .and_then(Value::as_array)
+            .map(|changes| {
+                changes
+                    .iter()
+                    .filter_map(|change| change.get("path").and_then(Value::as_str))
+                    .map(str::to_owned)
+                    .collect()
+            }),
+        _ => None,
+    };
+    values.unwrap_or_default()
 }
 
 fn item_permission_scope_is_safe(item: &Value, item_type: &str, sandbox: &Path) -> bool {
@@ -1621,8 +1657,11 @@ fn handle_server_request(
     observations.server_request_methods.push(method.to_owned());
 
     if is_permission_server_request(request) {
-        validate_permission_request_scope(method, params, observations)
-            .map_err(|_| CodexRecorderError::UnsafePermissionScope)?;
+        if let Err(failure) = validate_permission_request_scope(method, params, observations) {
+            return Err(CodexRecorderError::UnsafePermissionScope {
+                diagnostic: permission_scope_diagnostic(method, params, observations, &failure),
+            });
+        }
         io.commit_pending_server_request()?;
     }
 
@@ -1676,17 +1715,408 @@ fn handle_server_request(
     io.send(&json!({"id": id, "result": result}))
 }
 
+#[derive(Debug)]
+struct PermissionScopeFailure {
+    item: &'static str,
+    source: PermissionScopeError,
+}
+
+fn permission_scope_check<T>(
+    item: &'static str,
+    result: Result<T, PermissionScopeError>,
+) -> Result<T, PermissionScopeFailure> {
+    result.map_err(|source| PermissionScopeFailure { item, source })
+}
+
+fn permission_scope_diagnostic(
+    method: &str,
+    params: &Value,
+    observations: &Observations,
+    failure: &PermissionScopeFailure,
+) -> String {
+    let mut checks = vec![permission_diagnostic_check(
+        "method",
+        Value::from(method),
+        json!([
+            METHOD_COMMAND_APPROVAL,
+            METHOD_FILE_CHANGE_APPROVAL,
+            METHOD_PERMISSION_PROFILE_APPROVAL,
+            METHOD_LEGACY_EXEC_APPROVAL,
+            METHOD_LEGACY_PATCH_APPROVAL
+        ]),
+        matches!(
+            method,
+            METHOD_COMMAND_APPROVAL
+                | METHOD_FILE_CHANGE_APPROVAL
+                | METHOD_PERMISSION_PROFILE_APPROVAL
+                | METHOD_LEGACY_EXEC_APPROVAL
+                | METHOD_LEGACY_PATCH_APPROVAL
+        ),
+    )];
+
+    if matches!(
+        method,
+        METHOD_COMMAND_APPROVAL | METHOD_PERMISSION_PROFILE_APPROVAL | METHOD_LEGACY_EXEC_APPROVAL
+    ) {
+        let raw_cwd = params.get("cwd").cloned().unwrap_or(Value::Null);
+        let cwd_result = raw_cwd
+            .as_str()
+            .map(|cwd| validate_exact_permission_cwd(&observations.sandbox, cwd))
+            .unwrap_or(Err(PermissionScopeError::UnprovablePath));
+        let actual = json!({
+            "raw": raw_cwd,
+            "canonical": raw_cwd
+                .as_str()
+                .map(|cwd| diagnostic_canonical_path(&observations.sandbox, cwd))
+                .unwrap_or(Value::Null)
+        });
+        let expected = json!({
+            "canonical": diagnostic_canonical_path(
+                &observations.sandbox,
+                &observations.sandbox.to_string_lossy()
+            ),
+            "relation": "equal to the canonical fixture sandbox and not a link/reparse point"
+        });
+        checks.push(permission_diagnostic_check(
+            "cwd",
+            actual,
+            expected,
+            cwd_result.is_ok(),
+        ));
+    }
+
+    if matches!(
+        method,
+        METHOD_COMMAND_APPROVAL | METHOD_LEGACY_EXEC_APPROVAL
+    ) {
+        let command = params.get("command").cloned().unwrap_or(Value::Null);
+        let command_safe = match method {
+            METHOD_COMMAND_APPROVAL => command
+                .as_str()
+                .is_some_and(|raw| validate_permission_command(raw).is_ok()),
+            METHOD_LEGACY_EXEC_APPROVAL => command
+                .as_array()
+                .and_then(|parts| {
+                    parts
+                        .iter()
+                        .map(Value::as_str)
+                        .map(|part| part.map(str::to_owned))
+                        .collect::<Option<Vec<_>>>()
+                })
+                .is_some_and(|argv| validate_permission_argv(&argv).is_ok()),
+            _ => false,
+        };
+        checks.push(permission_diagnostic_check(
+            "command",
+            command,
+            json!({
+                "program": ["cargo", "cargo.exe"],
+                "argv": [["run"], ["run", "--"]],
+                "shell_operators": "forbidden"
+            }),
+            command_safe,
+        ));
+    }
+
+    if method == METHOD_COMMAND_APPROVAL {
+        let actions = params.get("commandActions").cloned().unwrap_or(Value::Null);
+        checks.push(permission_diagnostic_check(
+            "commandActions",
+            actions.clone(),
+            json!({
+                "nonempty": true,
+                "types": ["read", "listFiles", "search"],
+                "commands": "same strict command allowlist",
+                "paths": "when present, canonically inside the fixture sandbox"
+            }),
+            validate_command_actions(&actions, &observations.sandbox).is_ok(),
+        ));
+        let policy = json!({
+            "networkApprovalContext": params.get("networkApprovalContext"),
+            "proposedNetworkPolicyAmendments": params.get("proposedNetworkPolicyAmendments"),
+            "proposedExecpolicyAmendment": params.get("proposedExecpolicyAmendment")
+        });
+        let no_escalation = params
+            .get("networkApprovalContext")
+            .is_none_or(Value::is_null)
+            && params
+                .get("proposedNetworkPolicyAmendments")
+                .is_none_or(|value| !value_has_entries(value))
+            && params
+                .get("proposedExecpolicyAmendment")
+                .is_none_or(|value| !value_has_entries(value));
+        checks.push(permission_diagnostic_check(
+            "policy_escalation",
+            policy,
+            json!({
+                "networkApprovalContext": null,
+                "proposedNetworkPolicyAmendments": [],
+                "proposedExecpolicyAmendment": []
+            }),
+            no_escalation,
+        ));
+    } else if method == METHOD_LEGACY_EXEC_APPROVAL {
+        let parsed = params.get("parsedCmd").cloned().unwrap_or(Value::Null);
+        checks.push(permission_diagnostic_check(
+            "parsedCmd",
+            parsed.clone(),
+            json!({
+                "nonempty": true,
+                "types": ["read", "list_files", "search"],
+                "commands": "same strict command allowlist",
+                "paths": "when present, canonically inside the fixture sandbox"
+            }),
+            validate_parsed_commands(&parsed, &observations.sandbox).is_ok(),
+        ));
+    }
+
+    if method == METHOD_PERMISSION_PROFILE_APPROVAL {
+        let permissions = params.get("permissions").cloned().unwrap_or(Value::Null);
+        checks.push(permission_diagnostic_check(
+            "permissions",
+            permissions,
+            json!({
+                "keys": ["fileSystem", "network"],
+                "network": null,
+                "fileSystem_paths": "canonically inside the fixture sandbox"
+            }),
+            validate_permission_profile_scope(params, &observations.sandbox).is_ok(),
+        ));
+    }
+
+    if matches!(
+        method,
+        METHOD_FILE_CHANGE_APPROVAL | METHOD_LEGACY_PATCH_APPROVAL
+    ) {
+        if method == METHOD_LEGACY_PATCH_APPROVAL {
+            let file_changes = params.get("fileChanges").cloned().unwrap_or(Value::Null);
+            let file_changes_safe = file_changes
+                .as_object()
+                .filter(|changes| !changes.is_empty())
+                .is_some_and(|changes| {
+                    changes
+                        .keys()
+                        .all(|path| validate_permission_path(&observations.sandbox, path).is_ok())
+                });
+            checks.push(permission_diagnostic_check(
+                "fileChanges",
+                file_changes,
+                json!({
+                    "nonempty": true,
+                    "keys": "each path resolves canonically inside the fixture sandbox"
+                }),
+                file_changes_safe,
+            ));
+        }
+        let grant_root = params.get("grantRoot").cloned().unwrap_or(Value::Null);
+        checks.push(permission_diagnostic_check(
+            "grantRoot",
+            grant_root,
+            json!({
+                "allowed": "null or a path canonically inside the fixture sandbox"
+            }),
+            validate_optional_grant_root(params, &observations.sandbox).is_ok(),
+        ));
+    }
+
+    let target_paths = permission_diagnostic_target_paths(params, observations);
+    let target_details = target_paths
+        .iter()
+        .map(|path| {
+            json!({
+                "raw": path,
+                "canonical": diagnostic_canonical_path(&observations.sandbox, path)
+            })
+        })
+        .collect::<Vec<_>>();
+    let targets_safe = target_paths
+        .iter()
+        .all(|path| validate_permission_path(&observations.sandbox, path).is_ok());
+    checks.push(permission_diagnostic_check(
+        "target_paths",
+        Value::Array(target_details),
+        json!({
+            "relation": "every present path resolves inside the canonical fixture sandbox",
+            "canonical_root": diagnostic_canonical_path(
+                &observations.sandbox,
+                &observations.sandbox.to_string_lossy()
+            ),
+            "links_or_reparse_points": "forbidden"
+        }),
+        targets_safe,
+    ));
+
+    let expected_item_type = match method {
+        METHOD_COMMAND_APPROVAL | METHOD_LEGACY_EXEC_APPROVAL => Some("commandExecution"),
+        METHOD_FILE_CHANGE_APPROVAL | METHOD_LEGACY_PATCH_APPROVAL => Some("fileChange"),
+        _ => None,
+    };
+    let correlation_safe = match expected_item_type {
+        Some(item_type) => validate_correlated_lifecycle(params, observations, item_type).is_ok(),
+        None if method == METHOD_PERMISSION_PROFILE_APPROVAL => {
+            validate_any_correlated_lifecycle(params, observations).is_ok()
+        }
+        None => true,
+    };
+    checks.push(permission_diagnostic_check(
+        "correlated_lifecycle",
+        permission_diagnostic_correlation(params, observations),
+        json!({
+            "threadId": observations.active_thread_id,
+            "turnId": observations.active_turn_id,
+            "item_type": expected_item_type.unwrap_or("commandExecution or fileChange"),
+            "started_before_reply": true,
+            "scope_safe": true,
+            "terminal_status": null
+        }),
+        correlation_safe,
+    ));
+
+    let report = json!({
+        "guard": "codex_permission_scope",
+        "method": method,
+        "checks": checks,
+        "failed_item": failure.item,
+        "failure": failure.source.to_string()
+    });
+    let encoded = match serde_json::to_string_pretty(&report) {
+        Ok(value) => value,
+        Err(_) => {
+            return "{\"guard\":\"codex_permission_scope\",\
+                     \"failed_item\":\"diagnostic_serialization\"}"
+                .to_owned()
+        }
+    };
+    Redactor::for_environment(&observations.sandbox).redact(&encoded)
+}
+
+fn permission_diagnostic_check(
+    name: &'static str,
+    actual: Value,
+    expected: Value,
+    passed: bool,
+) -> Value {
+    json!({
+        "name": name,
+        "actual": actual,
+        "expected": expected,
+        "status": if passed { "PASS" } else { "FAIL" }
+    })
+}
+
+fn diagnostic_canonical_path(sandbox: &Path, raw: &str) -> Value {
+    let supplied = Path::new(raw);
+    let candidate = if supplied.is_absolute() {
+        supplied.to_path_buf()
+    } else {
+        sandbox.join(supplied)
+    };
+    match platform::canonical_permission_path(&candidate) {
+        Ok(path) => Value::String(path.to_string_lossy().into_owned()),
+        Err(error) => json!({
+            "unavailable": true,
+            "error_kind": format!("{:?}", error.kind())
+        }),
+    }
+}
+
+fn permission_diagnostic_target_paths(params: &Value, observations: &Observations) -> Vec<String> {
+    let mut paths = Vec::new();
+    for field in ["commandActions", "parsedCmd"] {
+        if let Some(values) = params.get(field).and_then(Value::as_array) {
+            paths.extend(
+                values
+                    .iter()
+                    .filter_map(|value| value.get("path").and_then(Value::as_str))
+                    .map(str::to_owned),
+            );
+        }
+    }
+    if let Some(changes) = params.get("fileChanges").and_then(Value::as_object) {
+        paths.extend(changes.keys().cloned());
+    }
+    if let Some(grant_root) = params.get("grantRoot").and_then(Value::as_str) {
+        paths.push(grant_root.to_owned());
+    }
+    for field in ["read", "write"] {
+        if let Some(values) = params
+            .pointer(&format!("/permissions/fileSystem/{field}"))
+            .and_then(Value::as_array)
+        {
+            paths.extend(values.iter().filter_map(Value::as_str).map(str::to_owned));
+        }
+    }
+    if let Some(entries) = params
+        .pointer("/permissions/fileSystem/entries")
+        .and_then(Value::as_array)
+    {
+        paths.extend(
+            entries
+                .iter()
+                .filter_map(|entry| entry.pointer("/path/path").and_then(Value::as_str))
+                .map(str::to_owned),
+        );
+    }
+    let item_id = params
+        .get("itemId")
+        .or_else(|| params.get("callId"))
+        .and_then(Value::as_str);
+    if let Some(lifecycle) = observations
+        .item_lifecycles
+        .iter()
+        .find(|lifecycle| Some(lifecycle.item_id.as_str()) == item_id)
+    {
+        paths.extend(lifecycle.permission_target_paths.iter().cloned());
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn permission_diagnostic_correlation(params: &Value, observations: &Observations) -> Value {
+    let item_id = params
+        .get("itemId")
+        .or_else(|| params.get("callId"))
+        .and_then(Value::as_str);
+    let lifecycle = observations
+        .item_lifecycles
+        .iter()
+        .find(|lifecycle| Some(lifecycle.item_id.as_str()) == item_id);
+    json!({
+        "request": {
+            "threadId": params.get("threadId").or_else(|| params.get("conversationId")),
+            "turnId": params.get("turnId"),
+            "itemId": params.get("itemId").or_else(|| params.get("callId"))
+        },
+        "matched_lifecycle": lifecycle.map(|lifecycle| json!({
+            "threadId": lifecycle.thread_id,
+            "turnId": lifecycle.turn_id,
+            "itemId": lifecycle.item_id,
+            "item_type": lifecycle.item_type,
+            "scope_safe": lifecycle.permission_scope_safe,
+            "exact_editable_change": lifecycle.exact_editable_change,
+            "terminal_status": lifecycle.terminal_status
+        }))
+    })
+}
+
 fn validate_permission_request_scope(
     method: &str,
     params: &Value,
     observations: &Observations,
-) -> Result<(), PermissionScopeError> {
+) -> Result<(), PermissionScopeFailure> {
     match method {
         METHOD_COMMAND_APPROVAL => validate_modern_command_scope(params, observations),
         METHOD_FILE_CHANGE_APPROVAL => validate_modern_file_scope(params, observations),
         METHOD_PERMISSION_PROFILE_APPROVAL => {
-            validate_permission_profile_scope(params, &observations.sandbox)?;
-            validate_any_correlated_lifecycle(params, observations)
+            permission_scope_check(
+                "permissions",
+                validate_permission_profile_scope(params, &observations.sandbox),
+            )?;
+            permission_scope_check(
+                "correlated_lifecycle",
+                validate_any_correlated_lifecycle(params, observations),
+            )
         }
         METHOD_LEGACY_EXEC_APPROVAL => validate_legacy_command_scope(params, observations),
         METHOD_LEGACY_PATCH_APPROVAL => validate_legacy_patch_scope(params, observations),
@@ -1697,22 +2127,33 @@ fn validate_permission_request_scope(
 fn validate_modern_command_scope(
     params: &Value,
     observations: &Observations,
-) -> Result<(), PermissionScopeError> {
+) -> Result<(), PermissionScopeFailure> {
     let cwd = params
         .get("cwd")
         .and_then(Value::as_str)
-        .ok_or(PermissionScopeError::UnprovablePath)?;
-    validate_exact_permission_cwd(&observations.sandbox, cwd)?;
+        .ok_or(PermissionScopeFailure {
+            item: "cwd",
+            source: PermissionScopeError::UnprovablePath,
+        })?;
+    permission_scope_check(
+        "cwd",
+        validate_exact_permission_cwd(&observations.sandbox, cwd),
+    )?;
     let command = params
         .get("command")
         .and_then(Value::as_str)
-        .ok_or(PermissionScopeError::UnsafeCommand)?;
-    validate_permission_command(command)?;
-    validate_command_actions(
-        params
-            .get("commandActions")
-            .ok_or(PermissionScopeError::UnsafeCommand)?,
-        &observations.sandbox,
+        .ok_or(PermissionScopeFailure {
+            item: "command",
+            source: PermissionScopeError::UnsafeCommand,
+        })?;
+    permission_scope_check("command", validate_permission_command(command))?;
+    let command_actions = params.get("commandActions").ok_or(PermissionScopeFailure {
+        item: "commandActions",
+        source: PermissionScopeError::UnsafeCommand,
+    })?;
+    permission_scope_check(
+        "commandActions",
+        validate_command_actions(command_actions, &observations.sandbox),
     )?;
     if params
         .get("networkApprovalContext")
@@ -1724,63 +2165,104 @@ fn validate_modern_command_scope(
             .get("proposedExecpolicyAmendment")
             .is_some_and(value_has_entries)
     {
-        return Err(PermissionScopeError::UnsafeCommand);
+        return Err(PermissionScopeFailure {
+            item: "policy_escalation",
+            source: PermissionScopeError::UnsafeCommand,
+        });
     }
-    validate_correlated_lifecycle(params, observations, "commandExecution")
+    permission_scope_check(
+        "correlated_lifecycle",
+        validate_correlated_lifecycle(params, observations, "commandExecution"),
+    )
 }
 
 fn validate_modern_file_scope(
     params: &Value,
     observations: &Observations,
-) -> Result<(), PermissionScopeError> {
-    validate_optional_grant_root(params, &observations.sandbox)?;
-    validate_correlated_lifecycle(params, observations, "fileChange")
+) -> Result<(), PermissionScopeFailure> {
+    permission_scope_check(
+        "grantRoot",
+        validate_optional_grant_root(params, &observations.sandbox),
+    )?;
+    permission_scope_check(
+        "correlated_lifecycle",
+        validate_correlated_lifecycle(params, observations, "fileChange"),
+    )
 }
 
 fn validate_legacy_command_scope(
     params: &Value,
     observations: &Observations,
-) -> Result<(), PermissionScopeError> {
+) -> Result<(), PermissionScopeFailure> {
     let cwd = params
         .get("cwd")
         .and_then(Value::as_str)
-        .ok_or(PermissionScopeError::UnprovablePath)?;
-    validate_exact_permission_cwd(&observations.sandbox, cwd)?;
+        .ok_or(PermissionScopeFailure {
+            item: "cwd",
+            source: PermissionScopeError::UnprovablePath,
+        })?;
+    permission_scope_check(
+        "cwd",
+        validate_exact_permission_cwd(&observations.sandbox, cwd),
+    )?;
     let command = params
         .get("command")
         .and_then(Value::as_array)
-        .ok_or(PermissionScopeError::UnsafeCommand)?
+        .ok_or(PermissionScopeFailure {
+            item: "command",
+            source: PermissionScopeError::UnsafeCommand,
+        })?
         .iter()
         .map(|part| {
             part.as_str()
                 .map(str::to_owned)
-                .ok_or(PermissionScopeError::UnsafeCommand)
+                .ok_or(PermissionScopeFailure {
+                    item: "command",
+                    source: PermissionScopeError::UnsafeCommand,
+                })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    validate_permission_argv(&command)?;
-    validate_parsed_commands(
-        params
-            .get("parsedCmd")
-            .ok_or(PermissionScopeError::UnsafeCommand)?,
-        &observations.sandbox,
+    permission_scope_check("command", validate_permission_argv(&command))?;
+    let parsed_commands = params.get("parsedCmd").ok_or(PermissionScopeFailure {
+        item: "parsedCmd",
+        source: PermissionScopeError::UnsafeCommand,
+    })?;
+    permission_scope_check(
+        "parsedCmd",
+        validate_parsed_commands(parsed_commands, &observations.sandbox),
     )?;
-    validate_correlated_lifecycle(params, observations, "commandExecution")
+    permission_scope_check(
+        "correlated_lifecycle",
+        validate_correlated_lifecycle(params, observations, "commandExecution"),
+    )
 }
 
 fn validate_legacy_patch_scope(
     params: &Value,
     observations: &Observations,
-) -> Result<(), PermissionScopeError> {
+) -> Result<(), PermissionScopeFailure> {
     let changes = params
         .get("fileChanges")
         .and_then(Value::as_object)
         .filter(|changes| !changes.is_empty())
-        .ok_or(PermissionScopeError::UnprovablePath)?;
+        .ok_or(PermissionScopeFailure {
+            item: "fileChanges",
+            source: PermissionScopeError::UnprovablePath,
+        })?;
     for path in changes.keys() {
-        validate_permission_path(&observations.sandbox, path)?;
+        permission_scope_check(
+            "fileChanges",
+            validate_permission_path(&observations.sandbox, path),
+        )?;
     }
-    validate_optional_grant_root(params, &observations.sandbox)?;
-    validate_correlated_lifecycle(params, observations, "fileChange")
+    permission_scope_check(
+        "grantRoot",
+        validate_optional_grant_root(params, &observations.sandbox),
+    )?;
+    permission_scope_check(
+        "correlated_lifecycle",
+        validate_correlated_lifecycle(params, observations, "fileChange"),
+    )
 }
 
 fn validate_permission_profile_scope(
@@ -2010,12 +2492,14 @@ fn observe_permission_reply(
     else {
         return;
     };
-    let target_started_before_reply = observations.item_lifecycles.iter().any(|lifecycle| {
+    let target = observations.item_lifecycles.iter().find(|lifecycle| {
         lifecycle.thread_id == thread_id
             && lifecycle.turn_id == turn_id
             && lifecycle.item_id == target_item_id
             && lifecycle.terminal_status.is_none()
     });
+    let target_started_before_reply = target.is_some();
+    let exact_editable_change = target.is_some_and(|lifecycle| lifecycle.exact_editable_change);
     observations
         .permission_flows
         .push(PermissionFlowObservation {
@@ -2024,6 +2508,7 @@ fn observe_permission_reply(
             target_item_id: target_item_id.to_owned(),
             decision,
             target_started_before_reply,
+            exact_editable_change,
             terminal_status_after_reply: None,
         });
 }
@@ -2465,6 +2950,37 @@ mod tests {
                 }]
             }
         })
+    }
+
+    fn file_permission_request(item_id: &str) -> Value {
+        json!({
+            "id": "permission-1",
+            "method": "item/fileChange/requestApproval",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": item_id,
+                "startedAtMs": 1
+            }
+        })
+    }
+
+    #[test]
+    fn permission_prompts_name_the_exact_existing_editable_file() -> Result<(), Box<dyn Error>> {
+        for scenario in [
+            CodexScenario::PermissionApprove,
+            CodexScenario::PermissionDeny,
+        ] {
+            let prompt = scenario
+                .prompt()
+                .ok_or("permission scenario did not provide a prompt")?;
+            assert!(prompt.contains("file-editing tool"));
+            assert!(prompt.contains("editable.txt"));
+            assert!(prompt.contains("complete contents"));
+            assert!(prompt.contains("KALEIDO PERMISSION PROBE"));
+            assert!(!prompt.contains("permission-probe.txt"));
+        }
+        Ok(())
     }
 
     #[test]
@@ -2963,8 +3479,8 @@ mod tests {
                 initialized(),
                 thread_started(),
                 turn_started(),
-                item_started("tool-1", "commandExecution"),
-                command_permission_request("tool-1"),
+                file_change_started("tool-1", "editable.txt"),
+                file_permission_request("tool-1"),
                 turn_completed("completed"),
             ],
         );
@@ -2976,9 +3492,9 @@ mod tests {
                 initialized(),
                 thread_started(),
                 turn_started(),
-                item_started("tool-1", "commandExecution"),
-                command_permission_request("tool-1"),
-                item_completed("tool-1", "commandExecution", "failed"),
+                file_change_started("tool-1", "editable.txt"),
+                file_permission_request("tool-1"),
+                item_completed("tool-1", "fileChange", "failed"),
                 turn_completed("completed"),
             ],
         );
@@ -2990,13 +3506,27 @@ mod tests {
                 initialized(),
                 thread_started(),
                 turn_started(),
-                item_started("tool-1", "commandExecution"),
-                command_permission_request("tool-1"),
-                item_completed("tool-1", "commandExecution", "completed"),
+                file_change_started("tool-1", "editable.txt"),
+                file_permission_request("tool-1"),
+                item_completed("tool-1", "fileChange", "completed"),
                 turn_completed("completed"),
             ],
         );
         assert!(continued?.observed_approved_permission_flow());
+
+        let (different_safe_file, _) = run_test(
+            CodexScenario::PermissionApprove,
+            [
+                initialized(),
+                thread_started(),
+                turn_started(),
+                file_change_started("tool-1", "other.txt"),
+                file_permission_request("tool-1"),
+                item_completed("tool-1", "fileChange", "completed"),
+                turn_completed("completed"),
+            ],
+        );
+        assert!(!different_safe_file?.observed_approved_permission_flow());
         Ok(())
     }
 
@@ -3009,9 +3539,9 @@ mod tests {
                 initialized(),
                 thread_started(),
                 turn_started(),
-                item_started("tool-1", "commandExecution"),
-                command_permission_request("tool-1"),
-                item_completed("tool-1", "commandExecution", "completed"),
+                file_change_started("tool-1", "editable.txt"),
+                file_permission_request("tool-1"),
+                item_completed("tool-1", "fileChange", "completed"),
                 turn_completed("completed"),
             ],
         );
@@ -3023,9 +3553,9 @@ mod tests {
                 initialized(),
                 thread_started(),
                 turn_started(),
-                item_started("tool-1", "commandExecution"),
-                command_permission_request("tool-1"),
-                item_completed("tool-1", "commandExecution", "declined"),
+                file_change_started("tool-1", "editable.txt"),
+                file_permission_request("tool-1"),
+                item_completed("tool-1", "fileChange", "declined"),
                 turn_completed("interrupted"),
             ],
         );
@@ -3037,9 +3567,9 @@ mod tests {
                 initialized(),
                 thread_started(),
                 turn_started(),
-                item_started("tool-1", "commandExecution"),
-                command_permission_request("tool-1"),
-                item_completed("tool-1", "commandExecution", "declined"),
+                file_change_started("tool-1", "editable.txt"),
+                file_permission_request("tool-1"),
+                item_completed("tool-1", "fileChange", "declined"),
                 turn_completed("completed"),
             ],
         );
@@ -3140,7 +3670,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(CodexRecorderError::UnsafePermissionScope)
+            Err(CodexRecorderError::UnsafePermissionScope { .. })
         ));
         assert!(!io
             .outgoing
@@ -3148,6 +3678,104 @@ mod tests {
             .any(|message| { message.get("id") == Some(&Value::from("unsafe-server-request")) }));
         let serialized = serde_json::to_string(&io.outgoing)?;
         assert!(!serialized.contains(OUTSIDE_MARKER));
+        Ok(())
+    }
+
+    #[test]
+    fn outside_permission_target_is_rejected_with_redacted_structured_diagnostics(
+    ) -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::tempdir()?;
+        let sandbox = temporary.path().join("sandbox");
+        fs::create_dir(&sandbox)?;
+        fs::write(sandbox.join("editable.txt"), b"ORIGINAL\n")?;
+        let outside = temporary.path().join("outside.txt");
+        fs::write(&outside, b"PRIVATE\n")?;
+        let outside_text = outside.to_string_lossy().into_owned();
+        let mut observations = Observations::new(&sandbox);
+        observations.active_thread_id = Some("thread-1".to_owned());
+        observations.active_turn_id = Some("turn-1".to_owned());
+        observe_notification(
+            &file_change_started("item-1", &outside_text),
+            METHOD_ITEM_STARTED,
+            &mut observations,
+        );
+        let request = file_permission_request("item-1");
+        let mut io = MemoryIo::default();
+
+        let error = match handle_server_request(
+            &mut io,
+            &request,
+            PermissionDecision::Deny,
+            &mut observations,
+        ) {
+            Err(error) => error,
+            Ok(()) => return Err(io::Error::other("outside target was accepted").into()),
+        };
+        let diagnostic = error.to_string();
+        eprintln!("{diagnostic}");
+
+        assert!(matches!(
+            error,
+            CodexRecorderError::UnsafePermissionScope { .. }
+        ));
+        assert!(diagnostic.contains("\"guard\": \"codex_permission_scope\""));
+        assert!(diagnostic.contains("\"name\": \"target_paths\""));
+        assert!(diagnostic.contains("\"actual\""));
+        assert!(diagnostic.contains("\"expected\""));
+        assert!(diagnostic.contains("\"status\": \"FAIL\""));
+        assert!(diagnostic.contains("\"failed_item\": \"correlated_lifecycle\""));
+        assert!(diagnostic.contains("<SANDBOX>"));
+        assert!(diagnostic.contains("<OUTSIDE_PATH>"));
+        assert!(!diagnostic.contains(&temporary.path().to_string_lossy().into_owned()));
+        assert!(io.outgoing.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_patch_rejection_diagnostic_names_the_missing_file_changes_check(
+    ) -> Result<(), Box<dyn Error>> {
+        let sandbox = test_sandbox_path();
+        let mut observations = Observations::new(&sandbox);
+        observations.active_thread_id = Some("thread-1".to_owned());
+        observations.active_turn_id = Some("turn-1".to_owned());
+        observe_notification(
+            &file_change_started("item-1", "editable.txt"),
+            METHOD_ITEM_STARTED,
+            &mut observations,
+        );
+        let request = json!({
+            "id": "legacy-patch",
+            "method": "applyPatchApproval",
+            "params": {
+                "conversationId": "thread-1",
+                "turnId": "turn-1",
+                "callId": "item-1",
+                "fileChanges": {}
+            }
+        });
+        let mut io = MemoryIo::default();
+
+        let error = match handle_server_request(
+            &mut io,
+            &request,
+            PermissionDecision::Deny,
+            &mut observations,
+        ) {
+            Err(error) => error,
+            Ok(()) => return Err(io::Error::other("empty legacy fileChanges was accepted").into()),
+        };
+        let diagnostic = error.to_string();
+
+        assert!(matches!(
+            error,
+            CodexRecorderError::UnsafePermissionScope { .. }
+        ));
+        assert!(diagnostic.contains("\"name\": \"fileChanges\""));
+        assert!(diagnostic.contains("\"actual\": {}"));
+        assert!(diagnostic.contains("\"expected\""));
+        assert!(diagnostic.contains("\"status\": \"FAIL\""));
+        assert!(diagnostic.contains("\"failed_item\": \"fileChanges\""));
+        assert!(io.outgoing.is_empty());
         Ok(())
     }
 
@@ -3179,7 +3807,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(CodexRecorderError::UnsafePermissionScope)
+            Err(CodexRecorderError::UnsafePermissionScope { .. })
         ));
         assert!(!io
             .outgoing
@@ -3239,7 +3867,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(CodexRecorderError::UnsafePermissionScope)
+            Err(CodexRecorderError::UnsafePermissionScope { .. })
         ));
         assert!(io.outgoing.is_empty());
         Ok(())

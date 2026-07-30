@@ -1,11 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::future::{poll_fn, Future};
 use std::io::{self, BufRead, BufReader, Cursor, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::path::{Path, PathBuf};
-use std::process::Child;
+use std::pin::pin;
+use std::process::{Child, ExitStatus};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::Arc;
+use std::task::Poll;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -28,6 +33,7 @@ use crate::sse_tee;
 const LOOPBACK: Ipv4Addr = Ipv4Addr::LOCALHOST;
 const MAX_START_ATTEMPTS: usize = 3;
 const MAX_EVENTS: usize = 500;
+const INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SESSION_LOAD_SEED_TITLE: &str = "KALEIDO SESSION LOAD SEED";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -212,6 +218,21 @@ pub enum OpenCodeError {
     ServerNotReady { attempts: usize, last_error: String },
     #[error("OpenCode prompt worker closed without a response")]
     PromptWorkerClosed,
+    #[error("OpenCode recording was interrupted by Ctrl-C")]
+    Interrupted,
+    #[error("git init for the fixture sandbox exited with {0}")]
+    GitInitFailed(ExitStatus),
+    #[error("failed to remove the recorder-created fixture .git directory: {0}")]
+    TemporaryGitCleanup(#[source] io::Error),
+    #[error(
+        "OpenCode operation failed ({source}); removing the recorder-created fixture .git \
+         directory also failed: {cleanup}"
+    )]
+    TemporaryGitCleanupAfterError {
+        #[source]
+        source: Box<OpenCodeError>,
+        cleanup: io::Error,
+    },
     #[error(
         "OpenCode permission request could not be proven safe inside the canonical fixture sandbox"
     )]
@@ -224,6 +245,181 @@ pub enum OpenCodeError {
     },
 }
 
+#[derive(Clone, Debug, Default)]
+struct CancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    fn check(&self) -> Result<(), OpenCodeError> {
+        if self.cancelled.load(Ordering::Acquire) {
+            Err(OpenCodeError::Interrupted)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GitRootOrigin {
+    RecorderCreated,
+    PreExisting,
+}
+
+impl GitRootOrigin {
+    const fn diagnostic(self) -> &'static str {
+        match self {
+            Self::RecorderCreated => {
+                "OpenCode fixture project root: .git=recorder-created; cleanup=RAII"
+            }
+            Self::PreExisting => {
+                "OpenCode fixture project root: .git=pre-existing; cleanup=preserved"
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TemporaryGitRoot {
+    owned_git: Option<PathBuf>,
+    origin: GitRootOrigin,
+}
+
+impl TemporaryGitRoot {
+    fn prepare(sandbox: &Path) -> Result<Self, OpenCodeError> {
+        let git = sandbox.join(".git");
+        match fs::symlink_metadata(&git) {
+            Ok(_) => {
+                validate_prompt_project_isolation(sandbox)?;
+                let root = Self {
+                    owned_git: None,
+                    origin: GitRootOrigin::PreExisting,
+                };
+                eprintln!("kaleido-recorder: {}", root.origin.diagnostic());
+                Ok(root)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let root = Self {
+                    owned_git: Some(git),
+                    origin: GitRootOrigin::RecorderCreated,
+                };
+                root.initialize(sandbox)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn initialize(self, sandbox: &Path) -> Result<Self, OpenCodeError> {
+        let git = platform::resolve(OsStr::new("git")).map_err(ProcessError::from)?;
+        let arguments = [
+            OsString::from("-c"),
+            OsString::from("init.templateDir="),
+            OsString::from("init"),
+            OsString::from("--quiet"),
+            OsString::from("--initial-branch=kaleido-fixture"),
+        ];
+        let child = platform::spawn_fixture(&git, &arguments, sandbox)?;
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            return Err(OpenCodeError::GitInitFailed(output.status));
+        }
+        validate_prompt_project_isolation(sandbox)?;
+        eprintln!("kaleido-recorder: {}", self.origin.diagnostic());
+        Ok(self)
+    }
+
+    fn finish<T>(mut self, result: Result<T, OpenCodeError>) -> Result<T, OpenCodeError> {
+        let cleanup = self.cleanup();
+        match (result, cleanup) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(cleanup)) => Err(OpenCodeError::TemporaryGitCleanup(cleanup)),
+            (Err(source), Ok(())) => Err(source),
+            (Err(source), Err(cleanup)) => Err(OpenCodeError::TemporaryGitCleanupAfterError {
+                source: Box::new(source),
+                cleanup,
+            }),
+        }
+    }
+
+    fn cleanup(&mut self) -> io::Result<()> {
+        let Some(git) = self.owned_git.as_ref() else {
+            return Ok(());
+        };
+        remove_git_path(git)?;
+        self.owned_git = None;
+        Ok(())
+    }
+}
+
+impl Drop for TemporaryGitRoot {
+    fn drop(&mut self) {
+        let _cleanup_result = self.cleanup();
+    }
+}
+
+fn remove_git_path(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn start_interrupt_listener(cancellation: CancellationToken) -> Result<(), OpenCodeError> {
+    start_interrupt_listener_with(cancellation, tokio::signal::ctrl_c())
+}
+
+fn start_interrupt_listener_with<F>(
+    cancellation: CancellationToken,
+    signal: F,
+) -> Result<(), OpenCodeError>
+where
+    F: Future<Output = io::Result<()>> + Send + 'static,
+{
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+    let listener = thread::Builder::new()
+        .name("kaleido-opencode-ctrl-c".to_owned())
+        .spawn(move || {
+            runtime.block_on(async move {
+                let mut signal = pin!(signal);
+                let mut ready_sender = Some(ready_sender);
+                let signal_result = poll_fn(|context| {
+                    let result = signal.as_mut().poll(context);
+                    if let Some(sender) = ready_sender.take() {
+                        let registration = match &result {
+                            Poll::Ready(Err(error)) => Err(error.kind()),
+                            Poll::Pending | Poll::Ready(Ok(())) => Ok(()),
+                        };
+                        let _send_result = sender.send(registration);
+                    }
+                    result
+                })
+                .await;
+                if signal_result.is_ok() {
+                    cancellation.cancel();
+                }
+            });
+        })?;
+    drop(listener);
+    match ready_receiver.recv() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(kind)) => {
+            Err(io::Error::new(kind, "could not register the OpenCode Ctrl-C listener").into())
+        }
+        Err(_) => {
+            Err(io::Error::other("OpenCode Ctrl-C listener stopped before registering").into())
+        }
+    }
+}
+
 pub fn record<W: Write>(
     executable: &ResolvedExecutable,
     sandbox: &Path,
@@ -232,28 +428,35 @@ pub fn record<W: Write>(
     timeout: Duration,
 ) -> Result<CompletedRecording<Outcome>, OpenCodeError> {
     let sandbox = validate_fixture_sandbox(sandbox)?;
-    if scenario != Scenario::SessionLoad {
-        validate_prompt_project_isolation(&sandbox)?;
-    }
+    let cancellation = CancellationToken::default();
+    start_interrupt_listener(cancellation.clone())?;
+    cancellation.check()?;
+    let temporary_git = TemporaryGitRoot::prepare(&sandbox)?;
+    cancellation.check()?;
     let client = Client::builder()
         .no_proxy()
         .connect_timeout(Duration::from_secs(2))
         .timeout(timeout)
         .build()?;
-    let mut server = start_server(executable, &sandbox, &client, timeout)?;
-    let result = if scenario == Scenario::SessionLoad {
-        record_session_load(&client, server.base_url(), &sandbox, fixture)
-    } else {
-        record_prompt_scenario(
-            &client,
-            server.base_url(),
-            scenario,
-            &sandbox,
-            fixture,
-            timeout,
-        )
-    };
-    finish_recording(result, || server.stop())
+    let mut server = start_server(executable, &sandbox, &client, timeout, &cancellation)?;
+    let result = validate_current_project_root(&client, server.base_url(), &sandbox, &cancellation)
+        .and_then(|()| {
+            if scenario == Scenario::SessionLoad {
+                record_session_load(&client, server.base_url(), &sandbox, fixture, &cancellation)
+            } else {
+                record_prompt_scenario(
+                    &client,
+                    server.base_url(),
+                    scenario,
+                    &sandbox,
+                    fixture,
+                    timeout,
+                    &cancellation,
+                )
+            }
+        });
+    let result = finish_recording(result, || server.stop());
+    temporary_git.finish(result)
 }
 
 fn finish_recording(
@@ -308,10 +511,12 @@ fn start_server(
     sandbox: &Path,
     client: &Client,
     timeout: Duration,
+    cancellation: &CancellationToken,
 ) -> Result<Server, OpenCodeError> {
     retry_server_startup(
         MAX_START_ATTEMPTS,
         |_| {
+            cancellation.check()?;
             let port = reserve_then_release_port()?;
             let arguments = [
                 "serve",
@@ -329,7 +534,7 @@ fn start_server(
             let mut child = platform::spawn_fixture(executable, &arguments, sandbox)?;
             drain_child_output(&mut child);
             let base_url = format!("http://127.0.0.1:{port}");
-            match wait_until_ready(&mut child, client, &base_url, timeout) {
+            match wait_until_ready(&mut child, client, &base_url, timeout, cancellation) {
                 Ok(()) => Ok(StartupAttempt::Ready(Server {
                     child: Some(child),
                     base_url,
@@ -399,11 +604,13 @@ fn wait_until_ready(
     client: &Client,
     base_url: &str,
     timeout: Duration,
+    cancellation: &CancellationToken,
 ) -> Result<(), OpenCodeError> {
     let deadline = Instant::now() + timeout.min(Duration::from_secs(15));
     let health_url = format!("{base_url}/global/health");
     let mut last_error = String::from("health endpoint did not respond");
     while Instant::now() < deadline {
+        cancellation.check()?;
         if let Some(status) = child.try_wait()? {
             return Err(OpenCodeError::ServerExited(status));
         }
@@ -422,10 +629,29 @@ fn wait_until_ready(
         }
         thread::sleep(Duration::from_millis(100));
     }
+    cancellation.check()?;
     Err(OpenCodeError::ServerNotReady {
         attempts: 1,
         last_error,
     })
+}
+
+fn validate_current_project_root(
+    client: &Client,
+    base_url: &str,
+    sandbox: &Path,
+    cancellation: &CancellationToken,
+) -> Result<(), OpenCodeError> {
+    cancellation.check()?;
+    let response =
+        request_json_unrecorded(client, base_url, Method::GET, "/project/current", None)?;
+    cancellation.check()?;
+    let project: Value = serde_json::from_str(&response.body)?;
+    if canonical_json_path(project.get("worktree"), sandbox) {
+        Ok(())
+    } else {
+        Err(OpenCodeError::ProjectIsolation)
+    }
 }
 
 fn record_session_load<W: Write>(
@@ -433,17 +659,22 @@ fn record_session_load<W: Write>(
     base_url: &str,
     sandbox: &Path,
     fixture: &mut FixtureSink<W>,
+    cancellation: &CancellationToken,
 ) -> Result<Outcome, OpenCodeError> {
+    cancellation.check()?;
     let (sessions, sessions_value) = fetch_session_list_unrecorded(client, base_url)?;
+    cancellation.check()?;
     let session_id = validate_session_load_preflight(&sessions_value, sandbox)?.to_owned();
     record_session_list_exchange(&sessions, fixture)?;
     let session_path = format!("/session/{session_id}");
     let detail = request_json_unrecorded(client, base_url, Method::GET, &session_path, None)?;
+    cancellation.check()?;
     let detail_value: Value = serde_json::from_str(&detail.body)?;
     validate_session_load_detail(&detail_value, &session_id, sandbox)?;
     record_json_exchange(Method::GET, &session_path, None, &detail, fixture)?;
     let messages_path = format!("/session/{session_id}/message");
     let messages = request_json_unrecorded(client, base_url, Method::GET, &messages_path, None)?;
+    cancellation.check()?;
     let messages_value: Value = serde_json::from_str(&messages.body)?;
     validate_session_load_messages(&messages_value, &session_id)?;
     record_json_exchange(Method::GET, &messages_path, None, &messages, fixture)?;
@@ -589,7 +820,9 @@ fn record_prompt_scenario<W: Write>(
     sandbox: &Path,
     fixture: &mut FixtureSink<W>,
     timeout: Duration,
+    cancellation: &CancellationToken,
 ) -> Result<Outcome, OpenCodeError> {
+    cancellation.check()?;
     let editable_path = sandbox.join("editable.txt");
     let editable_before = (scenario == Scenario::FileChange)
         .then(|| fs::read(&editable_path))
@@ -632,18 +865,15 @@ fn record_prompt_scenario<W: Write>(
     let mut state = ObservationState::default();
     let deadline = Instant::now() + timeout;
     while state.event_count < MAX_EVENTS {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        let frame = match event_receiver.recv_timeout(remaining) {
-            Ok(SseReaderEvent::Frame(frame)) => frame,
-            Ok(SseReaderEvent::Closed) => break,
-            Ok(SseReaderEvent::Error(error)) if is_timeout(&error) => break,
-            Ok(SseReaderEvent::Error(error)) => return Err(error.into()),
-            Err(RecvTimeoutError::Timeout) => break,
-            Err(RecvTimeoutError::Disconnected) => break,
+        let frame = match recv_with_cancellation(&event_receiver, deadline, cancellation)? {
+            CancellableReceive::Item(SseReaderEvent::Frame(frame)) => frame,
+            CancellableReceive::Item(SseReaderEvent::Closed)
+            | CancellableReceive::TimedOut
+            | CancellableReceive::Disconnected => break,
+            CancellableReceive::Item(SseReaderEvent::Error(error)) if is_timeout(&error) => break,
+            CancellableReceive::Item(SseReaderEvent::Error(error)) => return Err(error.into()),
         };
+        cancellation.check()?;
         let Some(event) =
             record_current_session_frame(&frame, &session_id, scenario, sandbox, fixture)?
         else {
@@ -673,13 +903,12 @@ fn record_prompt_scenario<W: Write>(
         }
     }
 
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let prompt_response = match prompt_worker.recv_timeout(remaining) {
-        Ok(response) => response?,
-        Err(RecvTimeoutError::Timeout) => {
+    let prompt_response = match recv_with_cancellation(&prompt_worker, deadline, cancellation)? {
+        CancellableReceive::Item(response) => response?,
+        CancellableReceive::TimedOut => {
             return Ok(prompt_timeout_outcome(state, session_id));
         }
-        Err(RecvTimeoutError::Disconnected) => return Err(OpenCodeError::PromptWorkerClosed),
+        CancellableReceive::Disconnected => return Err(OpenCodeError::PromptWorkerClosed),
     };
     if !prompt_response.status.is_success() {
         return Err(OpenCodeError::HttpStatus {
@@ -715,6 +944,33 @@ fn record_prompt_scenario<W: Write>(
     }
 
     Ok(state.outcome(scenario, session_id))
+}
+
+enum CancellableReceive<T> {
+    Item(T),
+    TimedOut,
+    Disconnected,
+}
+
+fn recv_with_cancellation<T>(
+    receiver: &Receiver<T>,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<CancellableReceive<T>, OpenCodeError> {
+    loop {
+        cancellation.check()?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(CancellableReceive::TimedOut);
+        }
+        match receiver.recv_timeout(remaining.min(INTERRUPT_POLL_INTERVAL)) {
+            Ok(value) => return Ok(CancellableReceive::Item(value)),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Ok(CancellableReceive::Disconnected);
+            }
+        }
+    }
 }
 
 fn prompt_timeout_outcome(state: ObservationState, session_id: String) -> Outcome {
@@ -2327,6 +2583,7 @@ mod tests {
             &format!("http://{address}"),
             &sandbox,
             &mut fixture,
+            &CancellationToken::default(),
         )?;
         let paths = server
             .join()
@@ -2383,6 +2640,7 @@ mod tests {
             &format!("http://{address}"),
             &sandbox,
             &mut fixture,
+            &CancellationToken::default(),
         );
         let paths = server
             .join()
@@ -2442,6 +2700,7 @@ mod tests {
                 &format!("http://{address}"),
                 &sandbox,
                 &mut fixture,
+                &CancellationToken::default(),
             );
             let paths = server
                 .join()
@@ -2499,6 +2758,7 @@ mod tests {
             &format!("http://{address}"),
             &sandbox,
             &mut fixture,
+            &CancellationToken::default(),
         );
         let paths = server
             .join()
@@ -2600,6 +2860,7 @@ mod tests {
                 &format!("http://{address}"),
                 &sandbox,
                 &mut fixture,
+                &CancellationToken::default(),
             );
             server
                 .join()
@@ -4023,6 +4284,179 @@ mod tests {
             !state.is_complete(Scenario::Cancel),
             "a second lifecycle must invalidate the selected cancel target"
         );
+    }
+
+    #[test]
+    fn temporary_git_root_is_created_and_removed_by_scope() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temporary = tempfile::tempdir()?;
+        let sandbox = temporary.path().join("sandbox");
+        std::fs::create_dir_all(&sandbox)?;
+        let sandbox = sandbox.canonicalize()?;
+        let git = sandbox.join(".git");
+
+        {
+            let root = TemporaryGitRoot::prepare(&sandbox)?;
+            assert_eq!(root.origin, GitRootOrigin::RecorderCreated);
+            assert!(git.is_dir());
+        }
+
+        assert!(!git.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn temporary_git_root_is_removed_after_injected_recording_failure(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let sandbox = temporary.path().join("sandbox");
+        std::fs::create_dir_all(&sandbox)?;
+        let sandbox = sandbox.canonicalize()?;
+        let git = sandbox.join(".git");
+        let root = TemporaryGitRoot::prepare(&sandbox)?;
+
+        let result = root.finish::<()>(Err(OpenCodeError::Protocol("injected recording failure")));
+
+        assert!(matches!(
+            result,
+            Err(OpenCodeError::Protocol("injected recording failure"))
+        ));
+        assert!(!git.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn temporary_git_root_is_removed_while_unwinding() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let sandbox = temporary.path().join("sandbox");
+        std::fs::create_dir_all(&sandbox)?;
+        let sandbox = sandbox.canonicalize()?;
+        let git = sandbox.join(".git");
+        let root = TemporaryGitRoot::prepare(&sandbox)?;
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _root = root;
+            std::panic::resume_unwind(Box::new("injected unwind"));
+        }));
+
+        assert!(unwind.is_err());
+        assert!(!git.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn pre_existing_git_root_is_diagnosed_and_preserved() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temporary = tempfile::tempdir()?;
+        let sandbox = temporary.path().join("sandbox");
+        let git = sandbox.join(".git");
+        std::fs::create_dir_all(&git)?;
+        std::fs::write(git.join("preserved.marker"), b"pre-existing\n")?;
+        let sandbox = sandbox.canonicalize()?;
+
+        {
+            let root = TemporaryGitRoot::prepare(&sandbox)?;
+            assert_eq!(root.origin, GitRootOrigin::PreExisting);
+            assert_eq!(
+                root.origin.diagnostic(),
+                "OpenCode fixture project root: .git=pre-existing; cleanup=preserved"
+            );
+        }
+
+        assert_eq!(
+            std::fs::read(git.join("preserved.marker"))?,
+            b"pre-existing\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn current_project_preflight_accepts_only_the_exact_sandbox_root(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let sandbox = temporary.path().join("sandbox");
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir_all(&sandbox)?;
+        std::fs::create_dir_all(&outside)?;
+        let sandbox = sandbox.canonicalize()?;
+        let outside = outside.canonicalize()?;
+
+        for (reported, accepted) in [(&sandbox, true), (&outside, false)] {
+            let listener = TcpListener::bind((LOOPBACK, 0))?;
+            let address = listener.local_addr()?;
+            let server = serve_json_responses(
+                listener,
+                vec![json!({"id": "project-test", "worktree": reported}).to_string()],
+            );
+            let client = Client::builder().no_proxy().build()?;
+
+            let result = validate_current_project_root(
+                &client,
+                &format!("http://{address}"),
+                &sandbox,
+                &CancellationToken::default(),
+            );
+            let paths = server
+                .join()
+                .map_err(|_| io::Error::other("mock server thread panicked"))??;
+
+            assert_eq!(paths, ["/project/current"]);
+            assert_eq!(result.is_ok(), accepted);
+            if !accepted {
+                assert!(matches!(result, Err(OpenCodeError::ProjectIsolation)));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn interrupt_listener_bridge_sets_the_cancellation_token(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cancellation = CancellationToken::default();
+        start_interrupt_listener_with(cancellation.clone(), std::future::ready(Ok(())))?;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while cancellation.check().is_ok() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+
+        assert!(matches!(
+            cancellation.check(),
+            Err(OpenCodeError::Interrupted)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_poll_unwinds_and_removes_the_temporary_git_root(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let sandbox = temporary.path().join("sandbox");
+        std::fs::create_dir_all(&sandbox)?;
+        let sandbox = sandbox.canonicalize()?;
+        let git = sandbox.join(".git");
+        let root = TemporaryGitRoot::prepare(&sandbox)?;
+        let (sender, receiver) = mpsc::channel::<()>();
+        let cancellation = CancellationToken::default();
+        let trigger = cancellation.clone();
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            trigger.cancel();
+        });
+
+        let receive = recv_with_cancellation(
+            &receiver,
+            Instant::now() + Duration::from_secs(1),
+            &cancellation,
+        );
+        drop(sender);
+        canceller
+            .join()
+            .map_err(|_| io::Error::other("cancellation thread panicked"))?;
+        let result = root.finish(receive.map(drop));
+
+        assert!(matches!(result, Err(OpenCodeError::Interrupted)));
+        assert!(!git.exists());
+        Ok(())
     }
 
     #[test]

@@ -294,7 +294,11 @@ OpenCode 还会自行向上寻找项目。仅设置
 `GIT_CEILING_DIRECTORIES=tests/fixtures` 时，它仍把父级 OneKaleidoscope 识别为
 项目；那次临时录制因返回父项目路径而被丢弃，没有提交。成功录制前在 toy
 project 内临时执行 `git init`，让 OpenCode 的项目根明确停在 sandbox；录完
-立即删除这个临时 `.git`，仓库中不提交嵌套 Git 元数据。
+立即删除这个临时 `.git`，仓库中不提交嵌套 Git 元数据。T-010 起这一步由录制器
+自动完成：不存在 `.git` 时创建临时仓库，并在成功、失败、panic 或 Ctrl-C
+退栈时清理；如果 sandbox 原本已有普通 `.git` 目录，则明确报告并原样保留。
+子进程仍同时设置 `GIT_CEILING_DIRECTORIES`，且录制任何 payload 前会用
+`GET /project/current` 校验 OpenCode 报告的 `worktree` 精确落在 sandbox。
 
 各 agent 的九个场景使用同一组名字：
 
@@ -320,14 +324,8 @@ foreach ($scenario in $scenarios | Where-Object { $_ -ne "session-load" }) {
   cargo run -p kaleido-recorder -- acp $scenario --bundled-executable $claudeAcp --timeout-secs 120
 }
 
-git -C tests/fixtures/sandbox init
-try {
-  foreach ($scenario in $scenarios) {
-    cargo run -p kaleido-recorder -- opencode $scenario --executable $opencode --timeout-secs 120
-  }
-}
-finally {
-  Remove-Item -LiteralPath "$repo\tests\fixtures\sandbox\.git" -Recurse -Force
+foreach ($scenario in $scenarios) {
+  cargo run -p kaleido-recorder -- opencode $scenario --executable $opencode --timeout-secs 120
 }
 ```
 
@@ -385,16 +383,17 @@ session。T-004 曾把一个同名 `claude.exe` 误判为录制残留；负责�
 自己的 Claude Code 会话。T-006 的清理逻辑已改为只检查本次 spawn 的 PID 家族，
 不再要求关闭无关的 Claude GUI/CLI。
 
-OpenCode 的 session-load 使用同一隔离 XDG 状态，并用临时嵌套 toy repository
-约束项目根：
+T-006 的 OpenCode session-load seed 使用同一隔离 XDG 状态。下面保留的是当时
+创建 CLI seed 的历史复现步骤；后续 recorder 自身的临时 `.git` 已由 T-010
+自动管理，不再需要在 recorder 命令外围手工创建或删除：
 
 ```powershell
 git -C tests/fixtures/sandbox init
 Push-Location tests/fixtures/sandbox
 & $opencode run --pure --format json --title "KALEIDO SESSION LOAD SEED" '"Reply with exactly KALEIDO SESSION LOAD SEED"'
 Pop-Location
-cargo run -p kaleido-recorder -- opencode session-load --executable $opencode --timeout-secs 120
 Remove-Item -LiteralPath "$repo\tests\fixtures\sandbox\.git" -Recurse -Force
+cargo run -p kaleido-recorder -- opencode session-load --executable $opencode --timeout-secs 120
 ```
 
 这份已提交的 T-004 session-load seed 当时因选择 Google provider 且缺少

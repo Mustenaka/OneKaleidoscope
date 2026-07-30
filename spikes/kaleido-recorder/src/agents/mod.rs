@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -213,17 +214,20 @@ pub fn validate_permission_path(sandbox: &Path, raw: &str) -> Result<(), Permiss
         || raw.contains("<OUTSIDE_PATH>")
         || raw.starts_with('~')
         || raw.contains("://")
-        || raw.contains('*')
-        || raw.contains('?')
     {
         return Err(PermissionScopeError::UnprovablePath);
     }
     let supplied = Path::new(raw);
     let supplied_is_absolute = supplied.is_absolute();
-    if supplied.components().any(|component| {
-        matches!(component, Component::ParentDir)
-            || (!supplied_is_absolute
-                && matches!(component, Component::Prefix(_) | Component::RootDir))
+    if supplied.components().any(|component| match component {
+        Component::Normal(segment) => segment
+            .to_string_lossy()
+            .chars()
+            .any(|character| matches!(character, '*' | '?')),
+        Component::Prefix(_) | Component::RootDir if !supplied_is_absolute => true,
+        Component::Prefix(_) | Component::RootDir | Component::CurDir | Component::ParentDir => {
+            false
+        }
     }) {
         return Err(PermissionScopeError::UnsafePath);
     }
@@ -234,7 +238,7 @@ pub fn validate_permission_path(sandbox: &Path, raw: &str) -> Result<(), Permiss
     } else {
         canonical_sandbox.join(supplied)
     };
-    validate_candidate_path(&canonical_sandbox, &candidate)
+    validate_candidate_path(&canonical_sandbox, &candidate).map(|_| ())
 }
 
 pub fn validate_exact_permission_path(
@@ -255,15 +259,14 @@ pub fn validate_exact_permission_path(
     validate_permission_path(sandbox, raw)?;
     let canonical_sandbox = canonical_sandbox(sandbox)?;
     let expected = canonical_sandbox.join(expected_relative);
-    validate_candidate_path(&canonical_sandbox, &expected)?;
-    let expected = canonicalize_scope_path(&expected)?;
+    let expected = validate_candidate_path(&canonical_sandbox, &expected)?;
     let supplied = Path::new(raw);
     let candidate = if supplied.is_absolute() {
         supplied.to_path_buf()
     } else {
         canonical_sandbox.join(supplied)
     };
-    let candidate = canonicalize_scope_path(&candidate)?;
+    let candidate = validate_candidate_path(&canonical_sandbox, &candidate)?;
     if candidate == expected {
         Ok(())
     } else {
@@ -288,36 +291,97 @@ fn canonicalize_scope_path(path: &Path) -> Result<PathBuf, PermissionScopeError>
 fn validate_candidate_path(
     canonical_sandbox: &Path,
     candidate: &Path,
-) -> Result<(), PermissionScopeError> {
-    let relative = candidate
-        .strip_prefix(canonical_sandbox)
-        .map_err(|_| PermissionScopeError::UnsafePath)?;
-    let mut current = canonical_sandbox.to_path_buf();
-    for component in relative.components() {
+) -> Result<PathBuf, PermissionScopeError> {
+    reject_existing_link_components(candidate)?;
+    let normalized = lexically_normalize_absolute(candidate)?;
+    let resolved = canonicalize_with_missing_tail(&normalized)?;
+    if resolved.starts_with(canonical_sandbox) {
+        Ok(resolved)
+    } else {
+        Err(PermissionScopeError::UnsafePath)
+    }
+}
+
+fn reject_existing_link_components(path: &Path) -> Result<(), PermissionScopeError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
         match component {
-            Component::Normal(segment) => current.push(segment),
-            Component::CurDir => continue,
-            Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
-                return Err(PermissionScopeError::UnsafePath);
-            }
-        }
-        match fs::symlink_metadata(&current) {
-            Ok(_) => {
-                if crate::platform::path_is_link_or_reparse(&current)
-                    .map_err(|_| PermissionScopeError::UnprovablePath)?
-                {
-                    return Err(PermissionScopeError::UnsafePath);
-                }
-                let canonical = canonicalize_scope_path(&current)?;
-                if !canonical.starts_with(canonical_sandbox) {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !current.pop() {
                     return Err(PermissionScopeError::UnsafePath);
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-            Err(_) => return Err(PermissionScopeError::UnprovablePath),
+            Component::Normal(segment) => {
+                current.push(segment);
+                match fs::symlink_metadata(&current) {
+                    Ok(_) => {
+                        if crate::platform::path_is_link_or_reparse(&current)
+                            .map_err(|_| PermissionScopeError::UnprovablePath)?
+                        {
+                            return Err(PermissionScopeError::UnsafePath);
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => return Err(PermissionScopeError::UnprovablePath),
+                }
+            }
         }
     }
     Ok(())
+}
+
+fn lexically_normalize_absolute(path: &Path) -> Result<PathBuf, PermissionScopeError> {
+    if !path.is_absolute() {
+        return Err(PermissionScopeError::UnprovablePath);
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(PermissionScopeError::UnsafePath);
+                }
+            }
+            Component::Normal(segment) => normalized.push(segment),
+        }
+    }
+    if normalized.is_absolute() {
+        Ok(normalized)
+    } else {
+        Err(PermissionScopeError::UnprovablePath)
+    }
+}
+
+fn canonicalize_with_missing_tail(path: &Path) -> Result<PathBuf, PermissionScopeError> {
+    let mut ancestor = path.to_path_buf();
+    let mut missing_tail = Vec::<OsString>::new();
+    loop {
+        match crate::platform::canonical_permission_path(&ancestor) {
+            Ok(mut canonical) => {
+                for segment in missing_tail.iter().rev() {
+                    canonical.push(segment);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let segment = ancestor
+                    .file_name()
+                    .map(OsString::from)
+                    .ok_or(PermissionScopeError::UnprovablePath)?;
+                missing_tail.push(segment);
+                if !ancestor.pop() {
+                    return Err(PermissionScopeError::UnprovablePath);
+                }
+            }
+            Err(_) => return Err(PermissionScopeError::UnprovablePath),
+        }
+    }
 }
 
 pub fn validate_path_array(sandbox: &Path, value: &Value) -> Result<(), PermissionScopeError> {
@@ -340,7 +404,7 @@ mod tests {
 
     use super::acp::{self, AcpError};
     use super::{
-        validate_exact_permission_path, validate_permission_command,
+        validate_exact_permission_cwd, validate_exact_permission_path, validate_permission_command,
         validate_permission_command_as, validate_permission_path, CleanupIssue, PermissionCommand,
         PermissionScopeError,
     };
@@ -477,6 +541,108 @@ mod tests {
         );
         assert!(matches!(
             validate_exact_permission_path(&sandbox, "other.txt", Path::new("notes.txt")),
+            Err(PermissionScopeError::UnsafePath)
+        ));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exact_permission_path_accepts_a_windows_verbatim_prefix() -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::tempdir()?;
+        let sandbox = temporary.path().join("sandbox");
+        fs::create_dir(&sandbox)?;
+        fs::write(sandbox.join("inside.txt"), b"inside")?;
+        let canonical = platform::permission_path_pattern(&sandbox.join("inside.txt"))?;
+        let verbatim = if let Some(unc) = canonical.strip_prefix(r"\\") {
+            format!(r"\\?\UNC\{unc}")
+        } else {
+            format!(r"\\?\{canonical}")
+        };
+
+        assert!(
+            validate_exact_permission_path(&sandbox, &verbatim, Path::new("inside.txt")).is_ok()
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exact_permission_path_accepts_a_different_drive_letter_case() -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::tempdir()?;
+        let sandbox = temporary.path().join("sandbox");
+        fs::create_dir(&sandbox)?;
+        fs::write(sandbox.join("inside.txt"), b"inside")?;
+        let canonical = platform::permission_path_pattern(&sandbox.join("inside.txt"))?;
+        let drive = canonical
+            .chars()
+            .next()
+            .filter(char::is_ascii_alphabetic)
+            .ok_or("temporary path did not start with a drive letter")?;
+        let changed_drive = if drive.is_ascii_uppercase() {
+            drive.to_ascii_lowercase()
+        } else {
+            drive.to_ascii_uppercase()
+        };
+        let different_case = format!("{changed_drive}{}", &canonical[drive.len_utf8()..]);
+
+        assert!(
+            validate_exact_permission_path(&sandbox, &different_case, Path::new("inside.txt"))
+                .is_ok()
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exact_permission_cwd_accepts_a_trailing_separator() -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::tempdir()?;
+        let sandbox = temporary.path().join("sandbox");
+        fs::create_dir(&sandbox)?;
+        let canonical = platform::permission_path_pattern(&sandbox)?;
+        let with_trailing_separator = format!("{canonical}\\");
+
+        assert!(validate_exact_permission_cwd(&sandbox, &with_trailing_separator).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn exact_permission_path_accepts_safe_dotdot_normalization() -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::tempdir()?;
+        let sandbox = temporary.path().join("sandbox");
+        fs::create_dir(&sandbox)?;
+        fs::create_dir(sandbox.join("nested"))?;
+        fs::write(sandbox.join("inside.txt"), b"inside")?;
+        let equivalent = sandbox
+            .join("nested")
+            .join("..")
+            .join("inside.txt")
+            .to_string_lossy()
+            .into_owned();
+
+        assert!(
+            validate_exact_permission_path(&sandbox, &equivalent, Path::new("inside.txt")).is_ok()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_permission_path_rejects_dotdot_that_escapes_sandbox() -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::tempdir()?;
+        let sandbox = temporary.path().join("sandbox");
+        fs::create_dir(&sandbox)?;
+        fs::write(sandbox.join("inside.txt"), b"inside")?;
+        fs::write(temporary.path().join("outside.txt"), b"outside")?;
+        let escaping = sandbox
+            .join("nested")
+            .join("..")
+            .join("..")
+            .join("outside.txt")
+            .to_string_lossy()
+            .into_owned();
+
+        assert!(matches!(
+            validate_exact_permission_path(&sandbox, &escaping, Path::new("inside.txt")),
             Err(PermissionScopeError::UnsafePath)
         ));
         Ok(())
