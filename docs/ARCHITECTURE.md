@@ -152,6 +152,33 @@ line 54  item/completed  → 同一 itemId，status=completed
 > 这条只有真实报文能揭示。仅看 schema 会得出「审批请求自带上下文」的错误结论，
 > 进而设计出一个在手机上无法渲染的协议。
 
+### 4.2c 拒绝不是错误（`04-permission-deny.jsonl` 实录证据）
+
+批准与拒绝两份 fixture 逐字对比，差异**只在 item 的终态**：
+
+| | approve | deny |
+|---|---|---|
+| 服务端请求 | `item/fileChange/requestApproval` | **形状完全相同** |
+| 客户端响应 | `{"decision":"accept"}` | `{"decision":"decline"}` |
+| `item/completed` 的 `item.status` | `completed` | **`declined`** |
+| `turn/completed` 的 `status` | `completed` | **`completed`**（不是 failed） |
+| `turn.error` | `null` | **`null`** |
+| agent 收场 | — | 一条 `final_answer`：「Unable to modify `editable.txt`: the file-editing operation was rejected, so no files were changed.」 |
+
+**推论（都会写进 `PROTOCOL.md`）**
+
+1. **UACP 绝不能把 deny 映射成 `Error` 事件。** 上游明确把它当正常流程收场
+   （`turn.status=completed`、`error=null`），agent 还会自己解释一句。
+   映射成 `Error` 会在手机上渲染成红色故障，与事实相反
+2. **拒绝的信号是 `item.status = "declined"`**，属于 item 生命周期的终态之一，不是独立事件。
+   因此 `ToolCallEnd` 必须能表达 `completed | declined | failed | …` 一族终态，
+   而不是只有成功/失败两态
+3. **拒绝时 `item/completed` 仍携带完整 `changes[]`（含 `diff`）**，尽管什么都没写盘。
+   手机因此可以显示「你拒绝了这个修改，它本来要写的是 …」——
+   但这也意味着**拒绝路径上的 diff 同样是文件内容**，同样必须走内容寻址存储
+4. `turn/completed` 自带 `itemsView: "summary"` 与该 turn 全部 item 的摘要数组，
+   对断线重连后的状态重建有用，`event.replay` 的设计可以利用它
+
 ### 4.3 日志的落盘格式
 
 - 每会话一个 append-only 文件：`<data_dir>/events/<session_id>.log`
