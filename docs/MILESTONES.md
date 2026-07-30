@@ -9,7 +9,7 @@
 
 | 里程碑 | 目标 | 任务卡 | 结束于门禁 | 状态 |
 |---|---|---|---|---|
-| **M1** | 地基与实测材料 | T-001 ~ T-005 | **G0**【人工】 | 🟡 进行中 |
+| **M1** | 地基与实测材料 | T-001 ~ T-012 | **G0**【人工】 | 🧊 **已冻结**（见下） |
 | **M2** | 协议定稿（**主管亲自产出**，不下发 Codex） | ARCHITECTURE.md / PROTOCOL.md / `kaleido-proto` | **G1**【审核】 | ⚪ 待 M1 |
 | **M3** | hostd + CLI 客户端 + 三家 adapter | 待 M2 后拆 | **G2**【人工】 | ⚪ |
 | **M4** | 传输层 + 配对 + 事件重放 | 待 M3 后拆 | **G3**【人工】 | ⚪ |
@@ -19,6 +19,38 @@
 | **M8** | 安全审查 + 跨平台构建 | 待 M7 后拆 | **G7**【审核】/ **G8**【人工】 | ⚪ |
 
 > 平台顺序（Android 先于 iOS）见 [ADR-0002](adr/0002-android-first.md)。
+
+---
+
+## 🧊 M1 已冻结（2026-07-30）
+
+**冻结理由**：M1 被执行成了「把三家上游的事件形状提取完整」的数据工程，
+结果是 `spikes/` + `xtask/` 累积 **40,105 行 Rust**，而 `crates/` 为空、
+`docs/PROTOCOL.md` 不存在、**产品代码零行**。这是主管的管理错误：
+把 fixture 完整度设成了协议设计的前置门禁，而那 12 个事件变体本身只是
+`REQUIREMENTS §4.5` 里的一个猜测。
+
+**已产出的真实资产（保留，继续使用）**
+
+| 资产 | 价值 |
+|---|---|
+| `tests/fixtures/codex/01,03,04` + `acp-claude/06` + `opencode/08` | 5 份真实报文，证明了 join 语义与 declined 终态（ARCHITECTURE §4.2b/§4.2c） |
+| `schemas/` 三家快照 + `required-surface.toml` + 漂移监控 | 协议设计的类型依据 |
+| `xtask` 的 check-deps / 反模式扫描 A-1~A-11 | 架构纪律的机器强制 |
+| 五层 agent 发现 + Windows `.cmd`/PATHEXT/进程树处理 | **将来 hostd 要用的同一套逻辑** |
+| ADR-0001 ~ 0009 | 九次架构决策，含四次自我纠错 |
+
+**冻结的内容**
+
+- `spikes/kaleido-recorder` **不再接任何任务卡**。它那条环境依赖的红测试
+  （`outside_permission_target_is_rejected_with_redacted_structured_diagnostics`，
+  脱敏规则顺序在 TEMP 位于家目录的机器上会先命中 `<HOME>`）**就让它红着**，
+  并从 `cargo xtask ci` 的默认流程中摘出
+- **T-012 降级为可选工具债**，与产品开发并行，永不阻塞
+- **12×3 覆盖门禁作废**。每家保留三组黄金场景即可：文本 turn / 工具+审批 / 恢复重连。
+  上游没有的能力用 capability 表达并进 `REQUIREMENTS §11` 登记，**不制造覆盖格子**
+
+**唯一仍然欠着的 M1 交付物**：G0 的 20 轮实测。它不依赖任何 agent、沙箱或环境。
 
 ---
 

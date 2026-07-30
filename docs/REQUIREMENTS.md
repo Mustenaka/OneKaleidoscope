@@ -14,6 +14,8 @@
 | [0005 schema 规范化层](adr/0005-schema-normalization-layer.md) | §4.3 / §4.4（生成器选型）、§9 R-4 |
 | [0006 Agent 发现策略](adr/0006-agent-discovery.md) | §4.2（Node 前置、GUI/CLI 双形态）、§9（新增 R-11 / R-12） |
 | [0007 Elicitation 能力位控制](adr/0007-elicitation-capability-gated.md) | §4.5（取代 ADR-0004 P-5） |
+| [0008 版本兼容模型](adr/0008-version-compatibility-model.md) | §4.3 / §4.4、§9 R-4 |
+| **[0009 Session Broker](adr/0009-session-broker.md)** | **§1.1 OBJ-1 恢复完整 + 新增 OBJ-7、§4、§8 门禁改端到端场景、新增 §11。取代 ADR-0003 能力模型** |
 
 ---
 
@@ -29,7 +31,8 @@
 
 | # | 目标 | 可验证的含义 |
 |---|---|---|
-| OBJ-1 | 电脑上跑着 agent 就能远程控制 | 无论 agent 由 CLI 还是 GUI 启动，hostd 都能（A-1）新建会话、（A-2）列出并加载该 agent 会话存储中的历史会话并在其上继续对话。（A-3）实时接管另一个前端进行中的会话仅 OpenCode 支持，其余由 `capabilities()` 声明为不支持。详见 [ADR-0003](adr/0003-agent-attach-semantics.md) |
+| OBJ-1 | 电脑上跑着 agent 就能远程控制 | **完成一次性集成启用后**，由任意表面（CLI / GUI）创建的会话都进入 hostd 管理的共享运行时；手机可实时查看正在进行的 turn（文本/推理增量、工具、计划、diff）、可审批、可 steer 引导、可取消，原生表面同步反映。启用前已存在的会话可查看历史并恢复。见 [ADR-0009](adr/0009-session-broker.md)<br>**上游确无公开路径的部分进 §11 登记，不得据此降级本条** |
+| OBJ-7 | 跨 agent 协作在一个手机端完成 | 同一项目下不同 provider 的会话在手机上归组可见并可切换（例：Claude Code 编排 plan → Codex 执行 → Claude Code 审核）。跨 provider 的**自动化编排引擎**不在 v1，但数据模型不得排除它（[ADR-0009](adr/0009-session-broker.md) D-7） |
 | OBJ-2 | 走协议，不走终端 | 代码中不得出现 ANSI 转义解析、屏幕缓冲区抓取来获取 agent 输出 |
 | OBJ-3 | 对话内容不经过任何第三方 SaaS | 端到端加密；relay 即使被完全攻陷也拿不到明文 |
 | OBJ-4 | PC 端一套代码覆盖三平台 | 单一 Rust workspace，`cargo build` 在 Windows/macOS/Linux 均通过 |
@@ -150,7 +153,19 @@
 
 Adapter 必须通过 `capabilities()` 显式声明自己支持哪些可选能力，UI 依据声明决定按钮是否可见 —— **禁止在 UI 层硬编码 agent 名称做分支判断**。
 
-`AdapterCaps` 必须包含接管能力三级位（ADR-0003）：`create`（恒 true）、`resume`（列出并加载外部创建的历史会话，三家均为 true）、`live_attach`（实时接管进行中的会话，仅 OpenCode 为 true）。
+~~`AdapterCaps` 必须包含接管能力三级位（ADR-0003）~~ —— **已被 [ADR-0009](adr/0009-session-broker.md) D-3 取代。**
+
+能力位按**具体 runtime 实例**协商（不按 agent 名字、不按版本号）：
+
+```
+spawn_owned  resume_persisted  observe_external_live  control_external_live
+simultaneous_multi_client  steer_in_flight  approval
+queue_visibility  plan_visibility
+```
+
+每个会话必须区分 **`history_source`**（历史从哪读）与 **`live_runtime`**（谁在执行、能否订阅与控制）。
+原来的 `resume` / `live_attach` 两个布尔位把这两件事压在了一起，导致「能列出 GUI 创建的历史」
+被反复误读成「接管了 GUI 正在跑的会话」——该压缩作废。
 
 ### 4.2 Claude Code（Tier B）
 
@@ -381,3 +396,24 @@ OneKaleidoscope/
 ├── android/
 └── .github/workflows/
 ```
+
+---
+
+## 11. 上游阻塞登记（[ADR-0009](adr/0009-session-broker.md) D-6）
+
+> **本表的存在意义是：需求永不因实现困难而降级。**
+> 上游确实没有公开路径的能力登记在此，需求条目保持原样。
+> **门禁不得因为登记了阻塞就算通过**，只能标注「该项受 UB-N 阻塞」。
+
+| ID | 缺失能力 | 影响的需求 | 已验证到什么程度 | 当前替代 | 复查触发条件 |
+|---|---|---|---|---|---|
+| **UB-1** | Codex Desktop（GUI）是否连接共享 app-server daemon 未知。若为私有实例，则无法订阅 Desktop 正在进行的 turn | OBJ-1 的 GUI × `observe_external_live` / `control_external_live` | `codex app-server` **已确认**提供 `daemon` 子命令、`proxy`（连接*正在运行的* control socket）、`--listen unix://\|ws://`、capability-token/JWT 鉴权。Desktop 侧行为**未实测** | Broker 覆盖 CLI；Desktop 会话可 `resume_persisted` | T-013 spike 结论；Codex 版本更新 |
+| **UB-2** | Claude Code 官方 `/remote-control` 的第三方客户端协议未公开，对端是厂商服务端 | OBJ-1 中「既存 Claude GUI/CLI 会话」的实时接管 | 官方文档确认该功能存在且面向 Anthropic 自有 Web/App | hostd 经 Agent SDK / `claude-agent-acp` 拥有的会话可完整实时（`spawn_owned` + `simultaneous_multi_client`） | 上游公开第三方接入协议 |
+| **UB-3** | Codex 快照中不存在 `subagent/*`（0 命中），无法表达 Codex 侧子 agent 树 | 跨 agent 编排（OBJ-7）的细粒度呈现 | 已对 `schemas/codex/` 0.146.0 逐条 grep | 用 `turn/plan/updated` 表达任务/计划层级 | Codex 新增该方法族 |
+| **UB-4** | ACP v1 无 elicitation（0 命中） | `Elicitation` 变体在 Claude Code 路径不可用 | 已对 `schemas/acp/schema.json` grep 验证，见 [ADR-0007](adr/0007-elicitation-capability-gated.md) | `caps.elicitation` 能力位关闭 | ACP v2 转 stable |
+
+### 登记纪律
+
+1. 进入本表前**必须有实测证据**，不许凭文档推断（教训见 ADR-0007 §主管的自我复盘）
+2. 每条必须写明**复查触发条件**，不许无限期挂着
+3. 上游一旦补齐，**立即销号并恢复对应门禁格**

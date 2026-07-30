@@ -1,6 +1,12 @@
 # ADR-0003: OBJ-1「接管」的三级语义
 
-- 状态：**已接受**（2026-07-28）
+- 状态：**已被取代**（2026-07-30）—— 能力模型由 [ADR-0009](0009-session-broker.md) D-2/D-3 取代
+- 保留价值：本文档的**一手核实证据**（三家的会话存储位置、`session/load` 会重放历史、
+  `claude-agent-acp` 与 CLI/GUI 共用 `~/.claude/projects`）仍然有效，继续引用
+- 作废部分：`A-1 create / A-2 resume / A-3 live_attach` 三位制。它把
+  「能列出历史」与「能接管正在跑的 turn」压成了同一维度，并据此**软化了 OBJ-1** ——
+  那是拿需求迁就实现，ADR-0009 §1 已明确认定为本项目至今最严重的管理错误
+- 原状态：已接受（2026-07-28）
 - 决策人：项目负责人
 - 起草：项目主管
 - 影响：`docs/REQUIREMENTS.md` §1.1 OBJ-1、§4.5 `AgentAdapter` trait、`docs/PROTOCOL.md` 能力协商
