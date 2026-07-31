@@ -34,7 +34,7 @@ It stops at the first failure and runs, in this order:
 2. the architecture dependency guard
 3. the repository antipattern scanner
 4. `cargo clippy --all-targets -- -D warnings`
-5. `cargo test --workspace`
+5. `cargo test --workspace --exclude kaleido-recorder`
 6. fixture schema and leak verification
 
 Each gate can also be run independently:
@@ -46,6 +46,15 @@ cargo xtask lint-forbidden
 cargo xtask clippy
 cargo xtask test
 cargo xtask fixtures verify
+```
+
+`kaleido-recorder` is a frozen Windows research spike and is excluded from the
+CI behavior-test scope by ADR-0016. Its committed fixtures remain covered by
+`cargo xtask fixtures verify` on every platform, and the spike remains covered
+by workspace clippy. This is a local Windows regression check, not a CI gate:
+
+```text
+cargo test -p kaleido-recorder
 ```
 
 ## R1 UniFFI binding probe

@@ -252,31 +252,19 @@ fn run_cargo_step_in_target(
 #[derive(Debug, Eq, PartialEq)]
 struct TestScope {
     arguments: &'static [&'static str],
-    exclusion_notice: Option<&'static str>,
+    exclusion_notice: &'static str,
 }
 
 fn test_scope() -> TestScope {
-    #[cfg(windows)]
-    {
-        TestScope {
-            arguments: &["test", "--workspace"],
-            exclusion_notice: None,
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        TestScope {
-            arguments: &["test", "--workspace", "--exclude", "kaleido-recorder"],
-            exclusion_notice: Some("test: kaleido-recorder excluded on this platform (ADR-0015)"),
-        }
+    TestScope {
+        arguments: &["test", "--workspace", "--exclude", "kaleido-recorder"],
+        exclusion_notice: "test: kaleido-recorder excluded on all platforms (ADR-0016)",
     }
 }
 
 fn run_test_step(root: &Path, target: Option<&Path>) -> Result<(), XtaskError> {
     let scope = test_scope();
-    if let Some(notice) = scope.exclusion_notice {
-        println!("{notice}");
-    }
+    println!("{}", scope.exclusion_notice);
     run_cargo_step_with_target(root, target, "test", scope.arguments)
 }
 
@@ -353,28 +341,13 @@ fn announce(step: &str) -> Result<(), XtaskError> {
 mod tests {
     use super::{test_scope, TestScope};
 
-    #[cfg(windows)]
     #[test]
-    fn windows_test_scope_does_not_exclude_the_recorder() {
+    fn test_scope_excludes_the_recorder_on_all_platforms_with_an_explicit_notice() {
         assert_eq!(
             test_scope(),
             TestScope {
-                arguments: &["test", "--workspace"],
-                exclusion_notice: None,
-            }
-        );
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn non_windows_test_scope_excludes_the_recorder_with_an_explicit_notice() {
-        assert_eq!(
-            test_scope(),
-            TestScope {
-                arguments: &["test", "--workspace", "--exclude", "kaleido-recorder",],
-                exclusion_notice: Some(
-                    "test: kaleido-recorder excluded on this platform (ADR-0015)",
-                ),
+                arguments: &["test", "--workspace", "--exclude", "kaleido-recorder"],
+                exclusion_notice: "test: kaleido-recorder excluded on all platforms (ADR-0016)",
             }
         );
     }

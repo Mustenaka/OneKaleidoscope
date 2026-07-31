@@ -566,6 +566,121 @@ fn sandbox_dot_segment_traversal_is_rejected_for_both_separators() -> TestResult
 }
 
 #[test]
+fn single_leading_backslash_root_outside_sandbox_is_reported_as_a_leak() -> TestResult {
+    let root = tempdir()?;
+    let fixtures = root.path().join("tests/fixtures");
+    let sandbox = PathBuf::from(r"\kaleido-t102-sandbox");
+    let request = serde_json::json!({
+        "ts_ms": 0,
+        "dir": "c2s",
+        "transport": "http",
+        "payload": {
+            "method": "GET",
+            "path": "/global/health",
+            "status": null,
+            "content_type": "application/json",
+            "body": null
+        }
+    });
+    let response = serde_json::json!({
+        "ts_ms": 1,
+        "dir": "s2c",
+        "transport": "http",
+        "payload": {
+            "method": "GET",
+            "path": "/global/health",
+            "status": 200,
+            "content_type": "application/json",
+            "body": {
+                "healthy": true,
+                "version": r"open(\foo\secret.txt)"
+            }
+        }
+    });
+    write_fixture(
+        &fixtures,
+        "opencode/single-backslash-root.jsonl",
+        &format!(
+            "{}\n{}\n",
+            serde_json::to_string(&request)?,
+            serde_json::to_string(&response)?
+        ),
+    )?;
+
+    let error = verification_error(
+        verify_paths(
+            &fixtures,
+            &repository_schemas()?,
+            &sandbox,
+            &Identity::default(),
+        ),
+        "the rooted backslash path must be rejected",
+    )?;
+
+    assert!(error.issues().iter().any(|issue| {
+        issue.line == 2
+            && issue.category == "leak: absolute path outside fixture sandbox"
+            && issue.pointer.as_deref() == Some("/payload/body/version")
+    }));
+    Ok(())
+}
+
+#[test]
+fn single_leading_backslash_root_inside_sandbox_is_not_reported() -> TestResult {
+    let root = tempdir()?;
+    let fixtures = root.path().join("tests/fixtures");
+    let sandbox = PathBuf::from(r"\kaleido-t102-sandbox");
+    let request = serde_json::json!({
+        "ts_ms": 0,
+        "dir": "c2s",
+        "transport": "http",
+        "payload": {
+            "method": "GET",
+            "path": "/global/health",
+            "status": null,
+            "content_type": "application/json",
+            "body": null
+        }
+    });
+    let response = serde_json::json!({
+        "ts_ms": 1,
+        "dir": "s2c",
+        "transport": "http",
+        "payload": {
+            "method": "GET",
+            "path": "/global/health",
+            "status": 200,
+            "content_type": "application/json",
+            "body": {
+                "healthy": true,
+                "version": r"\kaleido-t102-sandbox\safe-\inside.txt"
+            }
+        }
+    });
+    write_fixture(
+        &fixtures,
+        "opencode/single-backslash-inside.jsonl",
+        &format!(
+            "{}\n{}\n",
+            serde_json::to_string(&request)?,
+            serde_json::to_string(&response)?
+        ),
+    )?;
+
+    let summary = verify_paths(
+        &fixtures,
+        &repository_schemas()?,
+        &sandbox,
+        &Identity::default(),
+    )?;
+
+    assert_eq!(summary.files, 1);
+    assert_eq!(summary.records, 2);
+    assert_eq!(summary.opencode_files, 1);
+    Ok(())
+}
+
+#[test]
 fn unix_sandbox_comparison_remains_case_sensitive() -> TestResult {
     let root = tempdir()?;
     let fixtures = root.path().join("tests/fixtures");

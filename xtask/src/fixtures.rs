@@ -953,11 +953,13 @@ fn absolute_path_candidates(text: &str) -> Vec<String> {
     let trimmed = text.trim();
     if is_windows_drive_absolute(trimmed)
         || is_unc_absolute(trimmed)
+        || is_windows_root_absolute(trimmed)
         || (!trimmed.chars().any(char::is_whitespace) && is_unix_absolute_with_segments(trimmed, 1))
     {
         candidates.insert(trimmed.to_owned());
     }
 
+    let mut recognized_path_end = 0_usize;
     for (index, character) in text.char_indices() {
         if !path_start_boundary(text, index) {
             continue;
@@ -967,12 +969,17 @@ fn absolute_path_candidates(text: &str) -> Vec<String> {
         };
         let windows = character.is_ascii_alphabetic() && is_windows_drive_absolute(candidate);
         let unc = character == '\\' && is_unc_absolute(candidate);
+        let windows_root = character == '\\'
+            && is_windows_root_absolute(candidate)
+            && !is_json_escape_at(text, index)
+            && index >= recognized_path_end;
         let unix = character == '/'
             && (is_unix_absolute_with_segments(candidate, 2)
                 || (is_unix_absolute_with_segments(candidate, 1)
                     && single_segment_unix_path_context(text, index, candidate)));
-        if windows || unc || unix {
+        if windows || unc || windows_root || unix {
             candidates.insert(candidate.to_owned());
+            recognized_path_end = recognized_path_end.max(index.saturating_add(candidate.len()));
         }
     }
     candidates.into_iter().collect()
@@ -1043,6 +1050,37 @@ fn is_windows_drive_absolute(candidate: &str) -> bool {
 
 fn is_unc_absolute(candidate: &str) -> bool {
     candidate.starts_with(r"\\")
+}
+
+fn is_windows_root_absolute(candidate: &str) -> bool {
+    candidate.starts_with('\\') && !is_unc_absolute(candidate)
+}
+
+fn is_json_escape_at(text: &str, index: usize) -> bool {
+    let Some(next) = text
+        .get(index.saturating_add(1)..)
+        .and_then(|tail| tail.chars().next())
+    else {
+        return false;
+    };
+    if !matches!(next, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u') {
+        return false;
+    }
+    let Some(prefix) = text.get(..index) else {
+        return false;
+    };
+    let mut in_string = false;
+    let mut escaped = false;
+    for character in prefix.chars() {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' && in_string {
+            escaped = true;
+        } else if character == '"' {
+            in_string = !in_string;
+        }
+    }
+    in_string
 }
 
 fn is_unix_absolute_with_segments(candidate: &str, minimum_segments: usize) -> bool {
