@@ -1,0 +1,26 @@
+# NOTE: `cargo xtask check-deps` parses `crates/*/Cargo.toml` with its own
+# reader, which rejects dotted keys such as `edition.workspace = true`. Use the
+# equivalent inline-table form below in every crate under `crates/`.
+[package]
+name = "kaleido-proto"
+version = "0.1.0"
+edition = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+publish = false
+
+[features]
+default = []
+uniffi = ["dep:uniffi"]
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+uniffi = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

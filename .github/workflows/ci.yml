@@ -32,5 +32,67 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
 
+      - name: Set up JDK 22 for Kotlin probe
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '22'
+
+      - name: Set up Gradle 8.14 for Kotlin probe
+        if: matrix.os == 'ubuntu-latest'
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.14'
+
       - name: Run repository checks
         run: cargo xtask ci
+
+      - name: Compile Kotlin UniFFI consumer probe
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          java --version
+          gradle --version
+          cargo build --locked -p kaleido-core --lib
+          cargo run --locked -p kaleido-core --bin uniffi-bindgen -- \
+            generate --language kotlin \
+            --out-dir target/uniffi/kotlin \
+            target/debug/libkaleido_core.so
+          gradle \
+            --project-dir crates/kaleido-core/bindings/kotlin-probe \
+            --no-daemon \
+            --console=plain \
+            compileKotlin
+
+      - name: Compile Swift UniFFI consumer probe
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          swiftc --version
+          cargo build --locked -p kaleido-core --lib
+          cargo run --locked -p kaleido-core --bin uniffi-bindgen -- \
+            generate --language swift \
+            --out-dir target/uniffi/swift \
+            target/debug/libkaleido_core.dylib
+
+          swift_out="$PWD/target/uniffi/swift"
+          swiftc \
+            -swift-version 5 \
+            -parse-as-library \
+            -emit-library \
+            -emit-module \
+            -module-name KaleidoCoreProbe \
+            -emit-module-path "$swift_out/KaleidoCoreProbe.swiftmodule" \
+            -I "$swift_out" \
+            -L "$PWD/target/debug" \
+            -lkaleido_core \
+            -Xcc "-fmodule-map-file=$swift_out/kaleido_coreFFI.modulemap" \
+            -Xcc "-fmodule-map-file=$swift_out/kaleido_protoFFI.modulemap" \
+            "$swift_out/kaleido_proto.swift" \
+            "$swift_out/kaleido_core.swift" \
+            "$PWD/crates/kaleido-core/bindings/swift-probe/Probe.swift" \
+            -o "$swift_out/libKaleidoCoreProbe.dylib"
+          test -s "$swift_out/libKaleidoCoreProbe.dylib"

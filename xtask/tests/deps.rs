@@ -66,10 +66,11 @@ fn violations(error: &DependencyCheckError) -> &[Violation] {
 }
 
 #[test]
-fn repository_rules_declare_the_complete_ten_crate_matrix() {
+fn repository_rules_declare_the_complete_eleven_crate_matrix() {
     let rules = parse_rules(REPOSITORY_RULES).expect("repository rules must parse");
     let expected = BTreeSet::from([
         "kaleido-proto",
+        "kaleido-state",
         "kaleido-adapter",
         "kaleido-adapter-codex",
         "kaleido-adapter-acp",
@@ -111,7 +112,12 @@ fn repository_rules_declare_the_complete_ten_crate_matrix() {
             .get("kaleido-core")
             .expect("core rule must exist")
             .may_depend_on,
-        ["kaleido-proto", "kaleido-adapter", "kaleido-transport"]
+        [
+            "kaleido-proto",
+            "kaleido-state",
+            "kaleido-adapter",
+            "kaleido-transport",
+        ]
     );
     for (crate_name, rule) in &rules.crates {
         if rule

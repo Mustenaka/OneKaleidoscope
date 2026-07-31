@@ -56,6 +56,9 @@ deny_dependencies = [
     "walkdir",
 ]
 
+[crates."kaleido-state"]
+may_depend_on = ["kaleido-proto"]
+
 [crates."kaleido-adapter"]
 may_depend_on = ["kaleido-proto"]
 
@@ -72,11 +75,17 @@ may_depend_on = ["kaleido-proto", "kaleido-adapter"]
 may_depend_on = ["kaleido-proto"]
 
 [crates."kaleido-core"]
-may_depend_on = ["kaleido-proto", "kaleido-adapter", "kaleido-transport"]
+may_depend_on = [
+    "kaleido-proto",
+    "kaleido-state",
+    "kaleido-adapter",
+    "kaleido-transport",
+]
 
 [crates."kaleido-hostd"]
 may_depend_on = [
     "kaleido-proto",
+    "kaleido-state",
     "kaleido-adapter",
     "kaleido-adapter-*",
     "kaleido-core",

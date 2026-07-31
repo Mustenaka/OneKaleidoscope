@@ -2603,6 +2603,8 @@ mod tests {
     use std::error::Error;
     use std::{fs, io};
 
+    use directories::BaseDirs;
+
     use super::*;
 
     #[test]
@@ -3725,8 +3727,28 @@ mod tests {
         assert!(diagnostic.contains("\"status\": \"FAIL\""));
         assert!(diagnostic.contains("\"failed_item\": \"correlated_lifecycle\""));
         assert!(diagnostic.contains("<SANDBOX>"));
-        assert!(diagnostic.contains("<OUTSIDE_PATH>"));
-        assert!(!diagnostic.contains(&temporary.path().to_string_lossy().into_owned()));
+        assert!(
+            diagnostic.contains("<OUTSIDE_PATH>") || diagnostic.contains("<HOME>"),
+            "outside target was not replaced by an approved deterministic placeholder"
+        );
+
+        let diagnostic_lower = diagnostic.to_ascii_lowercase();
+        assert!(!diagnostic_lower.contains(&outside_text.to_ascii_lowercase()));
+        assert!(
+            !diagnostic_lower.contains(&temporary.path().to_string_lossy().to_ascii_lowercase())
+        );
+        if let Some(username) = std::env::var_os("USERNAME").or_else(|| std::env::var_os("USER")) {
+            let username = username.to_string_lossy().to_ascii_lowercase();
+            if !username.is_empty() {
+                assert!(!diagnostic_lower.contains(&username));
+            }
+        }
+        if let Some(base_dirs) = BaseDirs::new() {
+            let home = base_dirs.home_dir().to_string_lossy().to_ascii_lowercase();
+            for home_variant in [home.replace('\\', "/"), home.replace('/', "\\")] {
+                assert!(!diagnostic_lower.contains(&home_variant));
+            }
+        }
         assert!(io.outgoing.is_empty());
         Ok(())
     }

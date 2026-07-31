@@ -4,9 +4,14 @@
 > 架构与协议由项目主管（Claude Code）定义，你负责把任务卡变成可运行、可验证的代码。
 > 你的交付会被逐条审核。**糊弄测试是本项目最严重的违规。**
 >
-> **当前暂停（2026-07-30）**：先读 `docs/STATUS.md`。T-001～T-013 已冻结，
-> T-014 已撤销；在 `docs/PROTOCOL.md`、`crates/kaleido-proto` 和 T-100+ 新任务卡同时存在前，
-> 不得开始产品代码。下文旧版本/工具示例不能覆盖新任务的合同。
+> **当前状态（2026-07-31，T-100 门禁评审后更新）**：先读 `docs/STATUS.md`。
+> `docs/PROTOCOL.md` 与 `crates/kaleido-proto` 是**正式合同**。
+> **R2 已完成**：`docs/tasks/T-100.md` 两阶段均通过，四个 crate 已在真实 Codex 0.146.0
+> 上取得一手证据（`docs/gates/T-100-result.md`）。
+> **当前活动任务是 `docs/tasks/T-102.md`。**
+> T-001～T-013 已冻结，T-014 已撤销，T-101 已作废。
+> 下文旧版本/工具示例不能覆盖新任务卡的合同；特别注意 §3.2 的 Codex 一栏已被
+> `docs/adr/0012-provider-decode-strategy.md` 取代。
 
 ---
 
@@ -70,7 +75,7 @@ Agent 的输出必须来自其结构化协议（ACP / JSON-RPC / HTTP+SSE）。
 
 | 来源 | 工具 |
 |---|---|
-| Codex app-server | `codex app-server generate-json-schema` → 规范化层 → 生成器（**首选候选** `typify`，最终以 T-005 结论为准） |
+| Codex app-server | **不生成。** 按 [ADR-0012](docs/adr/0012-provider-decode-strategy.md) 用钉定 JSON Pointer 表解码，并由 `schemas/required-surface.toml` 归属 + 快照可解析性测试守卫漂移。既不生成也不手写上游类型 |
 | OpenCode | `/doc` 的 OpenAPI 3.1 → 规范化层 → 生成器（**首选候选** `progenitor`，但它只支持 3.0.x，见下） |
 | ACP | 官方 `agent-client-protocol` crate，钉定 **1.3.0**（协议 v1） |
 | 移动端绑定 | `kaleido-core` → UniFFI → Swift / Kotlin |

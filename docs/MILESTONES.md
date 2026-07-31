@@ -1,7 +1,9 @@
 # MILESTONES — 重新定基线后的实施顺序
 
-> 生效：2026-07-30
-> 原 M1 与 T-001～T-014 已冻结。当前没有授权执行的产品代码任务。
+> 生效：2026-07-30（R1 主管评审后更新）
+> 原 M1 与 T-001～T-014 已冻结/撤销。R1 **有条件通过**（携带 UB-R1-S）；
+> [T-100](tasks/T-100.md) 已 active，R2 开工。平台顺序见
+> [ADR-0013](adr/0013-platform-track-order.md)：Windows + Android 先行。
 
 ## 总原则
 
@@ -22,24 +24,38 @@
 
 ## R1 — 合同定稿（项目主管负责）
 
+状态：**有条件通过（携带 UB-R1-S），2026-07-30 主管评审**。验收记录见
+[R1-result.md](gates/R1-result.md) §0。协议、proto、Kotlin 编译与 workspace 基线已恢复
+并经主管独立复跑与变异复验；Swift 绑定已生成，但当前 Windows/WSL 环境没有 Swift 编译器。
+
+按 [ADR-0013](adr/0013-platform-track-order.md) D-2，原「移动端双端编译」门禁拆为：
+
+- **R1-K**（Kotlin 编译）：通过；
+- **R1-S**（Swift 编译）：未通过，登记 **UB-R1-S**，**携带至 R8 作为硬前置**，
+  解除路径是 [T-102](tasks/T-102.md) 在已有 `macos-latest` CI job 上的真实编译。
+
 产出：
 
 - `docs/PROTOCOL.md`；
 - `crates/kaleido-proto`；
 - canonical state、command、projection、cursor、capability、workflow 合同；
 - Swift/Kotlin 的最小 UniFFI 编译探针；
-- T-100 起的新任务卡。
+- T-100 起的新任务卡（R1 未通过时保持 blocked）。
 
 门禁：
 
-- 合同能表达项目索引、历史、活动会话、队列、Attention Inbox、工作流；
-- 明确 queue 与 steer、history 与 live、decline 与 error；
-- 用现有真实 fixture 验证至少两个 reducer 难点，但不要求补齐矩阵；
-- 移动端绑定对最小真实类型编译通过。
+- 合同能表达项目索引、历史、活动会话、队列、Attention Inbox、工作流 —— 通过；
+- 明确 queue 与 steer、history 与 live、decline 与 error —— 通过；
+- 用现有真实 fixture 验证至少两个 reducer 难点，但不要求补齐矩阵 —— 通过（三个）；
+- 移动端绑定对最小真实类型编译通过 —— Kotlin 通过；Swift 见 UB-R1-S。
 
 禁止：在 R1 前恢复 T-014 或创建 adapter 自有临时全局模型。
 
 ## R2 — 单 Provider 本地纵切
+
+状态：**已完成，2026-07-31**。任务卡 [T-100](tasks/T-100.md)，两阶段交付均通过。
+门禁结果见 [T-100-result.md](gates/T-100-result.md)，阶段 A 评审见
+[T-100-stage-a-review.md](gates/T-100-stage-a-review.md)。
 
 优先以 Codex Broker 管理的 app-server 会话完成：
 
@@ -60,6 +76,16 @@ provider → reducer → canonical state → durable log → Rust diagnostic cli
 这一步只做一个 provider，证明架构纵切；不先并排写三套 adapter。
 
 ## R3 — Android 局域网纵切
+
+**入口前置（三条，都必须先解除）：**
+
+| ID | 内容 | 为什么必须先解除 |
+|---|---|---|
+| G-R1-1 | UniFFI 的 callback / object / async / throwing 面未探针 | 决定投影能不能推送到手机，是 [ARCHITECTURE](ARCHITECTURE.md) §9 的模块边界问题，不是 UI 细节。见 [T-102](tasks/T-102.md) §5.2 |
+| P-1 | `AttentionState::Answered` 无法表达「观察到的外部应答」 | 手机会按 `command_id` 回查，现在那个 ID 可能指不到任何命令。见 [ADR-0014](adr/0014-codex-approval-families-and-timestamp-units.md) D-3 |
+| D-B1 | `LiveControl` 结构性不可达，`LiveBinding::Controlling` 永远到不了 | 手机靠它判断「我能不能干预」，不解决就永远渲染成只读。见 [T-100-result.md](gates/T-100-result.md) §4 |
+
+P-1 与 D-B1 都要改 `kaleido-proto` 或协议，必须由主管单独开卡授权，不得夹带进别的卡。
 
 产出最小 hostd + Android App：
 
@@ -120,6 +146,9 @@ NAT 20 轮测试属于性能与容量数据，不再决定 relay 是否开发，
 本里程碑可与 R3～R6 的 provider 工作并行研究，但 v1 最终验收不能跳过。
 
 ## R8 — iOS 对齐
+
+**入口前置：UB-R1-S 必须先解除**（[ADR-0013](adr/0013-platform-track-order.md) D-2、
+[T-102](tasks/T-102.md) §5.1）。R1 携带的 Swift 编译门禁在这里结清，不得跳过。
 
 在 Android 核心交互稳定后对齐 iOS：
 

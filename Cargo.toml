@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["spikes/*", "xtask"]
+members = ["crates/*", "spikes/*", "xtask"]
 
 [workspace.package]
 edition = "2021"
@@ -15,6 +15,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uniffi = "=0.32.0"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

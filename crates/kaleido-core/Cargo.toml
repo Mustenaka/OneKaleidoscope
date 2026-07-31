@@ -1,0 +1,24 @@
+# NOTE: `cargo xtask check-deps` does not accept dotted workspace keys.
+[package]
+name = "kaleido-core"
+version = "0.1.0"
+edition = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+publish = false
+
+[lib]
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+kaleido-proto = { path = "../kaleido-proto", features = ["uniffi"] }
+thiserror = { workspace = true }
+uniffi = { workspace = true, features = ["cli"] }
+
+[lints]
+workspace = true

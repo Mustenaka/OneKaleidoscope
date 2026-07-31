@@ -1,8 +1,8 @@
 # Development
 
-> Current phase: documentation and protocol rebaseline. There is no active
-> production-code task. See `docs/STATUS.md` and `docs/tasks/README.md` before
-> using the instructions below.
+> Current phase: R2 is complete (`docs/gates/T-100-result.md`). The active task is
+> `docs/tasks/T-102.md`, which must land before R3. See `docs/STATUS.md` and
+> `docs/tasks/README.md` before using the instructions below.
 
 ## Rust toolchain
 
@@ -47,6 +47,80 @@ cargo xtask clippy
 cargo xtask test
 cargo xtask fixtures verify
 ```
+
+## R1 UniFFI binding probe
+
+`kaleido-core` is a binding-only façade. Its exported probes use the actual
+`kaleido-proto` command, error, state-effect and projection types; there is no
+second DTO layer. UniFFI is pinned to `0.32.0`.
+
+T-102 extends the original record round-trip with the mobile call shapes:
+
+- `ProjectionProbeCallback` is implemented by Kotlin or Swift and called by
+  Rust with `ProjectionEnvelope` and `CanonicalError`;
+- `ProjectionSubscriptionProbe` owns that callback between `subscribe` and
+  `unsubscribe`;
+- `fallible_binding_probe` throws `BindingProbeError`, whose payload is the
+  canonical `CanonicalError`;
+- `async_binding_probe` asynchronously returns a canonical `CommandAck`.
+
+These exports contain no session, projection, or storage implementation. They
+only force Rust, UniFFI, Kotlin, and Swift to agree on the intended API shape.
+
+Generate both language bindings after building the dynamic library:
+
+```text
+cargo build -p kaleido-core --lib
+cargo run -p kaleido-core --bin uniffi-bindgen -- generate --language kotlin --out-dir target/uniffi/kotlin target/debug/kaleido_core.dll
+cargo run -p kaleido-core --bin uniffi-bindgen -- generate --language swift --out-dir target/uniffi/swift target/debug/kaleido_core.dll
+```
+
+On non-Windows platforms, replace the final library path with that platform's
+`cdylib` filename. Generated sources stay under ignored `target/`.
+
+The Kotlin consumer probe is in
+`crates/kaleido-core/bindings/kotlin-probe`; compile it with Gradle 8.14:
+
+```text
+gradle --project-dir crates/kaleido-core/bindings/kotlin-probe --no-daemon --console=plain compileKotlin
+```
+
+It uses Kotlin JVM plugin `2.2.20`, kotlinx.coroutines `1.11.0` for UniFFI's
+generated async bridge, JNA `5.19.1`, and JDK 22.
+
+The Swift probe is
+`crates/kaleido-core/bindings/swift-probe/Probe.swift`. On macOS, compile and
+link it together with both generated Swift sources and both generated FFI
+modules:
+
+```bash
+swiftc --version
+cargo build --locked -p kaleido-core --lib
+cargo run --locked -p kaleido-core --bin uniffi-bindgen -- \
+  generate --language swift \
+  --out-dir target/uniffi/swift \
+  target/debug/libkaleido_core.dylib
+
+swift_out="$PWD/target/uniffi/swift"
+swiftc -swift-version 5 -parse-as-library \
+  -emit-library -emit-module \
+  -module-name KaleidoCoreProbe \
+  -emit-module-path "$swift_out/KaleidoCoreProbe.swiftmodule" \
+  -I "$swift_out" \
+  -L "$PWD/target/debug" \
+  -lkaleido_core \
+  -Xcc "-fmodule-map-file=$swift_out/kaleido_coreFFI.modulemap" \
+  -Xcc "-fmodule-map-file=$swift_out/kaleido_protoFFI.modulemap" \
+  "$swift_out/kaleido_proto.swift" \
+  "$swift_out/kaleido_core.swift" \
+  "$PWD/crates/kaleido-core/bindings/swift-probe/Probe.swift" \
+  -o "$swift_out/libKaleidoCoreProbe.dylib"
+test -s "$swift_out/libKaleidoCoreProbe.dylib"
+```
+
+The CI workflow runs the Kotlin compile gate only on `ubuntu-latest` and the
+Swift compile-and-link gate only on `macos-latest`; both are hard failures.
+Binding generation alone is not compilation evidence.
 
 `cargo xtask fmt` is a formatting check; it does not rewrite files. To format
 code before running the gates, use `cargo fmt --all`.
@@ -97,6 +171,17 @@ The text after `reason:` must be non-empty. The scanner prints the number of
 effective A-2 exemptions on every run so growth is visible in CI. This is the
 only antipattern exemption: A-1 ANSI/terminal parsing, A-4 upstream
 discriminators in UACP, and A-6 handwritten upstream types cannot be exempted.
+
+## Redaction scans need their own test binary
+
+`tracing` caches call-site interest process-wide: a call site first reached while
+no subscriber is installed stays disabled for the rest of the process. A section
+10 redaction scan that shares a binary with tests which run without a subscriber
+would therefore capture an empty buffer and pass for the wrong reason.
+
+`crates/kaleido-hostd/tests/tracing_redaction.rs` is a separate test binary for
+this reason, and it asserts that the capture is non-empty before asserting what
+is absent from it. Do not merge it into another test file.
 
 ## Test-only lint allowances
 

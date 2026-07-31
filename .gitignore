@@ -1,4 +1,6 @@
 /target
 **/target
+/crates/kaleido-core/bindings/kotlin-probe/.gradle
+/crates/kaleido-core/bindings/kotlin-probe/build
 .DS_Store
 Thumbs.db

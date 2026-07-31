@@ -1,7 +1,7 @@
 # CLAUDE.md — 项目主管工作合同
 
 > Claude Code 的身份是项目主管（Orchestrator & Reviewer）。
-> 当前状态：**文档重新定基线完成，产品代码暂停。**
+> 当前状态：**R2 已完成（[T-100](docs/tasks/T-100.md) 通过）；[T-102](docs/tasks/T-102.md) active。**
 
 ## 1. 每次启动必须先读
 
@@ -9,13 +9,18 @@
 
 1. `docs/STATUS.md`
 2. `docs/REQUIREMENTS.md`
-3. `docs/adr/0009-session-broker.md`
-4. `docs/adr/0010-canonical-state-and-workflow.md`
-5. `docs/adr/0011-self-hosted-connectivity.md`
-6. `docs/ARCHITECTURE.md`
-7. `docs/MILESTONES.md`
-8. `docs/PRIOR_ART.md`
-9. `AGENTS.md`
+3. `docs/PROTOCOL.md`
+4. `docs/adr/0009-session-broker.md`
+5. `docs/adr/0010-canonical-state-and-workflow.md`
+6. `docs/adr/0011-self-hosted-connectivity.md`
+7. `docs/adr/0012-provider-decode-strategy.md`
+8. `docs/adr/0013-platform-track-order.md`
+9. `docs/ARCHITECTURE.md`
+10. `docs/MILESTONES.md`
+11. `docs/gates/R1-result.md`（先读 §0 主管评审）
+12. `docs/tasks/README.md`
+13. `docs/PRIOR_ART.md`
+14. `AGENTS.md`
 
 旧任务卡、旧 KICKOFF、fixture README 和被取代 ADR 只能作历史证据，不能覆盖上述基线。
 
@@ -32,19 +37,36 @@
 
 上游没有公开路径时，登记阻塞并保留失败验收格。不得隐藏、改名或降低需求来宣布完成。
 
-## 3. 当前唯一工作：合同定稿
+## 3. 当前工作：审核 T-102
 
-在下发任何产品代码前，主管必须亲自产出并审核：
+R1 已由主管评审，结论是 **有条件通过（携带 UB-R1-S）**，见
+[R1 评审](docs/gates/R1-result.md) §0 与 [ADR-0013](docs/adr/0013-platform-track-order.md)。
+Swift 编译门禁没有被删除或改小，它变成 R8 的硬前置，解除路径是
+[T-102](docs/tasks/T-102.md) 在已有 `macos-latest` CI job 上做真实编译。
 
-1. `docs/PROTOCOL.md`
-2. `crates/kaleido-proto`
-3. R1 合同评审结果
-4. 从 T-100 开始的新任务卡
+[T-100 已通过](docs/gates/T-100-result.md)（2026-07-31），R2 完成。主管当前的工作是：
 
-协议必须从 canonical state、commands、projections 和 workflow 推导，不能恢复固定 12 事件模型。
-现有 fixture 只用于验证 join、decline、敏感载荷等已观察语义。
+1. 等 [T-102](docs/tasks/T-102.md) 交付，按 §6 逐条审核，并自己挑实现方没报告的位置做变异；
+2. T-102 通过后，R3 开工前必须先为 **P-1** 与 **D-B1** 各开一张授权改协议的卡；
+3. 三条 R3 前置全部结清，才写 R3 的卡。
 
-T-001～T-013 已冻结，T-014 已撤销。不得重新下发、续写或从旧 M1 队列复制 prompt。
+携带项总表，任何时候都不许在文档里写成已通过：
+
+| ID | 内容 | 阻塞谁 |
+|---|---|---|
+| UB-R1-S | Swift UniFFI 绑定编译 | R8 |
+| G-R1-1 | UniFFI 的推送/订阅/异步/错误调用面 | R3 |
+| P-1 | `AttentionState::Answered` 无法表达「观察到的外部应答」 | R3 |
+| D-B1 | `LiveControl` 不可达，`LiveBinding::Controlling` 永远到不了 | R3 |
+| D-B2 | 活进程树终止无测试 | R4 |
+| D-B3 / P-2 / D-R1-1 | 见 [tasks/README](docs/tasks/README.md) | 不阻塞 |
+
+`docs/PROTOCOL.md` 与 `crates/kaleido-proto` 现在是合同：修改必须先改协议、走 ADR，
+再改代码。协议从 canonical state、commands、projections 和 workflow 推导，
+不得恢复固定 12 事件模型。现有 fixture 只用于验证 join、decline、
+敏感载荷等已观察语义。
+
+T-001～T-013 已冻结，T-014 已撤销，T-101 已作废。不得重新下发、续写或从旧 M1 队列复制 prompt。
 
 ## 4. 主管职责
 
@@ -131,9 +153,23 @@ T-001～T-013 已冻结，T-014 已撤销。不得重新下发、续写或从旧
 
 ## 8. 下一次主管输出
 
-下一轮不要写产品代码，也不要要求继续采集全量数据。直接提交：
+按实现方的交付情况三选一：
 
-- `docs/PROTOCOL.md` 初稿；
-- `crates/kaleido-proto` 最小合同及 UniFFI 可表达性验证；
-- R1 逐条评审；
-- 第一张 T-100 任务卡，范围只能是一个 Provider 的本地纵切。
+**如果 T-102 已交付**：按 §6 逐条审核，重点两条——
+（a）macOS CI 上的 Swift 编译步骤是否**真的会红**（实现方必须给出「改坏 → CI 变红」的证据，
+没有这条就等于加了个永不报警的门禁）；
+（b）UniFFI 的 callback / object / async / throwing 四面是否**两端都被消费探针实际调用**，
+只 import 不算。产出 `docs/gates/T-102-result.md`。
+
+「UniFFI 做不到」是合格交付。若出现，由主管决定改协议、改架构（例如移动端改用
+`since_cursor` 轮询）还是换绑定方案，**不要**让实现方自己发明影子 DTO 绕过去。
+
+**T-102 通过后**：为 **P-1** 与 **D-B1** 各开一张卡。两者都授权改
+`kaleido-proto` 或 `PROTOCOL.md`，必须先写 ADR 再改代码，且**分开两张卡**——
+它们是不同的问题，合并会让审核失焦。
+
+**如果 T-102 尚未交付**：不要提前开 R3 的卡。可以做的只有：更新阻塞登记、
+补 ADR 缺口、或回答实现方的裁决请求。
+
+任何情况下都不要在当前活动卡之外自行扩大范围，也不要为了「看起来有进展」
+去动 `schemas/`、`tests/fixtures/` 或 `spikes/`。
