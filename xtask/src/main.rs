@@ -143,7 +143,7 @@ fn run() -> Result<(), XtaskError> {
                 "clippy",
                 &["clippy", "--all-targets", "--", "-D", "warnings"],
             )?;
-            run_cargo_step_in_target(&root, &target, "test", &["test", "--workspace"])?;
+            run_test_step(&root, Some(&target))?;
             run_fixtures_step(&root)
         }
         Task::Fmt => run_cargo_step(&root, "fmt-check", &["fmt", "--all", "--", "--check"]),
@@ -152,7 +152,10 @@ fn run() -> Result<(), XtaskError> {
             "clippy",
             &["clippy", "--all-targets", "--", "-D", "warnings"],
         ),
-        Task::Test => run_cargo_step(&root, "test", &["test", "--workspace"]),
+        Task::Test => {
+            let target = root.join("target").join("xtask-test");
+            run_test_step(&root, Some(&target))
+        }
         Task::CheckDeps => run_deps_step(&root),
         Task::LintForbidden => run_forbidden_step(&root),
         Task::FixturesVerify => run_fixtures_step(&root),
@@ -246,6 +249,37 @@ fn run_cargo_step_in_target(
     run_cargo_step_with_target(root, Some(target), step, arguments)
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct TestScope {
+    arguments: &'static [&'static str],
+    exclusion_notice: Option<&'static str>,
+}
+
+fn test_scope() -> TestScope {
+    #[cfg(windows)]
+    {
+        TestScope {
+            arguments: &["test", "--workspace"],
+            exclusion_notice: None,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        TestScope {
+            arguments: &["test", "--workspace", "--exclude", "kaleido-recorder"],
+            exclusion_notice: Some("test: kaleido-recorder excluded on this platform (ADR-0015)"),
+        }
+    }
+}
+
+fn run_test_step(root: &Path, target: Option<&Path>) -> Result<(), XtaskError> {
+    let scope = test_scope();
+    if let Some(notice) = scope.exclusion_notice {
+        println!("{notice}");
+    }
+    run_cargo_step_with_target(root, target, "test", scope.arguments)
+}
+
 fn run_cargo_step_with_target(
     root: &Path,
     target: Option<&Path>,
@@ -313,4 +347,35 @@ fn announce(step: &str) -> Result<(), XtaskError> {
     println!("==> {step}");
     io::stdout().flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{test_scope, TestScope};
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_test_scope_does_not_exclude_the_recorder() {
+        assert_eq!(
+            test_scope(),
+            TestScope {
+                arguments: &["test", "--workspace"],
+                exclusion_notice: None,
+            }
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn non_windows_test_scope_excludes_the_recorder_with_an_explicit_notice() {
+        assert_eq!(
+            test_scope(),
+            TestScope {
+                arguments: &["test", "--workspace", "--exclude", "kaleido-recorder",],
+                exclusion_notice: Some(
+                    "test: kaleido-recorder excluded on this platform (ADR-0015)",
+                ),
+            }
+        );
+    }
 }

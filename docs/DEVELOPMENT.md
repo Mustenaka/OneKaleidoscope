@@ -118,9 +118,11 @@ swiftc -swift-version 5 -parse-as-library \
 test -s "$swift_out/libKaleidoCoreProbe.dylib"
 ```
 
-The CI workflow runs the Kotlin compile gate only on `ubuntu-latest` and the
-Swift compile-and-link gate only on `macos-latest`; both are hard failures.
-Binding generation alone is not compilation evidence.
+The CI workflow runs the Kotlin compile gate only on `ubuntu-latest`: the JVM
+probe has no Apple-platform dependency, so this keeps the macOS runner focused
+on the Swift-only evidence while still exercising a non-Windows generated
+binding. The Swift compile-and-link gate runs only on `macos-latest`; both are
+hard failures. Binding generation alone is not compilation evidence.
 
 `cargo xtask fmt` is a formatting check; it does not rewrite files. To format
 code before running the gates, use `cargo fmt --all`.
