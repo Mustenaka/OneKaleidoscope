@@ -34,7 +34,7 @@ jobs:
 
       - name: Set up JDK 22 for Kotlin probe
         if: matrix.os == 'ubuntu-latest'
-        uses: actions/setup-java@v6
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '22'
