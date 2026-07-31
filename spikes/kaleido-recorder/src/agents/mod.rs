@@ -403,8 +403,10 @@ mod tests {
     use std::path::Path;
 
     use super::acp::{self, AcpError};
+    #[cfg(windows)]
+    use super::validate_exact_permission_cwd;
     use super::{
-        validate_exact_permission_cwd, validate_exact_permission_path, validate_permission_command,
+        validate_exact_permission_path, validate_permission_command,
         validate_permission_command_as, validate_permission_path, CleanupIssue, PermissionCommand,
         PermissionScopeError,
     };
