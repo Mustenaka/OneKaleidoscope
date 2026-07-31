@@ -20,6 +20,11 @@ pub fn protocol_version() -> String {
     kaleido_proto::PROTOCOL_VERSION.to_owned()
 }
 
+#[uniffi::export]
+pub fn probe_protocol_version() -> String {
+    String::new()
+}
+
 /// Exercises the real command, error, state-effect and projection graph.
 ///
 /// The function has no product semantics: it returns the supplied projection
