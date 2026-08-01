@@ -739,7 +739,8 @@ These were not fixed and must not be described as resolved:
 - [x] The active workspace-test gate is the §5.5/ADR-0016 replacement:
       `cargo test --workspace --exclude kaleido-recorder`, exercised through
       `cargo xtask test`/`ci`. The literal superseded `cargo test --workspace`
-      is not claimed green and still fails only at D-B8.
+      is not claimed green: the documented Windows run fails at D-B8, while
+      the non-Windows recorder failures D-B6/D-B7 also remain.
 - [x] ADR-0017 D-1 preserves all 295 raw evidence files byte-for-byte; D-2 is
       fail-loud with green and red mutation evidence; D-B10 has a clean-Windows
       schema-diff result with zero required-surface drift.
