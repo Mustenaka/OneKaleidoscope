@@ -8,7 +8,9 @@
 
 > Status: Swift/Kotlin compilation, the Swift collision mutation, the fixture
 > scanner mutation, and the ADR-0017 fail-loud mutation are complete. The same
-> implementation SHA is green on macOS, Ubuntu, and Windows.
+> implementation SHA is green on macOS, Ubuntu, and Windows. One historical
+> §5.4 before/after passed-count transcript remains unavailable and is marked
+> explicitly below.
 
 ## Conclusion
 
@@ -19,7 +21,9 @@ async 调用面。**
 
 This conclusion is about whether UniFFI 0.32 can express and compile the
 required mobile call shape. It does not add a production subscription,
-projection, session, or storage implementation.
+projection, session, or storage implementation, and it does not prove callback
+thread scheduling, backpressure, process-death recovery, or a production
+subscription lifecycle.
 
 ## Evidence commit chain
 
@@ -493,8 +497,9 @@ schema diff: required surface is compatible (278 JSON files compared)
 exit code: 0
 ```
 
-The one informational out-of-surface removal belongs to the explicitly shown
-OpenCode version mismatch; it is not hidden or reported as zero drift. The
+The one informational out-of-surface removal was observed in the same run as
+the explicitly shown OpenCode version mismatch. That correlation is recorded,
+but no causal attribution is claimed. The machine conclusion is narrower: the
 required surface has no drift, and there is no Windows line-ending-induced Git
 blob false positive. The command appended three observations to
 `schemas/surface-history.jsonl` only in the disposable worktree. That file was
@@ -534,6 +539,16 @@ fixture, schema, or production redaction change:
      targets; `terminate_tree` returns `io::ErrorKind::Unsupported`.
    - Android no longer fails to compile, and process-tree termination never
      lies by returning `Ok(())`.
+
+The earlier Windows delivery recorded `cargo xtask ci` exit zero around these
+changes, and the diff adds or removes no test. However, the complete paired
+per-test-binary passed-count transcript was not retained. A retrospective
+checkout cannot recreate that historical exit-zero environment: it now reaches
+the registered recorder D-B8 failure before the suite finishes. Therefore the
+exact §5.4 “before and after counts” transcript is an explicit evidence gap,
+not a newly manufactured success claim. The cfg/diff reasoning above and the
+supervisor's scope verification remain valid, but they are not presented as a
+substitute for the missing raw count log.
 
 ## Frozen/protected scope hashes
 
@@ -585,6 +600,14 @@ git diff --stat b11b32c..4d40c76 -- \
 
 # no output
 ```
+
+This is a precise proof for commits *after* `b11b32c`, but not for history
+before that snapshot. `b11b32c` was the first T-102 branch commit cut from a
+dirty main worktree that already contained accepted R1/R2/T-100 contract files.
+The old `ae9da23` main commit is therefore not a valid contract baseline for a
+T-102-only diff. During final convergence, the owner must preserve the accepted
+main-worktree contract content and the supervisor-authored documents rather
+than treating this branch as a complete historical source.
 
 ADR-0017 is a separate authorized increment:
 
@@ -672,6 +695,23 @@ test: kaleido-recorder excluded on all platforms (ADR-0016)
 <== fixtures-verify: ok; 5 file(s), 220 record(s) (codex: 3, acp-claude: 1, opencode: 1)
 ```
 
+## Branch/main convergence state
+
+The implementation branch and the supervisor's main worktree are intentionally
+not merged in this delivery:
+
+- `codex/t-102-uniffi-probe` contains the implementation and evidence commits,
+  but not ADR-0015/0016/0017, the four T-102 unblock rulings, or the task-card
+  §5.4–§5.7 text subsequently authored in the main worktree;
+- the main worktree remains at `ae9da23` with its pre-existing uncommitted
+  R1/R2 and supervisor-authored documents intact;
+- this evidence file is also placed at main-worktree
+  `docs/gates/T-102-evidence.md`, without checkout, merge, cherry-pick, or
+  replacement of those supervisor documents.
+
+The owner must converge both sources while retaining the main-worktree ADR and
+task text. Neither source by itself is a complete final documentation tree.
+
 ## Unresolved observations
 
 These were not fixed and must not be described as resolved:
@@ -696,8 +736,15 @@ These were not fixed and must not be described as resolved:
 - [x] Generated artifacts are not tracked.
 - [x] ADR-0016 D-1 is explicit and tested; D-2 has positive, negative, and
       mutation evidence.
+- [x] The active workspace-test gate is the §5.5/ADR-0016 replacement:
+      `cargo test --workspace --exclude kaleido-recorder`, exercised through
+      `cargo xtask test`/`ci`. The literal superseded `cargo test --workspace`
+      is not claimed green and still fails only at D-B8.
 - [x] ADR-0017 D-1 preserves all 295 raw evidence files byte-for-byte; D-2 is
       fail-loud with green and red mutation evidence; D-B10 has a clean-Windows
       schema-diff result with zero required-surface drift.
 - [x] Final Windows clean-checkout `cargo xtask ci`, same-SHA three-platform CI,
       and all three platforms' `5/220` fixture verification are green.
+- [ ] The exact paired per-binary passed-count transcript requested by §5.4
+      was not retained from the original Windows environment; retrospective
+      checkout is stopped by the already registered D-B8 as documented above.
