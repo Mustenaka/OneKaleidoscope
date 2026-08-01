@@ -1,14 +1,14 @@
 # T-102 UniFFI mobile-call-surface evidence
 
-> Evidence date: 2026-07-31
-> Restored implementation commit:
-> `fde369c5bec241d0d623d57e7eb2f2d30173aa1a`
-> Restored CI run:
-> <https://github.com/Mustenaka/OneKaleidoscope/actions/runs/30614424449>
+> Evidence date: 2026-08-01
+> Validated implementation commit:
+> `4d40c76cc1f3ba76f0144eeac552e2c4de476fbe`
+> Three-platform green CI run:
+> <https://github.com/Mustenaka/OneKaleidoscope/actions/runs/30707060011>
 
-> Status: Swift/Kotlin compilation and both mutation proofs are complete.
-> T-102 as a whole is still blocked by a pre-existing Windows-only CRLF test
-> setup defect; the three-platform workflow is therefore not reported as green.
+> Status: Swift/Kotlin compilation, the Swift collision mutation, the fixture
+> scanner mutation, and the ADR-0017 fail-loud mutation are complete. The same
+> implementation SHA is green on macOS, Ubuntu, and Windows.
 
 ## Conclusion
 
@@ -28,9 +28,11 @@ projection, session, or storage implementation.
 | ADR-0016 implementation baseline | `1ba23c7cc7d78dd228b594e3b63c35862e12d2d4` | [30613601014](https://github.com/Mustenaka/OneKaleidoscope/actions/runs/30613601014) | macOS Swift success; Ubuntu Kotlin success; Windows CRLF blocker |
 | deliberate Swift-name collision | `d971b23838d058bf767f8b9e67b4939f2f3917b2` | [30614223755](https://github.com/Mustenaka/OneKaleidoscope/actions/runs/30614223755) | macOS repository checks success then Swift compilation fails exactly at the collision; Ubuntu remains success; Windows has the same independent CRLF blocker |
 | mutation removed | `fde369c5bec241d0d623d57e7eb2f2d30173aa1a` | [30614424449](https://github.com/Mustenaka/OneKaleidoscope/actions/runs/30614424449) | restored macOS Swift success; Ubuntu Kotlin success; Windows CRLF blocker |
+| ADR-0017 implementation | `4d40c76cc1f3ba76f0144eeac552e2c4de476fbe` | [30707060011](https://github.com/Mustenaka/OneKaleidoscope/actions/runs/30707060011) | macOS, Ubuntu, and Windows all success; Swift and Kotlin hard compile gates success; all three report fixture verification `5/220` |
 
-None of these runs is described as overall green while the Windows matrix job
-is red.
+The first three rows preserve the historical red Windows outcomes rather than
+rewriting them. ADR-0017 removes the line-ending-dependent setup and the final
+row is the first same-SHA, three-platform green run.
 
 ## Implemented probe surface
 
@@ -310,12 +312,25 @@ local regression command:
 cargo test -p kaleido-recorder
 ```
 
-That local command still passed the frozen spike unchanged:
+That command remains a local-only regression aid, but the complete package does
+not currently pass. A clean Windows run executes the first 164-test binary
+successfully, then later reaches the already registered D-B8 failure:
 
 ```text
 running 164 tests
 test result: ok. 164 passed; 0 failed; 0 ignored
+
+test repository_fixture_sandbox_is_replaced_before_absolute_path_scanning ... FAILED
+actual:   {"directory":"<OUTSIDE_PATH>"}
+expected: {"directory":"<SANDBOX>"}
+
+executed before Cargo stopped: 262 passed; 1 failed; 0 ignored
+exit code: 101
 ```
+
+No recorder source or assertion was changed. D-B8 remains unresolved exactly
+as ADR-0016 requires; the failure is not part of the product/xtask CI test
+scope, while the frozen spike remains under three-platform clippy.
 
 The exclusion affects only behavior tests. Three-platform fmt, dependency
 rules, forbidden-pattern lint, workspace clippy including `spikes/**`, fixture
@@ -360,14 +375,138 @@ test result: ok. 35 passed; 0 failed; 0 ignored
 <== fixtures-verify: ok; 5 file(s), 220 record(s) (codex: 3, acp-claude: 1, opencode: 1)
 ```
 
-The restored macOS and Ubuntu jobs both independently print the same `5/220`
-success. The Windows clean-checkout run currently stops at the unrelated CRLF
-blocker below before reaching fixture verification; local Windows `5/220`
-passed. Therefore the requested third CI-platform fixture proof remains
-blocked rather than being inferred or fabricated.
+The final same-SHA run
+[30707060011](https://github.com/Mustenaka/OneKaleidoscope/actions/runs/30707060011)
+prints the same `5/220` success independently on macOS, Ubuntu, and Windows.
+The Windows job's raw line is:
+
+```text
+<== fixtures-verify: ok; 5 file(s), 220 record(s) (codex: 3, acp-claude: 1, opencode: 1)
+```
 
 This change does **not** decide whether `\` is a separator on Unix; D-B6 remains
 open.
+
+## ADR-0017 D-1: deterministic line endings and raw evidence bytes
+
+The repository root now declares:
+
+```gitattributes
+* text=auto eol=lf
+
+# 逐字节证据：永不做行尾翻译
+schemas/**          -text
+tests/fixtures/**   -text
+```
+
+Normal text is therefore deterministic LF. The committed schema snapshots and
+fixtures are stronger: `-text` disables all line-ending translation. A fresh
+Windows worktree at
+`4d40c76cc1f3ba76f0144eeac552e2c4de476fbe`, with system
+`core.autocrlf=true`, produced:
+
+```text
+evidence_files=295
+byte_mismatches=0
+dependency_rules_crlf_pairs=0
+```
+
+Each of the 295 working-tree files was hashed with `git hash-object
+--no-filters` and compared with its `HEAD:<path>` blob. The protected Git trees
+are unchanged across the ADR-0017 commit:
+
+```text
+schemas tree:        a03d3a47eec854d139a9f94fab16ff27884bdcfe
+tests/fixtures tree: 060d9cca21d52482fa958cf50d508c2e1bc15064
+
+git diff --stat 6de6eb0..4d40c76 -- schemas tests/fixtures
+# no output
+```
+
+Thus the first checkout normalization changed ordinary text only; no schema or
+fixture byte changed.
+
+## ADR-0017 D-2: dependency-test setup is fail-loud
+
+Only `xtask/tests/deps.rs` changed. The test setup first normalizes its embedded
+rules from CRLF to LF, performs the existing exact replacement, then proves
+that the replacement happened:
+
+```rust
+let normalized_rules = REPOSITORY_RULES.replace("\r\n", "\n");
+let rules = normalized_rules.replace(
+    "\"kaleido-adapter\",\n    \"kaleido-adapter-*\",",
+    "\"kaleido-adapter-*\",",
+);
+assert_ne!(
+    rules, normalized_rules,
+    "test setup must remove the shared adapter allow-list entry"
+);
+```
+
+`xtask/src/deps.rs`, the test's `expect_err`, and its business violation
+assertion are unchanged. Restored green evidence is:
+
+```text
+adapter_wildcard_does_not_match_the_shared_adapter_crate ... ok
+test result: ok. 1 passed; 0 failed; 13 filtered out
+
+running 14 tests
+test result: ok. 14 passed; 0 failed; 0 ignored
+```
+
+The setup-specific mutation temporarily replaced the needle with the absent
+`kaleido-adapter-never-present`. The new assertion failed before the business
+assertion could run:
+
+```text
+assertion `left != right` failed: test setup must remove the shared adapter allow-list entry
+test result: FAILED. 0 passed; 1 failed; 13 filtered out
+```
+
+The mutation was removed and the target test returned green. The dependency
+test binary remains 14 tests before and after ADR-0017.
+
+## ADR-0017 D-3: D-B10 clean-Windows schema-diff verification
+
+D-B10 has now been exercised in a disposable clean Windows worktree with
+`core.autocrlf=true`. Codex was the pinned `0.146.0`; native `codex.exe` and
+`opencode.exe` were used with the committed ACP snapshot. A repository-external
+worktree ran the literal command:
+
+```text
+cargo xtask schema diff
+```
+
+The raw result was:
+
+```text
+schema: observed codex 0.146.0 (snapshot 0.146.0), opencode 1.18.9 (snapshot 1.18.8), acp 1.18.0 (snapshot 1.18.0)
+schema: NOTICE opencode version differs: observed 1.18.9, snapshot 1.18.8; comparison will continue
+schema: WARNING unverified version for opencode: observed 1.18.9, supported range =1.18.8; comparison will continue
+schema: fetching Codex 0.146.0, OpenCode 1.18.9, ACP crate 1.3.0 / schema 1.18.0
+schema: used a configured ACP snapshot verified against commit 48b2abf1ac750fece26e03e92e773ccbd4754f5d
+  in-surface    : 0 drift
+  out-of-surface: 1 drift (0 added / 0 changed / 1 removed)
+schema history: appended 3 new observation(s), deduplicated 0 existing observation(s)
+schema diff: required surface is compatible (278 JSON files compared)
+exit code: 0
+```
+
+The one informational out-of-surface removal belongs to the explicitly shown
+OpenCode version mismatch; it is not hidden or reported as zero drift. The
+required surface has no drift, and there is no Windows line-ending-induced Git
+blob false positive. The command appended three observations to
+`schemas/surface-history.jsonl` only in the disposable worktree. That file was
+restored to its committed empty state; afterwards `git status --short --
+schemas tests/fixtures` had no output and the 295-file byte comparison again
+reported zero mismatches.
+
+One additional observation is not treated as a D-B10 failure: the first probe
+through installed `.cmd` wrappers reached an existing fail-closed Windows
+descendant-cleanup `Access denied` error (exit 3). The exact process was gone
+and no orphan remained. Re-running with the native executables produced the
+successful result above; no process-cleanup code was changed under T-102.
 
 ## Authorized cross-platform compile/lint fixes
 
@@ -426,8 +565,8 @@ SHA-256 DA6A46D5C9D103AC19C6CF485994AC02525D65CAA1192780A0231A7D852FF5AF
 SHA-256 BEA85BB367B29A06BEB077CEA6FD10BF98B820A28AFD44EF1B11971238774904
 ```
 
-The manifest difference is exactly these six authorized implementation paths,
-and no others:
+Through ADR-0016, the manifest difference is exactly these six authorized
+implementation paths, and no others:
 
 ```text
 crates/kaleido-adapter-codex/src/platform/mod.rs
@@ -441,24 +580,35 @@ xtask/tests/fixtures.rs
 Hard-contract diff:
 
 ```text
-git diff --stat b11b32c..fde369c -- \
+git diff --stat b11b32c..4d40c76 -- \
   crates/kaleido-proto docs/PROTOCOL.md docs/adr schemas tests/fixtures
 
 # no output
 ```
 
+ADR-0017 is a separate authorized increment:
+
+```text
+git diff --stat 6de6eb0..4d40c76
+ .gitattributes      | 5 +++++
+ xtask/tests/deps.rs | 7 ++++++-
+ 2 files changed, 11 insertions(+), 1 deletion(-)
+```
+
 Generated `target/`, Kotlin `build/`, and `.gradle/` outputs remain ignored and
 `git ls-files` reports none of them.
 
-## Gates and current blocker
+## Final clean-checkout and three-platform gates
 
-The original Windows working tree completed the full gate:
+A repository-external fresh Windows worktree checked out
+`4d40c76cc1f3ba76f0144eeac552e2c4de476fbe` under the system
+`core.autocrlf=true`. It ran the literal required command `cargo xtask ci`:
 
 ```text
 ==> fmt-check
 <== fmt-check: ok
 ==> check-deps
-<== check-deps: ok
+<== check-deps: ok; 9 workspace member(s), 9 internal edge(s), 6 crates/* manifest(s)
 ==> lint-forbidden
 <== lint-forbidden: ok
 ==> clippy
@@ -470,43 +620,57 @@ test: kaleido-recorder excluded on all platforms (ADR-0016)
 <== fixtures-verify: ok; 5 file(s), 220 record(s) (codex: 3, acp-claude: 1, opencode: 1)
 ```
 
-Exit code: `0`.
+Exit code: `0`; elapsed: `353.5s`. The worktree remained clean and
+`git diff --exit-code -- schemas tests/fixtures` also returned zero. The
+pre-ADR original Windows working tree and the post-ADR clean checkout both
+complete `cargo xtask ci` with exit zero. The dependency integration binary
+remains `14 passed`, so ADR-0017 changed neither its count nor business
+assertions.
 
-However, the final clean Windows checkout exposes a pre-existing,
-line-ending-sensitive xtask test. Restored run
-<https://github.com/Mustenaka/OneKaleidoscope/actions/runs/30614424449>,
-Windows job `91104224840`, and a new local worktree with Git for Windows'
-`core.autocrlf=true` both reproduce it:
+The same implementation SHA is green in CI run
+[30707060011](https://github.com/Mustenaka/OneKaleidoscope/actions/runs/30707060011):
+
+| Job | ID | Conclusion | Platform-specific evidence |
+|---|---:|---|---|
+| `ci (macos-latest)` | `91387880690` | success | Swift binding generation and consumer compilation |
+| `ci (ubuntu-latest)` | `91387880710` | success | generated Kotlin consumer `:compileKotlin` |
+| `ci (windows-latest)` | `91387880717` | success | clean-checkout repository gates and fixture verification |
+
+Final macOS raw excerpt:
 
 ```text
-test adapter_wildcard_does_not_match_the_shared_adapter_crate ... FAILED
-thread 'adapter_wildcard_does_not_match_the_shared_adapter_crate' panicked at xtask\tests\deps.rs:305:10:
-the concrete adapter wildcard must not match the shared crate:
-CheckReport { workspace_members: 2, internal_edges: 1, crate_manifests: 0 }
-test result: FAILED. 13 passed; 1 failed
-xtask: step `test` failed with status exit code: 101
-##[error]Process completed with exit code 1.
+Apple Swift version 6.3.3 (swiftlang-6.3.3.1.3 clang-2100.1.1.101)
+Target: arm64-apple-macosx26.0
+swift-driver version: 1.148.6
+Running `target/debug/uniffi-bindgen generate --language swift --out-dir target/uniffi/swift target/debug/libkaleido_core.dylib`
 ```
 
-Root cause: the test embeds `docs/dependency-rules.toml` with `include_str!`
-and removes an allow-list entry using a hard-coded LF substring. A Windows
-checkout contains CRLF, so `replace` is a no-op and the test's synthetic rule
-mutation never occurs. The assertion and dependency checker are not wrong;
-the test setup is line-ending-sensitive. This test predates T-102.
+The step then ran the exact `swiftc` command recorded earlier in this file and
+its `test -s` output check; the job concluded success. The earlier accepted run
+`30614424449` remains the raw Swift 6.3.2 evidence requested by the card, while
+this final same-SHA run used the runner's current Swift 6.3.3.
 
-The minimal suggested correction is test-local CRLF-to-LF normalization before
-the existing exact replacement. It changes neither assertion nor production
-dependency semantics. Changing `.gitattributes` or the dependency parser would
-be broader alternatives.
+Final Ubuntu raw excerpt:
 
-This correction is outside ADR-0016 D-1/D-2 and T-102 §5.4's cfg-only
-exception, so it has not been made without supervisor approval. Consequences:
+```text
+test: kaleido-recorder excluded on all platforms (ADR-0016)
+<== fixtures-verify: ok; 5 file(s), 220 record(s) (codex: 3, acp-claude: 1, opencode: 1)
+> Task :compileKotlin
+BUILD SUCCESSFUL in 1m 6s
+```
 
-- macOS Swift and Ubuntu Kotlin compile evidence is complete;
-- the deliberate Swift-red evidence is complete and restored;
-- local Windows functional gates and `5/220` fixture verification passed;
-- final three-platform all-green CI and Windows CI `5/220` evidence remain
-  blocked at this one pre-existing test.
+Final Windows raw excerpt:
+
+```text
+4d40c76cc1f3ba76f0144eeac552e2c4de476fbe
+<== fmt-check: ok
+<== check-deps: ok; 9 workspace member(s), 9 internal edge(s), 6 crates/* manifest(s)
+<== lint-forbidden: ok
+<== clippy: ok
+test: kaleido-recorder excluded on all platforms (ADR-0016)
+<== test: ok
+<== fixtures-verify: ok; 5 file(s), 220 record(s) (codex: 3, acp-claude: 1, opencode: 1)
+```
 
 ## Unresolved observations
 
@@ -532,6 +696,8 @@ These were not fixed and must not be described as resolved:
 - [x] Generated artifacts are not tracked.
 - [x] ADR-0016 D-1 is explicit and tested; D-2 has positive, negative, and
       mutation evidence.
-- [ ] Final Windows clean-checkout `cargo xtask ci` and Windows CI fixture
-      verification: blocked by the pre-existing CRLF-sensitive
-      `xtask/tests/deps.rs` setup described above.
+- [x] ADR-0017 D-1 preserves all 295 raw evidence files byte-for-byte; D-2 is
+      fail-loud with green and red mutation evidence; D-B10 has a clean-Windows
+      schema-diff result with zero required-surface drift.
+- [x] Final Windows clean-checkout `cargo xtask ci`, same-SHA three-platform CI,
+      and all three platforms' `5/220` fixture verification are green.
