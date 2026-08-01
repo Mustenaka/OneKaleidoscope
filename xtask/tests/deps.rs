@@ -291,9 +291,14 @@ fn hostd_wildcard_allows_all_three_concrete_adapters() {
 
 #[test]
 fn adapter_wildcard_does_not_match_the_shared_adapter_crate() {
-    let rules = REPOSITORY_RULES.replace(
+    let normalized_rules = REPOSITORY_RULES.replace("\r\n", "\n");
+    let rules = normalized_rules.replace(
         "\"kaleido-adapter\",\n    \"kaleido-adapter-*\",",
         "\"kaleido-adapter-*\",",
+    );
+    assert_ne!(
+        rules, normalized_rules,
+        "test setup must remove the shared adapter allow-list entry"
     );
     let source = metadata(&[
         TestPackage::new("kaleido-hostd", "crates/kaleido-hostd/Cargo.toml")

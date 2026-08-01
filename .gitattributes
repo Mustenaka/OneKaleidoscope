@@ -1,0 +1,5 @@
+* text=auto eol=lf
+
+# 逐字节证据：永不做行尾翻译
+schemas/**          -text
+tests/fixtures/**   -text
