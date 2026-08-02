@@ -21,7 +21,15 @@ R0 通过，R1 经主管评审后**有条件通过**：
 钉定路径 decoder → reducer → canonical state → durable log → 六个投影，
 可观察、可干预、可重启恢复。
 
-当前活动任务：**[T-102](tasks/T-102.md)**（prompt：[T-102-codex-prompt.md](tasks/T-102-codex-prompt.md)）。
+**[T-102](tasks/T-102.md) 已于 2026-08-02 通过**（[门禁结果](gates/T-102-result.md)）。
+UB-R1-S 与 G-R1-1 解除：Swift 在 macOS CI 上真实编译，UniFFI 的 callback / object /
+async / throwing 四面两端消费并编译。
+
+**当前活动：仓库收敛**（[prompt](tasks/repo-convergence-prompt.md)）。分支是 `ae9da23` 的
+直系后代，可快进；差异恰好是 `.gitattributes` 与 12 个主管文档。
+
+收敛完成后依次下发 R3 的两条硬前置，**分开两张卡**：
+[T-103](tasks/T-103.md)（P-1）→ [T-104](tasks/T-104.md)（D-B1）。
 
 ## 1. 当前结论
 
@@ -121,11 +129,13 @@ steer 意图始终排队、进程退出三联状态、重启后从日志重建�
 
 | ID | 内容 | 归属 | 解除路径 |
 |---|---|---|---|
-| UB-R1-S | Swift UniFFI 绑定编译 | R8 硬前置 | [T-102](tasks/T-102.md)：macOS CI 步骤 |
-| G-R1-1 | UniFFI 的 callback / object / async / throwing 面未探针 | **R3 硬前置** | [T-102](tasks/T-102.md) §5.2 |
+| ~~UB-R1-S~~ | ~~Swift UniFFI 绑定编译~~ | — | **已解除，2026-08-02**，[T-102 门禁结果](gates/T-102-result.md) |
+| ~~G-R1-1~~ | ~~UniFFI 的 callback / object / async / throwing 面~~ | — | **已解除**。结论：R3 投影推送**能**走 UniFFI 回调；但**未**证明线程调度、背压、进程恢复 |
 | P-1 | `AttentionState::Answered` 强制 `command_id`，被观察到的外部应答无本地命令 | **R3 硬前置** | 需单独开卡授权改 `kaleido-proto`；见 [ADR-0014](adr/0014-codex-approval-families-and-timestamp-units.md) D-3 |
 | D-B1 | `LiveControl` 无任何代码路径可证明，`LiveBinding::Controlling` 结构性不可达 —— 手机会永远渲染成只读 | **R3 硬前置** | 见 [T-100 门禁结果](gates/T-100-result.md) §4 |
 | D-B2 | 活进程树终止无测试（只测了「已退出」分支） | R4 前置 | 同上 |
+| D-B6 / D-B7 | 跨平台路径校验规则（Unix 上的 `\`、macOS `/var` 符号链接别名）未定 | **R9 前置** | 见 [ADR-0015](adr/0015-frozen-spike-tests-are-windows-only.md) D-4；写 R9 路径校验前先定规则 |
+| D-B8 | 脱敏占位符优先级：`<HOME>` 先于 `<SANDBOX>`（非泄漏，标签精度问题） | R4 复查 | 同上 |
 | D-B3 | 跨 stream 投影的 cursor 语义待确认 | 不阻塞 | 同上 |
 | P-2 | Codex 审批无过期时间，`ApprovalExpired` 真实流量永不触发 | 不阻塞 | 移动端需正确渲染「无过期时间」 |
 

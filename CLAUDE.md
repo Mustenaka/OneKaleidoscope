@@ -37,29 +37,36 @@
 
 上游没有公开路径时，登记阻塞并保留失败验收格。不得隐藏、改名或降低需求来宣布完成。
 
-## 3. 当前工作：审核 T-102
+## 3. 当前工作：为 P-1 与 D-B1 开卡
 
 R1 已由主管评审，结论是 **有条件通过（携带 UB-R1-S）**，见
 [R1 评审](docs/gates/R1-result.md) §0 与 [ADR-0013](docs/adr/0013-platform-track-order.md)。
 Swift 编译门禁没有被删除或改小，它变成 R8 的硬前置，解除路径是
 [T-102](docs/tasks/T-102.md) 在已有 `macos-latest` CI job 上做真实编译。
 
-[T-100 已通过](docs/gates/T-100-result.md)（2026-07-31），R2 完成。主管当前的工作是：
+[T-100 已通过](docs/gates/T-100-result.md)（R2 完成）、[T-102 已通过](docs/gates/T-102-result.md)
+（UB-R1-S 与 G-R1-1 解除）。主管当前的工作是：
 
-1. 等 [T-102](docs/tasks/T-102.md) 交付，按 §6 逐条审核，并自己挑实现方没报告的位置做变异；
-2. T-102 通过后，R3 开工前必须先为 **P-1** 与 **D-B1** 各开一张授权改协议的卡；
-3. 三条 R3 前置全部结清，才写 R3 的卡。
+1. **先提醒负责人收敛仓库**——本地 `main` 与 `origin/codex/t-102-uniffi-probe`
+   两个来源都不完整，见 [T-102 门禁结果](docs/gates/T-102-result.md) §4；
+2. 为 **P-1** 与 **D-B1** 各开一张卡。两者都授权改 `kaleido-proto` 或 `PROTOCOL.md`，
+   必须先写 ADR 再改代码，且**分开两张**——它们是不同的问题，合并会让审核失焦；
+3. 两张卡结清后才写 R3 的卡。
 
 携带项总表，任何时候都不许在文档里写成已通过：
 
 | ID | 内容 | 阻塞谁 |
 |---|---|---|
-| UB-R1-S | Swift UniFFI 绑定编译 | R8 |
-| G-R1-1 | UniFFI 的推送/订阅/异步/错误调用面 | R3 |
 | P-1 | `AttentionState::Answered` 无法表达「观察到的外部应答」 | R3 |
 | D-B1 | `LiveControl` 不可达，`LiveBinding::Controlling` 永远到不了 | R3 |
 | D-B2 | 活进程树终止无测试 | R4 |
-| D-B3 / P-2 / D-R1-1 | 见 [tasks/README](docs/tasks/README.md) | 不阻塞 |
+| D-B6 / D-B7 | 跨平台路径校验规则未定 | R9 |
+| D-B11 | OpenCode 快照 1.18.8 vs 实机 1.18.9，1 处 out-of-surface removal | R5 |
+| D-B8 / D-B3 / P-2 / D-R1-1 | 见 [tasks/README](docs/tasks/README.md) | 不阻塞 |
+
+G-R1-1 虽已解除，但它的结论**有边界**：只证明了 UniFFI 能表达并编译回调/对象/async/
+throwing 四种形状，**没有**证明线程调度、背压、进程被杀后的恢复。R3 不得引用本结论
+当作那些问题已解决。
 
 `docs/PROTOCOL.md` 与 `crates/kaleido-proto` 现在是合同：修改必须先改协议、走 ADR，
 再改代码。协议从 canonical state、commands、projections 和 workflow 推导，
@@ -155,21 +162,20 @@ T-001～T-013 已冻结，T-014 已撤销，T-101 已作废。不得重新下发
 
 按实现方的交付情况三选一：
 
-**如果 T-102 已交付**：按 §6 逐条审核，重点两条——
-（a）macOS CI 上的 Swift 编译步骤是否**真的会红**（实现方必须给出「改坏 → CI 变红」的证据，
-没有这条就等于加了个永不报警的门禁）；
-（b）UniFFI 的 callback / object / async / throwing 四面是否**两端都被消费探针实际调用**，
-只 import 不算。产出 `docs/gates/T-102-result.md`。
+**下一步是开两张卡**（T-103 = P-1，T-104 = D-B1，或按当时编号）：
 
-「UniFFI 做不到」是合格交付。若出现，由主管决定改协议、改架构（例如移动端改用
-`since_cursor` 轮询）还是换绑定方案，**不要**让实现方自己发明影子 DTO 绕过去。
+- **P-1**：`AttentionState::Answered` 强制 `command_id`，但被观察到的外部应答没有本地命令。
+  现在 replay 路径铸了一个确定性 ID 顶上——canonical 状态里存在一个指不到任何命令的引用。
+  R3 之后手机会真的按它回查。先写 ADR，再改 proto。
+- **D-B1**：`Capability::LiveControl` 只出现在枚举列表里，没有任何代码路径会把它标记为
+  proven，因此 `LiveBinding::Controlling` 结构性不可达，手机会一直渲染成只读。
+  要么让命令被 runtime 接受时提升它，要么在协议里说清 `LiveControl` 与 `TurnPrompt`
+  的区别。先写 ADR，再改代码。
 
-**T-102 通过后**：为 **P-1** 与 **D-B1** 各开一张卡。两者都授权改
-`kaleido-proto` 或 `PROTOCOL.md`，必须先写 ADR 再改代码，且**分开两张卡**——
-它们是不同的问题，合并会让审核失焦。
+**两张卡必须分开**——它们是不同的问题，合并会让审核失焦。
 
-**如果 T-102 尚未交付**：不要提前开 R3 的卡。可以做的只有：更新阻塞登记、
-补 ADR 缺口、或回答实现方的裁决请求。
+**开卡前先提醒负责人收敛仓库**。T-102 四次阻塞的共同根因就是本地状态与已推送状态脱节；
+带着两个不完整的来源开下一张卡，同样的问题会继续复利。
 
 任何情况下都不要在当前活动卡之外自行扩大范围，也不要为了「看起来有进展」
 去动 `schemas/`、`tests/fixtures/` 或 `spikes/`。
