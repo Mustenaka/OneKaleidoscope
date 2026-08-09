@@ -12,6 +12,15 @@ use kaleido_proto::effect::StateEffect;
 use kaleido_proto::error::CanonicalError;
 use kaleido_proto::projection::ProjectionEnvelope;
 
+pub mod cache;
+pub mod connection;
+pub mod credential;
+pub mod mobile;
+pub mod signer;
+
+pub use mobile::{MobileClient, MobileClientError, ProjectionCallback, ProjectionSubscription};
+pub use signer::{DeviceSigner, DeviceSignerError};
+
 uniffi::setup_scaffolding!();
 
 /// Returns the protocol version implemented by the canonical contract.

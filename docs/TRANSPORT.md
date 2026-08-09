@@ -215,6 +215,10 @@ ProjectionEnvelopeFrame {
   subscription_id: u64,
   envelope: ProjectionEnvelope,
 }
+ProjectionSubscriptionClosed {
+  subscription_id: u64,
+  error: CanonicalError,
+}
 UnsubscribeRequest { request_id: u64, subscription_id: u64 }
 UnsubscribeAck     { request_id: u64, subscription_id: u64 }
 
@@ -234,7 +238,8 @@ TransportError
 `request_id` 和 `subscription_id` 必须非零，在一条连接的每个发送方向由请求方单调分配且不得复用；响应
 逐字回显 request ID，projection push 逐字回显 subscription ID。任一计数器到 `u64::MAX` 后，
 发送方必须在需要下一 ID 前正常关闭并新建连接；不得 wrap、归零或复用。未知 control `kind`、响应 ID
-错配、subscription ID 冲突或已 unsubscribe 后继续 push 都是 `MalformedFrame` 并关闭连接。
+错配、subscription ID 冲突、重复 terminal、未知 subscription terminal，或已 unsubscribe/terminal
+后继续 push 都是 `MalformedFrame` 并关闭连接。
 
 ContentWrite 的 `ContentWriteRequest { content_kind, byte_len, digest }` 是 JSON 控制头；正文
 使用其后、同一 request ID 的唯一 binary content frame，不内嵌 JSON，也不进入 JSON
@@ -252,7 +257,24 @@ ContentWrite 的 `ContentWriteRequest { content_kind, byte_len, digest }` 是 JS
 5. 只发送大于已发送 head 的 live entry。
 
 这个顺序保证 snapshot/replay 与 live 交界不漏不重。慢客户端一旦落后 bounded channel，服务端
-发送 CursorGap（若仍可写）并关闭订阅；不得跳 cursor。
+停止该订阅的后续 push，并发送：
+
+```text
+ProjectionSubscriptionClosed {
+  subscription_id,
+  error: CanonicalError {
+    code: CursorGap,
+    retriable: true,
+    detail_ref: None,
+    at_ms: <lag detected time>,
+  },
+}
+```
+
+该 frame 是 server push，没有 request ID，只关闭目标 subscription；TLS 与其他订阅保持可用。
+客户端保留 last-good cursor 并从该 cursor 重新订阅，不得跳 cursor或应用 terminal 后的 envelope。
+若 terminal 无法安全写出才关闭连接。主动 unsubscribe 与 lag 的有序竞态、tombstone 和重复拒绝规则
+由 [ADR-0022](adr/0022-projection-subscription-terminal-frame.md) 固定。
 
 ## 7. Command 与 content
 

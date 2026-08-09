@@ -1,0 +1,32 @@
+# NOTE: `cargo xtask check-deps` parses `crates/*/Cargo.toml` with its own
+# reader, which rejects dotted keys such as `edition.workspace = true`.
+[package]
+name = "kaleido-transport"
+version = "0.1.0"
+edition = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+publish = false
+
+[dependencies]
+base64 = { workspace = true }
+kaleido-proto = { path = "../kaleido-proto" }
+p256 = { workspace = true }
+rand_core = { workspace = true }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
+rustls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_ignored = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+x509-cert = { workspace = true }
+zeroize = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[lints]
+workspace = true

@@ -18,7 +18,9 @@ use kaleido_proto::capability::{Capability, CapabilityState, EvidenceSource};
 use kaleido_proto::command::CommandOutcome;
 use kaleido_proto::effect::{DiagnosticCode, StateEffect};
 use kaleido_proto::error::ErrorCode;
-use kaleido_proto::host::{ConnectionFaultReason, ConnectionState, HostPlatform, LaunchSurface};
+use kaleido_proto::host::{
+    ConnectionFaultReason, ConnectionState, HostPlatform, HostReachability, LaunchSurface,
+};
 use kaleido_proto::ids::{CommandId, ItemId, ProviderBindingKind};
 use kaleido_proto::session::{LiveBinding, LiveUnboundReason, SessionStatus};
 use kaleido_proto::turn::{ItemBody, ItemStatus, MessagePhase, TurnOrigin, TurnStatus};
@@ -134,6 +136,12 @@ fn a_simple_turn_reduces_to_one_user_and_one_agent_message() {
     let effects = reducer
         .ingest(&transcript, &mut content)
         .expect("the recording must reduce cleanly");
+
+    let host_reachability = effects.iter().find_map(|effect| match effect {
+        StateEffect::HostUpserted { host } => Some(host.reachability.clone()),
+        _ => None,
+    });
+    assert_eq!(host_reachability, Some(HostReachability::Offline));
 
     let items = items(&effects);
     assert_eq!(items.len(), 2, "observed items: {items:?}");

@@ -18,6 +18,9 @@ sha2 = { version = "=0.11.0", default-features = false }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
 [dev-dependencies]
 tempfile = "=3.27.0"
 

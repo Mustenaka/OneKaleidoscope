@@ -16,16 +16,21 @@
 //!
 //! [`effect::StateEffect`]: kaleido_proto::effect::StateEffect
 
+mod command_outbox;
 pub mod content;
 pub mod error;
 pub mod log;
+mod platform;
 pub mod projection;
+pub mod projection_journal;
 pub mod state;
 pub mod store;
 
+pub use command_outbox::{DeviceCommandAdmission, DispatchClaim, DispatchTicket, PendingDispatch};
 pub use content::ContentStore;
 pub use error::StateError;
 pub use log::StreamLog;
 pub use projection::{DiagnosticProjectionEnvelope, ProjectionName};
+pub use projection_journal::{ProjectionJournal, ProjectionReplay};
 pub use state::CanonicalState;
-pub use store::{CanonicalStore, ClockSource};
+pub use store::{CanonicalStore, ClockSource, StateCommit};

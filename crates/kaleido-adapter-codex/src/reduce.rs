@@ -423,7 +423,10 @@ impl CodexReducer {
                     id: self.host_id.clone(),
                     display_name: self.config.host_display_name.clone(),
                     platform: self.config.host_platform.clone(),
-                    reachability: HostReachability::LanDirect,
+                    // The adapter only observes the provider runtime. LAN
+                    // reachability belongs to hostd's listener lifecycle and
+                    // must not be inferred from the first provider frame.
+                    reachability: HostReachability::Offline,
                     protocol_version: kaleido_proto::PROTOCOL_VERSION.to_owned(),
                     last_seen_at_ms: at_ms,
                 },
