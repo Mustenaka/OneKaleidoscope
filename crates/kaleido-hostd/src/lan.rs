@@ -14,7 +14,7 @@ use kaleido_adapter_codex::{
 use kaleido_proto::capability::EvidenceSource;
 use kaleido_proto::content::{ContentKind, Sensitivity};
 use kaleido_proto::host::LaunchSurface;
-use kaleido_proto::ids::SessionId;
+use kaleido_proto::ids::{DeviceId, SessionId};
 use kaleido_proto::turn::TurnOrigin;
 use kaleido_state::ClockSource;
 use kaleido_transport::bootstrap::encode_uri;
@@ -145,6 +145,27 @@ impl CodexLanHost {
     /// it to `tracing` or ordinary analytics.
     pub fn pairing_uri(&self) -> &str {
         &self.pairing_uri
+    }
+
+    /// Issues another one-time pairing credential for an operator-initiated
+    /// device enrollment. The returned secret must be shown directly and must
+    /// never enter tracing or durable state.
+    pub fn issue_pairing_uri(&self) -> Result<String, CodexLanError> {
+        let server = self.server.as_ref().ok_or(CodexLanError::Listener)?;
+        let bootstrap = server
+            .issue_pairing(now_ms())
+            .map_err(|_| CodexLanError::Pairing)?;
+        encode_uri(&bootstrap).map_err(|_| CodexLanError::Pairing)
+    }
+
+    /// Durably revokes a paired Android identity before active connections are
+    /// notified and closed by the LAN server.
+    pub fn revoke_device(&self, device_id: &DeviceId) -> Result<(), CodexLanError> {
+        self.server
+            .as_ref()
+            .ok_or(CodexLanError::Listener)?
+            .revoke_device(device_id, now_ms())
+            .map_err(|_| CodexLanError::Listener)
     }
 
     pub fn session_id(&self) -> &SessionId {

@@ -1,0 +1,137 @@
+name: Android CI
+
+'on':
+  push:
+    paths:
+      - 'apps/android/**'
+      - 'crates/kaleido-core/**'
+      - 'crates/kaleido-proto/**'
+      - 'crates/kaleido-transport/**'
+      - 'crates/*/Cargo.toml'
+      - 'spikes/*/Cargo.toml'
+      - 'xtask/Cargo.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/android.yml'
+  pull_request:
+    paths:
+      - 'apps/android/**'
+      - 'crates/kaleido-core/**'
+      - 'crates/kaleido-proto/**'
+      - 'crates/kaleido-transport/**'
+      - 'crates/*/Cargo.toml'
+      - 'spikes/*/Cargo.toml'
+      - 'xtask/Cargo.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/android.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    name: Android API 35 (x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@4733eaac7c1b0da527e4206b7671e0061de1ce37 # v6
+
+      - name: Set up JDK 22
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '22'
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: false
+          rustflags: ''
+          target: aarch64-linux-android,x86_64-linux-android
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+
+      - name: Install pinned cargo-ndk
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+
+      - name: Install Android API 35 toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            'platform-tools' \
+            'platforms;android-35' \
+            'build-tools;35.0.0' \
+            'ndk;28.2.13676358' \
+            'emulator' \
+            'system-images;android-35;google_apis;x86_64'
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/28.2.13676358" >> "$GITHUB_ENV"
+
+      - name: Build AAR, APK, lint and JVM tests
+        working-directory: apps/android
+        run: >-
+          ./gradlew
+          --no-daemon
+          --console=plain
+          :core-android:verifyCoreAndroidAar
+          :app:assembleDebug
+          :app:assembleDebugAndroidTest
+          :app:testDebugUnitTest
+          :app:lintDebug
+
+      - name: Enable KVM access
+        shell: bash
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run API 35 native smoke and instrumentation
+        uses: reactivecircus/android-emulator-runner@4c44018e59b437e86cdfc41da381398f93ed8808 # v2
+        with:
+          api-level: 35
+          arch: x86_64
+          target: google_apis
+          profile: pixel_6
+          disable-animations: true
+          emulator-options: >-
+            -no-window
+            -gpu swiftshader_indirect
+            -noaudio
+            -no-boot-anim
+            -camera-back none
+          script: |
+            apps/android/gradlew \
+              --project-dir apps/android \
+              --no-daemon \
+              --console=plain \
+              :app:connectedDebugAndroidTest \
+              -Pandroid.testInstrumentationRunnerArguments.class=com.onekaleidoscope.integration.NativeUniFfiSmokeTest
+            apps/android/gradlew \
+              --project-dir apps/android \
+              --no-daemon \
+              --console=plain \
+              :app:connectedDebugAndroidTest
+
+      - name: Upload Android artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: onekaleidoscope-android
+          if-no-files-found: error
+          path: |
+            apps/android/core-android/build/outputs/aar/*.aar
+            apps/android/app/build/outputs/apk/**/*.apk
+            apps/android/app/build/reports/lint-results-debug.html
+            apps/android/app/build/reports/androidTests/connected/**

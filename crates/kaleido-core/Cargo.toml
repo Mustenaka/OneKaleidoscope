@@ -18,6 +18,7 @@ path = "src/bin/uniffi-bindgen.rs"
 [dependencies]
 kaleido-proto = { path = "../kaleido-proto", features = ["uniffi"] }
 kaleido-transport = { path = "../kaleido-transport" }
+rand_core = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
