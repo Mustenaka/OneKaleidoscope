@@ -7,8 +7,9 @@
 //! an approval that is already decided or already expired.
 
 use kaleido_proto::attention::{
-    ApprovalRequest, AttentionItem, AttentionResponse, AttentionState, AttentionSubject,
-    DecisionOption, DecisionSemantics, JoinState,
+    ApprovalRequest, AttentionAnswerEvidence, AttentionAnswerEvidenceSource, AttentionAnswerSource,
+    AttentionItem, AttentionResponse, AttentionState, AttentionSubject, DecisionOption,
+    DecisionSemantics, JoinState,
 };
 use kaleido_proto::capability::{
     Capability, CapabilityEntry, CapabilityEvidence, CapabilityState, EvidenceSource,
@@ -16,7 +17,7 @@ use kaleido_proto::capability::{
 };
 use kaleido_proto::command::{Actor, Command, CommandEnvelope, CommandOutcome};
 use kaleido_proto::content::{ContentKind, ContentRef, Sensitivity};
-use kaleido_proto::effect::StateEffect;
+use kaleido_proto::effect::{StateEffect, StreamKey};
 use kaleido_proto::error::ErrorCode;
 use kaleido_proto::host::{
     ConnectionState, Host, HostPlatform, HostReachability, LaunchSurface, Project, ProjectBinding,
@@ -31,7 +32,7 @@ use kaleido_proto::session::{
     HistorySource, HistorySourceKind, LiveBinding, LiveUnboundReason, OwnershipMode, SessionStatus,
 };
 use kaleido_proto::turn::{Item, ItemBody, ItemStatus, MessagePhase, Turn, TurnOrigin, TurnStatus};
-use kaleido_state::{CanonicalStore, ClockSource};
+use kaleido_state::{CanonicalStore, ClockSource, StateError};
 
 const NOW_MS: i64 = 1_785_378_000_000;
 
@@ -357,6 +358,139 @@ fn answering_an_already_answered_approval_is_refused() {
         }
         other => panic!("expected a rejection, found {other:?}"),
     }
+}
+
+#[test]
+fn a_local_answer_references_the_real_envelope_command() {
+    let mut fixture = scaffold(None);
+    let envelope = reply(&fixture, "real-envelope", "accept", None);
+    fixture
+        .store
+        .submit_command(&envelope, NOW_MS)
+        .expect("submit local answer");
+
+    let answered = fixture
+        .store
+        .state()
+        .attention(&fixture.attention_id)
+        .expect("answered attention");
+    match &answered.state {
+        AttentionState::Answered {
+            answer_source: AttentionAnswerSource::LocalCommand { command_id },
+            ..
+        } => assert_eq!(command_id, &envelope.command_id),
+        other => panic!("expected a local-command answer, found {other:?}"),
+    }
+}
+
+#[test]
+fn a_local_reply_after_an_external_answer_is_already_answered() {
+    let mut fixture = scaffold(None);
+    let mut externally_answered = fixture
+        .store
+        .state()
+        .attention(&fixture.attention_id)
+        .cloned()
+        .expect("open attention");
+    externally_answered.state = AttentionState::Answered {
+        option_id: Some("accept".to_owned()),
+        free_form_ref: None,
+        decided_at_ms: NOW_MS,
+        answer_source: AttentionAnswerSource::ObservedExternal {
+            evidence: AttentionAnswerEvidence {
+                observer_host_id: externally_answered.host_id.clone(),
+                observed_at_ms: NOW_MS,
+                source: AttentionAnswerEvidenceSource::ObservedInTraffic,
+            },
+        },
+    };
+    fixture
+        .store
+        .apply(&StateEffect::AttentionUpserted {
+            item: externally_answered,
+        })
+        .expect("apply external observation");
+
+    let envelope = reply(&fixture, "after-external", "decline", None);
+    match fixture
+        .store
+        .submit_command(&envelope, NOW_MS)
+        .expect("submit after external answer")
+        .outcome
+    {
+        CommandOutcome::Rejected { error } => {
+            assert_eq!(error.code, ErrorCode::ApprovalAlreadyAnswered);
+        }
+        other => panic!("expected an already-answered rejection, found {other:?}"),
+    }
+    assert!(matches!(
+        fixture
+            .store
+            .state()
+            .attention(&fixture.attention_id)
+            .map(|item| &item.state),
+        Some(AttentionState::Answered {
+            answer_source: AttentionAnswerSource::ObservedExternal { .. },
+            ..
+        })
+    ));
+}
+
+#[test]
+fn a_zero_one_answered_log_fails_loud_without_migration() {
+    let mut fixture = scaffold(None);
+    let envelope = reply(&fixture, "legacy-shape", "accept", None);
+    fixture
+        .store
+        .submit_command(&envelope, NOW_MS)
+        .expect("write a current answer");
+
+    let stream = StreamKey::Session {
+        session_id: fixture.session_id.clone(),
+    };
+    let path = fixture.store.log().path_for(&stream);
+    let contents = std::fs::read_to_string(&path).expect("read session log");
+    let mut replaced = false;
+    let mut legacy_lines = Vec::new();
+    for line in contents.lines() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(line).expect("parse current record");
+        if value
+            .pointer("/effect/kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("attention_upserted")
+            && value
+                .pointer("/effect/item/state/kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("answered")
+        {
+            let state = value
+                .pointer_mut("/effect/item/state")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("answered state object");
+            let answer_source = state
+                .remove("answer_source")
+                .expect("current answer source");
+            let command_id = answer_source
+                .get("command_id")
+                .cloned()
+                .expect("local command id");
+            state.insert("command_id".to_owned(), command_id);
+            replaced = true;
+        }
+        legacy_lines.push(serde_json::to_string(&value).expect("encode legacy record"));
+    }
+    assert!(replaced, "the test must rewrite an Answered record");
+    let mut legacy_log = legacy_lines.join("\n");
+    legacy_log.push('\n');
+    std::fs::write(&path, legacy_log).expect("write legacy-shaped log");
+
+    let root = fixture.store.root().to_path_buf();
+    drop(fixture.store);
+    assert!(matches!(
+        CanonicalStore::load(&root, ClockSource::Fixed { at_ms: NOW_MS }),
+        Err(StateError::MalformedRecord { .. })
+    ));
 }
 
 #[test]

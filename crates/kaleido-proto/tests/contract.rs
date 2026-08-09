@@ -1,5 +1,5 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
-//! Executable contract checks for UACP v0.1.
+//! Executable contract checks for UACP v0.2.
 //!
 //! These tests intentionally exercise both success and rejection paths. The
 //! Codex evidence checks read the committed recorder fixtures; they do not
@@ -11,9 +11,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use kaleido_proto::attention::{
-    ApprovalRequest, AttentionItem, AttentionResponse, AttentionState, AttentionSubject,
-    DecisionOption, DecisionSemantics, JoinFailureReason, JoinState, ReplyRejection,
-    WorkflowGateRequest,
+    ApprovalRequest, AttentionAnswerEvidence, AttentionAnswerEvidenceSource, AttentionAnswerSource,
+    AttentionItem, AttentionResponse, AttentionState, AttentionSubject, DecisionOption,
+    DecisionSemantics, JoinFailureReason, JoinState, ReplyRejection, WorkflowGateRequest,
 };
 use kaleido_proto::capability::{
     Capability, CapabilityEntry, CapabilityEvidence, CapabilityState, CapabilityUnavailableReason,
@@ -394,11 +394,146 @@ fn attention_reply_binds_target_session_key_state_expiry_and_offered_option() {
         option_id: Some("accept".to_owned()),
         free_form_ref: None,
         decided_at_ms: NOW,
-        command_id: CommandId::new("command-answered"),
+        answer_source: AttentionAnswerSource::LocalCommand {
+            command_id: CommandId::new("command-answered"),
+        },
     };
     assert_eq!(
         answered.check_reply(&response, NOW),
         Err(ReplyRejection::NotOpen)
+    );
+}
+
+#[test]
+fn answered_attention_distinguishes_local_commands_from_external_observations() {
+    let response = approval_response();
+
+    let mut local = approval(JoinState::Joined { item_id: item_id() });
+    local.state = AttentionState::Answered {
+        option_id: Some("accept".to_owned()),
+        free_form_ref: None,
+        decided_at_ms: NOW,
+        answer_source: AttentionAnswerSource::LocalCommand {
+            command_id: CommandId::new("command-local"),
+        },
+    };
+    assert!(local.validate().is_ok());
+    assert_eq!(
+        local.check_reply(&response, NOW),
+        Err(ReplyRejection::NotOpen)
+    );
+    let local_json = serde_json::to_value(&local).expect("serialize local answer");
+    assert_eq!(
+        local_json.pointer("/state/answer_source/kind"),
+        Some(&Value::from("local_command"))
+    );
+    assert_eq!(
+        local_json.pointer("/state/answer_source/command_id/value"),
+        Some(&Value::from("command-local"))
+    );
+
+    let mut external = approval(JoinState::Joined { item_id: item_id() });
+    external.state = AttentionState::Answered {
+        option_id: Some("decline".to_owned()),
+        free_form_ref: None,
+        decided_at_ms: NOW,
+        answer_source: AttentionAnswerSource::ObservedExternal {
+            evidence: AttentionAnswerEvidence {
+                observer_host_id: host_id(),
+                observed_at_ms: NOW,
+                source: AttentionAnswerEvidenceSource::RecordedFixture,
+            },
+        },
+    };
+    assert!(external.validate().is_ok());
+    assert_eq!(
+        external.check_reply(&response, NOW),
+        Err(ReplyRejection::NotOpen)
+    );
+    let external_json = serde_json::to_value(&external).expect("serialize external answer");
+    assert_eq!(
+        external_json.pointer("/state/answer_source/kind"),
+        Some(&Value::from("observed_external"))
+    );
+    assert_eq!(
+        external_json.pointer("/state/answer_source/evidence/source/kind"),
+        Some(&Value::from("recorded_fixture"))
+    );
+    assert!(external_json.pointer("/state/command_id").is_none());
+    assert!(external_json
+        .pointer("/state/answer_source/command_id")
+        .is_none());
+}
+
+#[test]
+fn attention_answer_source_rejects_empty_or_cross_host_evidence_and_old_wire_shape() {
+    let mut empty_command = approval(JoinState::Joined { item_id: item_id() });
+    empty_command.state = AttentionState::Answered {
+        option_id: Some("accept".to_owned()),
+        free_form_ref: None,
+        decided_at_ms: NOW,
+        answer_source: AttentionAnswerSource::LocalCommand {
+            command_id: CommandId::new(""),
+        },
+    };
+    assert_eq!(
+        empty_command.validate(),
+        Err(ContractViolation::EmptyIdentifier {
+            field: "attention_state.answer_source.command_id"
+        })
+    );
+
+    let mut empty_observer = approval(JoinState::Joined { item_id: item_id() });
+    empty_observer.state = AttentionState::Answered {
+        option_id: Some("accept".to_owned()),
+        free_form_ref: None,
+        decided_at_ms: NOW,
+        answer_source: AttentionAnswerSource::ObservedExternal {
+            evidence: AttentionAnswerEvidence {
+                observer_host_id: HostId::new(""),
+                observed_at_ms: NOW,
+                source: AttentionAnswerEvidenceSource::ObservedInTraffic,
+            },
+        },
+    };
+    assert_eq!(
+        empty_observer.validate(),
+        Err(ContractViolation::EmptyIdentifier {
+            field: "attention_state.answer_source.evidence.observer_host_id"
+        })
+    );
+
+    let mut wrong_observer = approval(JoinState::Joined { item_id: item_id() });
+    wrong_observer.state = AttentionState::Answered {
+        option_id: Some("accept".to_owned()),
+        free_form_ref: None,
+        decided_at_ms: NOW,
+        answer_source: AttentionAnswerSource::ObservedExternal {
+            evidence: AttentionAnswerEvidence {
+                observer_host_id: HostId::new("host-other"),
+                observed_at_ms: NOW,
+                source: AttentionAnswerEvidenceSource::ObservedInTraffic,
+            },
+        },
+    };
+    assert_eq!(
+        wrong_observer.validate(),
+        Err(ContractViolation::AttentionAnswerObserverHostMismatch)
+    );
+
+    let old_answered = serde_json::json!({
+        "kind": "answered",
+        "option_id": "accept",
+        "free_form_ref": null,
+        "decided_at_ms": NOW,
+        "command_id": "command-old-wire"
+    });
+    assert!(serde_json::from_value::<AttentionState>(old_answered).is_err());
+    assert!(
+        serde_json::from_value::<AttentionAnswerEvidenceSource>(serde_json::json!({
+            "kind": "future_source"
+        }))
+        .is_err()
     );
 }
 
@@ -1265,15 +1400,16 @@ fn unknown_provider_message_becomes_diagnostic_without_fabricating_support() {
 // --- Version boundary and projection refresh -----------------------------
 
 #[test]
-fn pre_one_compatibility_is_limited_to_the_zero_one_line() {
-    assert_eq!(PROTOCOL_VERSION, "0.1.0");
-    assert!(version_is_compatible("0.1.0"));
-    assert!(version_is_compatible("0.1.999"));
+fn pre_one_compatibility_is_limited_to_the_zero_two_line() {
+    assert_eq!(PROTOCOL_VERSION, "0.2.0");
+    assert!(version_is_compatible("0.2.0"));
+    assert!(version_is_compatible("0.2.999"));
     assert!(!version_is_compatible("0.0.9"));
-    assert!(!version_is_compatible("0.2.0"));
+    assert!(!version_is_compatible("0.1.999"));
+    assert!(!version_is_compatible("0.3.0"));
     assert!(!version_is_compatible("1.0.0"));
-    assert!(!version_is_compatible("0.1"));
-    assert!(!version_is_compatible("0.1.0.1"));
+    assert!(!version_is_compatible("0.2"));
+    assert!(!version_is_compatible("0.2.0.1"));
     assert!(!version_is_compatible("not-a-version"));
 }
 

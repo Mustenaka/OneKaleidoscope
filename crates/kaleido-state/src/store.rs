@@ -11,7 +11,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use kaleido_proto::attention::{AttentionItem, AttentionState, ReplyRejection};
+use kaleido_proto::attention::{
+    AttentionAnswerSource, AttentionItem, AttentionState, ReplyRejection,
+};
 use kaleido_proto::command::{Command, CommandAck, CommandEnvelope, CommandOutcome};
 use kaleido_proto::content::ContentKind;
 use kaleido_proto::effect::{Cursor, LogRecord, SessionSnapshot, StateEffect, StreamKey};
@@ -457,7 +459,9 @@ impl CanonicalStore {
             option_id: response.option_id.clone(),
             free_form_ref: response.free_form_ref.clone(),
             decided_at_ms: now_ms,
-            command_id: command_id.clone(),
+            answer_source: AttentionAnswerSource::LocalCommand {
+                command_id: command_id.clone(),
+            },
         };
         self.apply(&StateEffect::AttentionUpserted { item: answered })?;
         // The broker has recorded the decision. Whether the runtime accepted it

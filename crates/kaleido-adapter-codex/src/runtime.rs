@@ -14,7 +14,7 @@ use kaleido_proto::attention::AttentionResponse;
 use kaleido_proto::content::{ContentKind, ContentRef};
 use kaleido_proto::effect::StateEffect;
 use kaleido_proto::host::ConnectionFaultReason;
-use kaleido_proto::ids::{ProjectBindingId, ProjectId, ProviderRuntimeId, SessionId};
+use kaleido_proto::ids::{CommandId, ProjectBindingId, ProjectId, ProviderRuntimeId, SessionId};
 use serde_json::{json, Value};
 
 use crate::process::{ChildTransport, Receive};
@@ -352,6 +352,7 @@ impl ProviderRuntimeSession for CodexRuntimeSession {
 
     fn respond_attention(
         &mut self,
+        command_id: &CommandId,
         response: &AttentionResponse,
         content: &mut dyn ContentAccess,
     ) -> Result<Vec<StateEffect>, RuntimeSessionError> {
@@ -370,13 +371,25 @@ impl ProviderRuntimeSession for CodexRuntimeSession {
             .reducer
             .approval_request_id(&response.attention_id)
             .ok_or(RuntimeSessionError::CapabilityUnavailable)?;
-        // A live reply is still decoded by the shared reducer. The reducer
-        // deliberately emits no synthetic canonical answer in live mode: the
-        // store has already applied the real RespondAttention command.
-        self.send_value(
+        if !self
+            .reducer
+            .register_local_attention_answer(&response.attention_id, command_id, option)
+        {
+            return Err(RuntimeSessionError::CapabilityUnavailable);
+        }
+        // The outgoing reply is still decoded by the shared reducer. Its
+        // per-attention command association prevents it from overwriting the
+        // LocalCommand answer already applied by the store, while unrelated
+        // live replies remain externally observed answers.
+        let sent = self.send_value(
             &json!({ "id": request_id, "result": { "decision": option } }),
             content,
-        )
+        );
+        if sent.is_err() {
+            self.reducer
+                .forget_local_attention_answer(&response.attention_id);
+        }
+        sent
     }
 
     fn drain_effects(

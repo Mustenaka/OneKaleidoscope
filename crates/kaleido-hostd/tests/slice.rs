@@ -12,7 +12,8 @@ mod support;
 
 use kaleido_adapter::IdentityMint;
 use kaleido_hostd::slice::{self, ApprovalDecision, ReplayRequest, RunRequest, REPLAY_BASE_AT_MS};
-use kaleido_proto::attention::AttentionSubject;
+use kaleido_proto::attention::{AttentionAnswerSource, AttentionState, AttentionSubject};
+use kaleido_proto::effect::StateEffect;
 use kaleido_proto::host::{ConnectionFaultReason, ConnectionState};
 use kaleido_proto::session::{LiveBinding, LiveUnboundReason, SessionStatus};
 use kaleido_proto::ContractViolation;
@@ -397,6 +398,30 @@ fn live_orchestration_latches_streaming_and_keeps_steer_pending() {
             .into_iter()
             .any(|entry| matches!(entry.subject, AttentionSubject::ConnectionFault { .. })),
         "an intentional close must not fabricate a connection fault"
+    );
+    let local_command_id = reloaded
+        .state()
+        .attention_entries()
+        .into_iter()
+        .find_map(|entry| match &entry.state {
+            AttentionState::Answered {
+                answer_source: AttentionAnswerSource::LocalCommand { command_id },
+                ..
+            } => Some(command_id.clone()),
+            _ => None,
+        })
+        .expect("the broker-owned approval keeps its real local command ID");
+    assert!(
+        reloaded
+            .log()
+            .read_all()
+            .expect("read live log")
+            .iter()
+            .any(|record| matches!(
+                &record.effect,
+                StateEffect::CommandAcknowledged { ack } if ack.command_id == local_command_id
+            )),
+        "the answer source must reference an actual command acknowledgement"
     );
 }
 
