@@ -6,32 +6,60 @@
 //! depends on a login, a network or the version of Codex installed locally.
 
 use std::io::Write;
-use std::path::Path;
-
 mod support;
 
 use kaleido_adapter::IdentityMint;
-use kaleido_hostd::slice::{self, ApprovalDecision, ReplayRequest, RunRequest, REPLAY_BASE_AT_MS};
+use kaleido_hostd::slice::{
+    self, ApprovalDecision, ReplayRequest, RunRequest, R3_CODEX_PROJECTIONS, REPLAY_BASE_AT_MS,
+};
 use kaleido_proto::attention::{AttentionAnswerSource, AttentionState, AttentionSubject};
 use kaleido_proto::capability::Capability;
 use kaleido_proto::command::CommandOutcome;
 use kaleido_proto::effect::StateEffect;
 use kaleido_proto::host::{ConnectionFaultReason, ConnectionState};
 use kaleido_proto::ids::ProviderBindingKind;
+use kaleido_proto::projection::ProjectionKey;
 use kaleido_proto::session::{LiveBinding, LiveUnboundReason, SessionStatus};
 use kaleido_proto::ContractViolation;
 use kaleido_state::{CanonicalStore, ClockSource, ProjectionName, StateError};
 
 use support::{fixture, forbidden_strings, replay, FixtureRuntime, FIXTURES};
 
-fn projections(log_dir: &Path, session_id: &kaleido_proto::ids::SessionId) -> Vec<String> {
-    ProjectionName::ALL
-        .iter()
-        .map(|name| {
-            slice::show(log_dir, *name, Some(session_id))
-                .unwrap_or_else(|error| panic!("render {}: {error}", name.as_str()))
-        })
-        .collect()
+fn r3_keys(
+    state: &kaleido_state::CanonicalState,
+    session_id: &kaleido_proto::ids::SessionId,
+) -> Vec<ProjectionKey> {
+    let session = state.session(session_id).expect("fixture session");
+    let host_id = state.hosts().next().expect("fixture host").id.clone();
+    let runtime_id = session
+        .history_source
+        .runtime_id
+        .clone()
+        .expect("fixture runtime binding");
+    vec![
+        ProjectionKey::ProjectIndex {
+            host_id: host_id.clone(),
+        },
+        ProjectionKey::SessionIndex {
+            project_id: session.project_id.clone(),
+        },
+        ProjectionKey::Transcript {
+            session_id: session_id.clone(),
+        },
+        ProjectionKey::LiveActivity {
+            session_id: session_id.clone(),
+        },
+        ProjectionKey::InputQueue {
+            session_id: session_id.clone(),
+        },
+        ProjectionKey::AttentionInbox {
+            host_id: host_id.clone(),
+        },
+        ProjectionKey::RuntimeCapability {
+            host_id,
+            runtime_id,
+        },
+    ]
 }
 
 #[test]
@@ -58,13 +86,48 @@ fn a_replayed_session_rebuilds_field_for_field_after_a_reload() {
 
 #[test]
 fn every_projection_is_identical_before_and_after_a_reload() {
-    let replayed = replay("04-permission-deny.jsonl");
-    let before = projections(&replayed.log_dir, &replayed.session_id);
-    let after = projections(&replayed.log_dir, &replayed.session_id);
-    assert_eq!(before, after);
-    assert_eq!(before.len(), 6, "this slice owns six read models");
-    for rendered in &before {
-        assert!(rendered.contains("\"projection_version\""));
+    for fixture_name in FIXTURES {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let log_dir = directory.path().join("log");
+        let request = ReplayRequest::new(fixture(fixture_name), &log_dir);
+        let (outcome, store) =
+            slice::replay_into_store(&request).expect("replay the recorded fixture");
+        let keys = r3_keys(store.state(), &outcome.session_id);
+        assert_eq!(keys.len(), R3_CODEX_PROJECTIONS.len());
+        let before = keys
+            .iter()
+            .map(|key| {
+                store
+                    .projection_journal()
+                    .current(key)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("{fixture_name}: missing current {key:?}"))
+            })
+            .collect::<Vec<_>>();
+        drop(store);
+
+        let reloaded = CanonicalStore::load(
+            &log_dir,
+            ClockSource::Fixed {
+                at_ms: slice::REPLAY_BASE_AT_MS,
+            },
+        )
+        .expect("reload projection journal");
+        let after = keys
+            .iter()
+            .map(|key| {
+                reloaded
+                    .projection_journal()
+                    .current(key)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("{fixture_name}: missing reloaded {key:?}"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(before, after, "{fixture_name}: journal reload diverged");
+
+        let all = slice::show_all(&log_dir, Some(&outcome.session_id))
+            .expect("show all seven Codex projections");
+        assert!(!all.contains("workflow-board"));
     }
 }
 

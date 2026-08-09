@@ -48,6 +48,12 @@ pub enum HostdError {
 
     #[error("live state persistence failed")]
     LiveStatePersistence,
+
+    #[error("this operating system is not supported by the host daemon")]
+    UnsupportedHostPlatform,
+
+    #[error("the LAN host could not be started or stopped")]
+    Lan,
 }
 
 impl HostdError {

@@ -15,12 +15,19 @@ kaleido-adapter = { path = "../kaleido-adapter" }
 kaleido-adapter-codex = { path = "../kaleido-adapter-codex" }
 kaleido-proto = { path = "../kaleido-proto" }
 kaleido-state = { path = "../kaleido-state" }
+kaleido-transport = { path = "../kaleido-transport" }
+rand_core = { workspace = true }
+rustls = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+kaleido-core = { path = "../kaleido-core" }
+p256 = { workspace = true }
+sha2 = { workspace = true }
 tempfile = "=3.27.0"
 
 [lints]

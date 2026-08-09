@@ -39,6 +39,20 @@ use crate::error::HostdError;
 /// instants stay in the same range and order sensibly.
 pub const REPLAY_BASE_AT_MS: i64 = 1_785_378_000_000;
 
+/// The seven projections a Codex session can actually materialize in R3.
+///
+/// `WorkflowBoard` remains a valid transport/protocol key, but a Codex fixture
+/// with no workflow must not invent one just to satisfy a diagnostic `all`.
+pub const R3_CODEX_PROJECTIONS: [ProjectionName; 7] = [
+    ProjectionName::ProjectIndex,
+    ProjectionName::SessionIndex,
+    ProjectionName::Transcript,
+    ProjectionName::LiveActivity,
+    ProjectionName::InputQueue,
+    ProjectionName::AttentionInbox,
+    ProjectionName::RuntimeCapability,
+];
+
 /// What to replay and where to put the result.
 #[derive(Debug, Clone)]
 pub struct ReplayRequest {
@@ -155,7 +169,7 @@ pub fn replay_into_store(
     )?;
     let mut reducer = CodexReducer::new(ReducerConfig {
         host_display_name: request.host_display_name.clone(),
-        host_platform: host_platform(),
+        host_platform: host_platform()?,
         project_display_name: request.project_display_name.clone(),
         identity_salt: request.host_display_name.clone(),
         // A recording proves the shape of the protocol, not that anything is
@@ -200,7 +214,7 @@ pub fn run(request: &RunRequest) -> Result<RunOutcome, HostdError> {
     let submit_command_id = mint.command_id(&format!("slice-run-submit|{issued_at_ms}"));
     let reducer = ReducerConfig {
         host_display_name: "kaleido-host".to_owned(),
-        host_platform: host_platform(),
+        host_platform: host_platform()?,
         project_display_name: "kaleido-slice".to_owned(),
         identity_salt: "kaleido-host".to_owned(),
         evidence: EvidenceSource::ObservedInTraffic,
@@ -532,7 +546,7 @@ fn render_run_outcome(
     process_exited: bool,
 ) -> Result<RunOutcome, HostdError> {
     let mut projections = serde_json::Map::new();
-    for name in ProjectionName::ALL {
+    for name in R3_CODEX_PROJECTIONS {
         projections.insert(
             name.as_str().to_owned(),
             serde_json::to_value(store.projection(name, Some(&session_id))?)?,
@@ -603,7 +617,7 @@ pub fn show_all(log_dir: &Path, session_id: Option<&SessionId>) -> Result<String
         },
     )?;
     let mut rendered = serde_json::Map::new();
-    for name in ProjectionName::ALL {
+    for name in R3_CODEX_PROJECTIONS {
         let envelope = store.projection(name, session_id)?;
         rendered.insert(name.as_str().to_owned(), serde_json::to_value(&envelope)?);
     }
@@ -616,12 +630,6 @@ pub fn read_transcript(fixture: &Path) -> Result<Transcript, HostdError> {
     Ok(parse_transcript(&raw)?)
 }
 
-fn host_platform() -> HostPlatform {
-    if cfg!(target_os = "windows") {
-        HostPlatform::Windows
-    } else if cfg!(target_os = "macos") {
-        HostPlatform::MacOs
-    } else {
-        HostPlatform::Linux
-    }
+fn host_platform() -> Result<HostPlatform, HostdError> {
+    crate::platform::host_platform().ok_or(HostdError::UnsupportedHostPlatform)
 }
