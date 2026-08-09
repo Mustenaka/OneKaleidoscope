@@ -1,7 +1,8 @@
 # OneKaleidoscope 当前状态
 
 > 生效：2026-08-09
-> 进度基线：T-106 实现 `8cd949e`，三平台 [CI 全绿](https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31313728415)。
+> 进度基线：T-107 实现 `1ecedf4`，push / PR 两套三平台
+> [CI](https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31320367365) / [CI](https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31320378173) 全绿。
 
 ## 1. 当前结论
 
@@ -29,8 +30,7 @@ R3 开工审计又发现三个必须先闭合的合同缺口：
 3. 手机 prompt/free-form 没有安全的敏感正文写入入口，远端也不能被允许伪造 `Actor`。
 
 T-106 已以 UACP `0.3.0`、投影独立游标和 TRANSPORT `0.1.0` 关闭以上缺口。
-[T-107](tasks/T-107.md) 的本地实现门禁已通过，正在等待新 SHA 三平台 CI；随后执行
-[T-108](tasks/T-108.md)。
+[T-107](tasks/T-107.md) 已通过，下一项是 [T-108](tasks/T-108.md)。
 
 ## 2. 已完成
 
@@ -45,7 +45,7 @@ T-106 已以 UACP `0.3.0`、投影独立游标和 TRANSPORT `0.1.0` 关闭以上
 | T-103 | UACP `0.2.0` Attention provenance、旧 `0.1` 日志 fail-loud |
 | T-104 | `AcceptedByRuntime` → `LiveControl` → `Controlling`，含跨 runtime/session 防伪造守卫 |
 | T-106 | UACP `0.3.0` mobile contract、projection 独立游标、可信 command/content ingress、TRANSPORT `0.1.0` |
-| T-107（本地门禁） | pinned TLS LAN Broker、projection journal、可信 mobile ingress、Rust `MobileClient`、真实 Codex 冷重连纵切；等待新 SHA 三平台 CI |
+| T-107 | pinned TLS LAN Broker、projection journal、可信 mobile ingress、Rust `MobileClient`、真实 Codex 冷重连纵切；两套三平台 CI 全绿 |
 
 ## 3. 当前可用能力
 

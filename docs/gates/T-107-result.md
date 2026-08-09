@@ -1,7 +1,7 @@
 # T-107 门禁结果：hostd LAN Broker 与 Rust mobile core
 
 > 日期：2026-08-09
-> 状态：**本地实现门禁通过，等待新 SHA 三平台 CI**
+> 状态：**通过**
 
 ## 1. 实现结论
 
@@ -94,6 +94,12 @@ BUILD SUCCESSFUL; 2 actionable tasks executed
   状态观察结果。若要展示离线恢复 rejection，需要后续 ADR 增加查询/投影面。
 - 本卡不含 Android UI、R4 relay/push、真实 TurnSteer delivery 或其他 provider。
 
-## 7. 待完成
+## 7. 三平台 CI
 
-- 新提交 SHA 的 Windows / Ubuntu / macOS CI；macOS 同时提供 Swift consumer 编译证据。
+实现 SHA `1ecedf4` 的 push 与 PR 两套矩阵均全绿：
+
+- [push run 31320367365](https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31320367365)：
+  Windows、Ubuntu、macOS 全绿；
+- [PR run 31320378173](https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31320378173)：
+  Windows、Ubuntu、macOS 全绿；
+- GitGuardian 通过；macOS job 实际生成、编译并链接 Swift consumer。
