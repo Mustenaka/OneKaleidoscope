@@ -41,7 +41,12 @@ fixtures-verify: 5 files, 220 records
 Windows 上还以新类型图成功生成 Kotlin 与 Swift UniFFI 源码；外语消费端编译由
 Ubuntu/macOS Actions 门禁给出最终证据。
 
-三平台 Actions 结果在最终提交后补记。
+三平台 Actions：
+
+- [PR workflow 31304864165](https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31304864165)：
+  Ubuntu/Kotlin、macOS/Swift、Windows 全部成功；
+- [push workflow 31304842595](https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31304842595)：
+  同一实现 SHA 的三平台矩阵全部成功。
 
 ## 真实 Codex 0.147.0 纵切
 
