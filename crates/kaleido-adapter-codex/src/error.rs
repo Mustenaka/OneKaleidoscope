@@ -46,6 +46,12 @@ pub enum CodexAdapterError {
     #[error("upstream referenced a {scope} this adapter never bound")]
     UnknownBinding { scope: &'static str },
 
+    #[error("a local attention answer did not match its registered command response")]
+    LocalAttentionAnswerMismatch,
+
+    #[error("the reducer evidence source cannot prove an external attention answer")]
+    InvalidExternalAnswerEvidence,
+
     #[error(transparent)]
     Content(#[from] ContentAccessError),
 

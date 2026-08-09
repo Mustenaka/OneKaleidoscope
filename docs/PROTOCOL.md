@@ -1,13 +1,14 @@
-# PROTOCOL — UACP v0.1
+# PROTOCOL — UACP v0.2
 
-> 状态：**v0.1 合同定稿，2026-07-30**
+> 状态：**v0.2 合同定稿，2026-08-09**
 > 需求真源是 [REQUIREMENTS.md](REQUIREMENTS.md)。本文件在其之下、在任务卡之上。
 > 相关决策：[ADR-0009](adr/0009-session-broker.md)、[ADR-0010](adr/0010-canonical-state-and-workflow.md)、
-> [ADR-0011](adr/0011-self-hosted-connectivity.md)、[ADR-0012](adr/0012-provider-decode-strategy.md)。
+> [ADR-0011](adr/0011-self-hosted-connectivity.md)、[ADR-0012](adr/0012-provider-decode-strategy.md)、
+> [ADR-0018](adr/0018-attention-answer-provenance.md)。
 
 本文件定义 UACP（Unified Agent Control Protocol）的**规范化状态、命令、状态转移、
 投影、cursor 与能力语义**。它是 `crates/kaleido-proto` 的逐字来源：proto 中出现的每个类型
-都必须能在本文件找到定义，本文件定义的每个 v0.1 类型都必须在 proto 中存在。
+都必须能在本文件找到定义，本文件定义的每个 v0.2 类型都必须在 proto 中存在。
 
 **关键词**：必须 / 不得 / 应当 / 可以，按 RFC 2119 语义解释。
 
@@ -45,15 +46,15 @@ provider 报文
 ## 1. 版本与兼容
 
 ```
-PROTOCOL_VERSION = "0.1.0"
+PROTOCOL_VERSION = "0.2.0"
 ```
 
 - 握手时双方交换 `protocol_version`，格式必须是三个十进制分量
   `major.minor.patch`，不得带缺失分量、前后缀或非数字字符。
-- v0.1 是 pre-1.0。**minor 是兼容边界**：本实现只接受 `0.1.x`；`0.0.x`、
-  `0.2.x`、其他 `0.x`、`1.x` 和畸形版本都必须在解码业务消息前拒绝。
-- `0.1.x` 的 patch 版本只允许文档澄清和不改变 wire 形状的修复。
-- 所有 v0.1 UACP wire enum 都是**闭合合同**。未知 UACP `kind` 必须解码失败，
+- v0.2 是 pre-1.0。**minor 是兼容边界**：本实现只接受 `0.2.x`；`0.0.x`、
+  `0.1.x`、其他 `0.x`、`1.x` 和畸形版本都必须在解码业务消息前拒绝。
+- `0.2.x` 的 patch 版本只允许文档澄清和不改变 wire 形状的修复。
+- 所有 v0.2 UACP wire enum 都是**闭合合同**。未知 UACP `kind` 必须解码失败，
   不得猜成相近语义，也不得声称新增变体天然向前兼容。
 - 上游 provider 标签不直接成为 UACP enum。adapter 遇到未知 method、item 类型、
   status 或标签时，按 provider 合同产生 `DiagnosticRecorded` 或
@@ -75,12 +76,13 @@ PROTOCOL_VERSION = "0.1.0"
 `ToolSurface`、`FileChangeKind`、`PlanEntryState`、`ItemDiagnosticCode`、
 `DiagnosticSeverity`、
 `QueueIntent`、`QueueState`、`AttentionSubject`、`AttentionState`、
+`AttentionAnswerSource`、`AttentionAnswerEvidenceSource`、
 `JoinState`、`JoinFailureReason`、`DecisionSemantics`、`WorkflowState`、
 `StepRole`、`StepState`、`CompletionCondition`、`ArtifactKind`,
 `WorkflowAction`、`StepBlocker`、`ErrorCode`、`Actor`、`Command`、
 `CommandOutcome`、`StateEffect`、`DiagnosticCode`、`StreamKey`、
 `SnapshotPayload`、`SubscribeOutcome`、`ProjectionPayload` 和
-`ContentReadResponse`。v0.1 没有用于承接上游未知标签的开放 wire enum。
+`ContentReadResponse`。v0.2 没有用于承接上游未知标签的开放 wire enum。
 
 ---
 
@@ -561,10 +563,24 @@ AttentionSubject =
 AttentionState =
   | Open
   | Answered { option_id: Option<String>, free_form_ref: Option<ContentRef>,
-               decided_at_ms: i64, command_id: CommandId }
+               decided_at_ms: i64, answer_source: AttentionAnswerSource }
   | Expired  { at_ms: i64 }
   | Superseded { by: AttentionId }
   | Cancelled { at_ms: i64 }
+
+AttentionAnswerSource =
+  | LocalCommand { command_id: CommandId }
+  | ObservedExternal { evidence: AttentionAnswerEvidence }
+
+AttentionAnswerEvidence {
+  observer_host_id: HostId,
+  observed_at_ms: i64,
+  source: AttentionAnswerEvidenceSource,
+}
+
+AttentionAnswerEvidenceSource =
+  | ObservedInTraffic
+  | RecordedFixture
 
 ApprovalRequest {
   request_key: String,              // Broker 分配，跨重连稳定
@@ -637,15 +653,24 @@ AttentionResponse {
   `expected_expires_at_ms`；expected expiry 必须与当前 AttentionItem 完全一致。
   validator 还必须检查当前 state 是 `Open`、`now_ms < expires_at_ms`、选择项存在，
   以及 free-form 是否允许。
-- 过期后的回复必须以 `ErrorCode::ApprovalExpired` 拒绝；重复回复返回
-  `CommandOutcome::Duplicate`，不得重复下发给 runtime。
+- 本地 `RespondAttention` 接受后，`answer_source` 必须是
+  `LocalCommand { command_id }`，且 `command_id` 必须是实际进入 Broker 的
+  `CommandEnvelope.command_id`；不得为上游决定铸造 ID。
+- 无法关联到本地命令的 live reply 必须使用
+  `ObservedExternal { evidence.source = ObservedInTraffic }`；真实 fixture replay 必须使用
+  `RecordedFixture`。`observer_host_id` 必须非空且等于外层 `AttentionItem.host_id`；
+  replay 的 `observed_at_ms` 必须来自原始记录，不得使用 replay 墙钟。
+- `ObservedExternal` 只证明 Broker 在何处、何时、通过何种媒介观察到决定，不声明外部 actor 身份。
+- 过期后的回复必须以 `ErrorCode::ApprovalExpired` 拒绝。重复提交同一个本地幂等键返回
+  `CommandOutcome::Duplicate`；对任何已经 `Answered` 的事项新发本地回复，均返回
+  `Rejected { error.code = ApprovalAlreadyAnswered }`，不得下发给 runtime。
 - `options` 由 runtime 提供，**不得**在客户端硬编码为「同意/拒绝」两项。
 - 同一 request 的 `option_id` 不得重复；回复至少要有 option 或 free-form 之一。
 - `ConnectionFault` 使会话在移动端 Inbox 可见，但不产生 `Turn.error`。
 
 ### 4.8 Workflow
 
-Workflow 是 v1 必做（[ADR-0010](adr/0010-canonical-state-and-workflow.md) D-4），v0.1 只定义状态与人工推进，不含自动调度策略。
+Workflow 是 v1 必做（[ADR-0010](adr/0010-canonical-state-and-workflow.md) D-4），v0.2 只定义状态与人工推进，不含自动调度策略。
 
 ```
 Workflow {
@@ -1006,7 +1031,7 @@ Command =
   | CancelWorkflow    { workflow_id: WorkflowId }
 ```
 
-注意 v0.1 **没有** `SteerActiveTurn` 命令。引导一律通过
+注意 v0.2 **没有** `SteerActiveTurn` 命令。引导一律通过
 `EnqueueInput { intent: SteerActiveTurn }` 表达，由 Broker 依据能力和 runtime 确认决定
 它最终是 `DeliveredAsSteer` 还是留在 `Pending`。这样协议层面就不存在「假装已引导」的
 表达方式（R-P9）。
@@ -1345,9 +1370,9 @@ diff 或命令内容。可展示上下文在 `:48` 的 item 报文里。因此 `
 两条 reasoning、两条 agentMessage 和一条 fileChange。因此 `Turn.item_ids` 必须由逐条
 item 转移累积，见 §4.4。
 
-### 11.3 观测到但 v0.1 不使用的面
+### 11.3 观测到但 v0.2 不使用的面
 
-以下 method 在真实录制中出现，v0.1 **不**建模，一律走 `DiagnosticRecorded`：
+以下 method 在真实录制中出现，v0.2 **不**建模，一律走 `DiagnosticRecorded`：
 
 `mcpServer/startupStatus/updated`、`thread/tokenUsage/updated`、
 `account/rateLimits/updated`、`remoteControl/status/changed`。
@@ -1358,7 +1383,7 @@ item 转移累积，见 §4.4。
 
 ---
 
-## 12. v0.1 明确不含
+## 12. v0.2 明确不含
 
 | 项 | 归属 |
 |---|---|

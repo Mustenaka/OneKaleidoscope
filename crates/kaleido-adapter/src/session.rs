@@ -9,7 +9,7 @@ use kaleido_proto::attention::AttentionResponse;
 use kaleido_proto::content::ContentRef;
 use kaleido_proto::effect::StateEffect;
 use kaleido_proto::host::ConnectionFaultReason;
-use kaleido_proto::ids::{ProjectBindingId, ProjectId, ProviderRuntimeId};
+use kaleido_proto::ids::{CommandId, ProjectBindingId, ProjectId, ProviderRuntimeId};
 use kaleido_proto::ContractViolation;
 use thiserror::Error;
 
@@ -43,9 +43,12 @@ pub trait ProviderRuntimeSession {
         content: &mut dyn ContentAccess,
     ) -> Result<Vec<StateEffect>, RuntimeSessionError>;
 
-    /// Answers an open approval or question.
+    /// Answers an open approval or question on behalf of a real broker
+    /// command. The command identifier lets an adapter distinguish this send
+    /// from an answer merely observed on a shared runtime.
     fn respond_attention(
         &mut self,
+        command_id: &CommandId,
         response: &AttentionResponse,
         content: &mut dyn ContentAccess,
     ) -> Result<Vec<StateEffect>, RuntimeSessionError>;

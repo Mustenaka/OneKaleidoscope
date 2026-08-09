@@ -10,12 +10,15 @@ mod support;
 use kaleido_adapter_codex::error::CodexAdapterError;
 use kaleido_adapter_codex::transcript::Direction;
 use kaleido_adapter_codex::{CodexReducer, ReducerConfig, SurfacePurpose, TranscriptFrame};
-use kaleido_proto::attention::{AttentionState, AttentionSubject, JoinFailureReason, JoinState};
+use kaleido_proto::attention::{
+    AttentionAnswerEvidenceSource, AttentionAnswerSource, AttentionState, AttentionSubject,
+    JoinFailureReason, JoinState,
+};
 use kaleido_proto::capability::{Capability, CapabilityState, EvidenceSource};
 use kaleido_proto::effect::{DiagnosticCode, StateEffect};
 use kaleido_proto::error::ErrorCode;
 use kaleido_proto::host::{ConnectionFaultReason, ConnectionState, HostPlatform, LaunchSurface};
-use kaleido_proto::ids::ItemId;
+use kaleido_proto::ids::{CommandId, ItemId};
 use kaleido_proto::session::{LiveBinding, LiveUnboundReason, SessionStatus};
 use kaleido_proto::turn::{ItemBody, ItemStatus, MessagePhase, TurnOrigin, TurnStatus};
 use serde_json::Value;
@@ -285,7 +288,16 @@ fn an_approved_file_change_completes_and_its_approval_is_answered() {
     assert_eq!(file_edit.1, ItemStatus::Completed);
 
     let attention = last_attention(&effects);
-    assert!(matches!(attention.state, AttentionState::Answered { .. }));
+    assert!(matches!(
+        &attention.state,
+        AttentionState::Answered {
+            answer_source: AttentionAnswerSource::ObservedExternal { evidence },
+            decided_at_ms,
+            ..
+        } if evidence.source == AttentionAnswerEvidenceSource::RecordedFixture
+            && evidence.observer_host_id == attention.host_id
+            && evidence.observed_at_ms == *decided_at_ms
+    ));
     match &attention.subject {
         AttentionSubject::Approval { request } => {
             assert!(matches!(request.join, JoinState::Joined { .. }));
@@ -337,15 +349,48 @@ fn a_declined_file_change_is_terminal_and_the_turn_still_completes() {
 
     let attention = last_attention(&effects);
     match &attention.state {
-        AttentionState::Answered { option_id, .. } => {
+        AttentionState::Answered {
+            option_id,
+            answer_source: AttentionAnswerSource::ObservedExternal { evidence },
+            decided_at_ms,
+            ..
+        } => {
             assert_eq!(option_id.as_deref(), Some("decline"));
+            assert_eq!(
+                evidence.source,
+                AttentionAnswerEvidenceSource::RecordedFixture
+            );
+            assert_eq!(evidence.observer_host_id, attention.host_id);
+            assert_eq!(evidence.observed_at_ms, *decided_at_ms);
         }
         other => panic!("expected an answered approval, found {other:?}"),
     }
 }
 
 #[test]
-fn a_live_outgoing_reply_never_overwrites_the_stores_real_answer() {
+fn a_live_unassociated_reply_is_an_externally_observed_answer() {
+    let transcript = load_transcript("03-permission-approve.jsonl");
+    let mut reducer = live_reducer();
+    let mut content = MemoryContent::default();
+    let effects = reducer
+        .ingest(&transcript, &mut content)
+        .expect("the live-shaped recording must reduce cleanly");
+
+    let attention = last_attention(&effects);
+    assert!(matches!(
+        &attention.state,
+        AttentionState::Answered {
+            answer_source: AttentionAnswerSource::ObservedExternal { evidence },
+            decided_at_ms,
+            ..
+        } if evidence.source == AttentionAnswerEvidenceSource::ObservedInTraffic
+            && evidence.observer_host_id == attention.host_id
+            && evidence.observed_at_ms == *decided_at_ms
+    ));
+}
+
+#[test]
+fn a_live_locally_associated_reply_never_overwrites_the_stores_real_answer() {
     // Reorder only frames from the real approval recording so the operation
     // arrives *after* the outgoing reply. This exercises the hidden overwrite
     // path where a later join refresh could otherwise republish the replay-only
@@ -378,6 +423,18 @@ fn a_live_outgoing_reply_never_overwrites_the_stores_real_answer() {
         )),
         "the live request itself must still open attention"
     );
+    let attention_id = approval_effects
+        .iter()
+        .find_map(|effect| match effect {
+            StateEffect::AttentionUpserted { item } => Some(item.id.clone()),
+            _ => None,
+        })
+        .expect("the approval has an attention identifier");
+    assert!(reducer.register_local_attention_answer(
+        &attention_id,
+        &CommandId::new("cmd_real_local_answer"),
+        "accept",
+    ));
 
     let reply_effects = reducer
         .ingest_frame(
@@ -389,7 +446,7 @@ fn a_live_outgoing_reply_never_overwrites_the_stores_real_answer() {
         reply_effects
             .iter()
             .all(|effect| !matches!(effect, StateEffect::AttentionUpserted { .. })),
-        "the reducer must not replace the store's real command ID"
+        "the reducer must not replace the store's LocalCommand answer"
     );
     assert!(
         reducer

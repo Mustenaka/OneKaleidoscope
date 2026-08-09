@@ -18,7 +18,7 @@ use kaleido_proto::capability::{Capability, EvidenceSource};
 use kaleido_proto::content::{ContentAvailability, ContentKind, ContentRef, Sensitivity};
 use kaleido_proto::effect::StateEffect;
 use kaleido_proto::host::ConnectionFaultReason;
-use kaleido_proto::ids::ContentId;
+use kaleido_proto::ids::{CommandId, ContentId};
 use kaleido_proto::session::SessionStatus;
 
 #[derive(Debug, Default)]
@@ -123,6 +123,7 @@ impl ProviderRuntimeSession for StandInSession {
 
     fn respond_attention(
         &mut self,
+        _command_id: &CommandId,
         _response: &AttentionResponse,
         _content: &mut dyn ContentAccess,
     ) -> Result<Vec<StateEffect>, RuntimeSessionError> {
