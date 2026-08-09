@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kaleido_proto::command::{CommandAck, DeviceCommandRequest};
 use kaleido_proto::content::{
@@ -17,16 +17,18 @@ use kaleido_proto::ids::DeviceId;
 use kaleido_proto::projection::{
     ProjectionEnvelope, ProjectionKey, ProjectionSubscribe, ProjectionSubscribeOutcome,
 };
-use kaleido_transport::auth::{build_transcript, ChallengeTranscript};
+use kaleido_transport::auth::{
+    build_transcript, validate_p256_spki, verify_transcript_signature, ChallengeTranscript,
+};
 use kaleido_transport::bootstrap::decode_uri;
 use kaleido_transport::control::{ControlFrame, PairRequest};
 use kaleido_transport::frame::Frame;
-use kaleido_transport::{MAX_FRAME_LENGTH, TRANSPORT_VERSION};
+use kaleido_transport::{FRAME_IO_TIMEOUT_MS, MAX_FRAME_LENGTH, TRANSPORT_VERSION};
 use zeroize::Zeroize;
 
 use crate::cache::{CacheApply, ProjectionCache};
 use crate::connection::WireConnection;
-use crate::credential::{CredentialStore, PairedHost};
+use crate::credential::{CredentialStore, PairedHost, PairedHostInfo, SecureCredentialVault};
 use crate::signer::DeviceSigner;
 
 const WORKER_POLL: Duration = Duration::from_millis(100);
@@ -121,18 +123,27 @@ impl std::fmt::Debug for MobileClient {
     }
 }
 
-#[uniffi::export]
 impl MobileClient {
-    #[uniffi::constructor]
+    /// Native-only constructor retained for hostd loopback integration tests.
+    /// Mobile bindings expose only `new_with_secure_vault`, so Android cannot
+    /// accidentally persist endpoint, pin or DeviceId in plaintext storage.
     pub fn new(
         storage_directory: String,
         signer: Box<dyn DeviceSigner>,
     ) -> Result<Arc<Self>, MobileClientError> {
         let credentials =
             CredentialStore::open(&storage_directory).map_err(|_| MobileClientError::Storage)?;
+        Self::from_stores(storage_directory, signer, credentials)
+    }
+
+    fn from_stores(
+        cache_directory: String,
+        signer: Box<dyn DeviceSigner>,
+        credentials: CredentialStore,
+    ) -> Result<Arc<Self>, MobileClientError> {
         let paired = credentials.load().map_err(|_| MobileClientError::Storage)?;
         let cache =
-            ProjectionCache::open(&storage_directory).map_err(|_| MobileClientError::Storage)?;
+            ProjectionCache::open(&cache_directory).map_err(|_| MobileClientError::Storage)?;
         Ok(Arc::new(Self {
             signer: Arc::from(signer),
             credentials,
@@ -141,6 +152,23 @@ impl MobileClient {
             worker: Mutex::new(None),
             next_subscription_id: AtomicU64::new(1),
         }))
+    }
+}
+
+#[uniffi::export]
+impl MobileClient {
+    #[uniffi::constructor]
+    pub fn new_with_secure_vault(
+        cache_directory: String,
+        signer: Box<dyn DeviceSigner>,
+        credential_vault: Box<dyn SecureCredentialVault>,
+    ) -> Result<Arc<Self>, MobileClientError> {
+        let credentials = CredentialStore::secure(Arc::from(credential_vault));
+        Self::from_stores(cache_directory, signer, credentials)
+    }
+
+    pub fn paired_host_info(&self) -> Option<PairedHostInfo> {
+        lock(&self.paired).as_ref().map(PairedHostInfo::from)
     }
 
     pub fn pair(
@@ -162,6 +190,7 @@ impl MobileClient {
             .signer
             .public_key_spki_der()
             .map_err(|_| MobileClientError::Authentication)?;
+        validate_p256_spki(&public_key).map_err(|_| MobileClientError::Authentication)?;
         let mut wire = WireConnection::connect(&bootstrap.endpoint, &bootstrap.host_public_key_pin)
             .map_err(|_| MobileClientError::Authentication)?;
         hello(&mut wire)?;
@@ -486,6 +515,39 @@ fn execute_command(
                     }
                     return Err(MobileClientError::RemoteRejected);
                 }
+
+                // The subscribe ack deliberately precedes the initial replay/current envelope.
+                // A request/response after that ack is therefore an ordered wire barrier: hostd
+                // cannot read this Ping or write its Pong until it has written the complete
+                // initial projection sequence. Waiting for the matching Pong lets callers treat
+                // the core cache as synchronized when `subscribe` returns, including the
+                // `since == head` case where Resumed carries no projection envelope.
+                let barrier_request_id = take_request_id(next_request_id)?;
+                wire.send_control(&ControlFrame::Ping {
+                    request_id: barrier_request_id,
+                    nonce: barrier_request_id,
+                })
+                .map_err(|_| MobileClientError::WorkerStopped)?;
+                wait_for(
+                    wire,
+                    callbacks,
+                    current_snapshots,
+                    cache,
+                    |frame| match frame {
+                        ControlFrame::Pong { request_id, nonce }
+                            if *request_id == barrier_request_id
+                                && *nonce == barrier_request_id =>
+                        {
+                            Some(())
+                        }
+                        _ => None,
+                    },
+                )?;
+
+                let synchronized_cursor = lock(cache)
+                    .since(&subscribe.key)
+                    .ok_or(MobileClientError::Contract)?;
+                validate_synchronized_cursor(&ack.outcome, subscribe.since, synchronized_cursor)?;
                 Ok(())
             })();
             if result.is_err() {
@@ -617,6 +679,28 @@ fn execute_command(
     Ok(())
 }
 
+fn validate_synchronized_cursor(
+    outcome: &ProjectionSubscribeOutcome,
+    since: Option<Cursor>,
+    synchronized_cursor: Cursor,
+) -> Result<(), MobileClientError> {
+    match outcome {
+        ProjectionSubscribeOutcome::CurrentFollows { current_cursor }
+            if synchronized_cursor < *current_cursor =>
+        {
+            Err(MobileClientError::Contract)
+        }
+        ProjectionSubscribeOutcome::Resumed { .. }
+            if since.is_none_or(|cursor| synchronized_cursor < cursor) =>
+        {
+            Err(MobileClientError::Contract)
+        }
+        ProjectionSubscribeOutcome::Rejected { .. } => Err(MobileClientError::Contract),
+        ProjectionSubscribeOutcome::CurrentFollows { .. }
+        | ProjectionSubscribeOutcome::Resumed { .. } => Ok(()),
+    }
+}
+
 fn wait_for<T>(
     wire: &mut WireConnection,
     callbacks: &mut BTreeMap<u64, ActiveSubscription>,
@@ -624,10 +708,15 @@ fn wait_for<T>(
     cache: &Arc<Mutex<ProjectionCache>>,
     mut select: impl FnMut(&ControlFrame) -> Option<T>,
 ) -> Result<T, MobileClientError> {
+    let timeout_ms = u64::try_from(FRAME_IO_TIMEOUT_MS).map_err(|_| MobileClientError::Contract)?;
+    let deadline = Instant::now()
+        .checked_add(Duration::from_millis(timeout_ms))
+        .ok_or(MobileClientError::Contract)?;
     loop {
-        let frame = wire
-            .receive()
-            .map_err(|_| MobileClientError::WorkerStopped)?;
+        let frame = poll_until(deadline, || {
+            wire.try_receive()
+                .map_err(|_| MobileClientError::WorkerStopped)
+        })?;
         if let Frame::Control(bytes) = &frame {
             let control = ControlFrame::decode(bytes).map_err(|_| MobileClientError::Contract)?;
             if let Some(value) = select(&control) {
@@ -635,6 +724,20 @@ fn wait_for<T>(
             }
         }
         handle_unsolicited(wire, frame, callbacks, current_snapshots, cache)?;
+    }
+}
+
+fn poll_until<T>(
+    deadline: Instant,
+    mut poll: impl FnMut() -> Result<Option<T>, MobileClientError>,
+) -> Result<T, MobileClientError> {
+    loop {
+        if Instant::now() >= deadline {
+            return Err(MobileClientError::WorkerStopped);
+        }
+        if let Some(value) = poll()? {
+            return Ok(value);
+        }
     }
 }
 
@@ -767,8 +870,14 @@ fn authenticated_wire(
         expires_at_ms,
     })
     .map_err(|_| MobileClientError::Authentication)?;
+    let public_key = signer
+        .public_key_spki_der()
+        .map_err(|_| MobileClientError::Authentication)?;
+    validate_p256_spki(&public_key).map_err(|_| MobileClientError::Authentication)?;
     let signature = signer
         .sign_p256_sha256(transcript.to_vec())
+        .map_err(|_| MobileClientError::Authentication)?;
+    verify_transcript_signature(&public_key, &transcript, &signature)
         .map_err(|_| MobileClientError::Authentication)?;
     let mut proof = ControlFrame::ChallengeProof {
         request_id,
@@ -902,20 +1011,26 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use kaleido_proto::effect::Cursor;
     use kaleido_proto::error::CanonicalError;
     use kaleido_proto::host::HostReachability;
     use kaleido_proto::ids::HostId;
     use kaleido_proto::projection::{
-        ProjectIndexView, ProjectionEnvelope, ProjectionKey, ProjectionPayload, PROJECTION_VERSION,
+        ProjectIndexView, ProjectionEnvelope, ProjectionKey, ProjectionPayload,
+        ProjectionSubscribeOutcome, PROJECTION_VERSION,
     };
 
     use super::{
-        apply_projection, close_callbacks, ActiveSubscription, MobileClientError,
-        ProjectionCallback,
+        apply_projection, close_callbacks, poll_until, validate_synchronized_cursor,
+        ActiveSubscription, MobileClient, MobileClientError, ProjectionCallback,
     };
     use crate::cache::ProjectionCache;
+    use crate::credential::{
+        CredentialStore, PairedHost, SecureCredentialVault, SecureCredentialVaultError,
+    };
+    use crate::signer::{DeviceSigner, DeviceSignerError};
 
     #[derive(Default)]
     struct CallbackEvents {
@@ -925,6 +1040,34 @@ mod tests {
     }
 
     struct TestCallback(Arc<CallbackEvents>);
+
+    #[derive(Clone, Default)]
+    struct TestVault {
+        bytes: Arc<Mutex<Option<Vec<u8>>>>,
+    }
+
+    impl SecureCredentialVault for TestVault {
+        fn load_paired_host(&self) -> Result<Option<Vec<u8>>, SecureCredentialVaultError> {
+            Ok(self.bytes.lock().expect("vault lock").clone())
+        }
+
+        fn store_paired_host(&self, credential: Vec<u8>) -> Result<(), SecureCredentialVaultError> {
+            *self.bytes.lock().expect("vault lock") = Some(credential);
+            Ok(())
+        }
+    }
+
+    struct UnusedSigner;
+
+    impl DeviceSigner for UnusedSigner {
+        fn public_key_spki_der(&self) -> Result<Vec<u8>, DeviceSignerError> {
+            Err(DeviceSignerError::KeyUnavailable)
+        }
+
+        fn sign_p256_sha256(&self, _transcript: Vec<u8>) -> Result<Vec<u8>, DeviceSignerError> {
+            Err(DeviceSignerError::SigningFailed)
+        }
+    }
 
     impl ProjectionCallback for TestCallback {
         fn on_projection(&self, _projection: ProjectionEnvelope) {
@@ -969,6 +1112,59 @@ mod tests {
             key,
             callback: Box::new(TestCallback(events)),
         }
+    }
+
+    #[test]
+    fn secure_constructor_cold_loads_only_paired_host_identity() {
+        let directory = tempfile::tempdir().expect("cache directory");
+        let vault = TestVault::default();
+        let host = PairedHost {
+            host_id: HostId::new("host-secure-cold"),
+            device_id: kaleido_proto::ids::DeviceId::new("device-secure-cold"),
+            endpoint: "127.0.0.1:7443".to_owned(),
+            host_public_key_pin: format!("sha256:{}", "A".repeat(43)),
+        };
+        CredentialStore::secure(Arc::new(vault.clone()))
+            .store(&host)
+            .expect("seed secure vault");
+
+        let client = MobileClient::new_with_secure_vault(
+            directory.path().to_string_lossy().into_owned(),
+            Box::new(UnusedSigner),
+            Box::new(vault),
+        )
+        .expect("cold client");
+
+        let info = client.paired_host_info().expect("paired identity");
+        assert_eq!(info.host_id, host.host_id);
+        assert_eq!(info.device_id, host.device_id);
+    }
+
+    #[test]
+    fn a_live_projection_before_the_barrier_pong_may_advance_past_the_current_ack() {
+        let outcome = ProjectionSubscribeOutcome::CurrentFollows {
+            current_cursor: Cursor { seq: 10 },
+        };
+
+        assert!(validate_synchronized_cursor(&outcome, None, Cursor { seq: 10 }).is_ok());
+        assert!(
+            validate_synchronized_cursor(&outcome, None, Cursor { seq: 11 }).is_ok(),
+            "a contiguous live projection may be published before hostd reads the barrier Ping"
+        );
+        assert!(validate_synchronized_cursor(&outcome, None, Cursor { seq: 9 }).is_err());
+    }
+
+    #[test]
+    fn a_request_wait_tolerates_empty_worker_polls_before_the_response() {
+        let mut polls = 0_u8;
+        let response = poll_until(Instant::now() + Duration::from_secs(1), || {
+            polls = polls.saturating_add(1);
+            Ok((polls == 3).then_some("response"))
+        })
+        .expect("response after bounded empty polls");
+
+        assert_eq!(response, "response");
+        assert_eq!(polls, 3);
     }
 
     #[test]

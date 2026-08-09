@@ -3,7 +3,7 @@
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use kaleido_core::{DeviceSigner, DeviceSignerError, MobileClient, ProjectionCallback};
@@ -91,6 +91,93 @@ impl ProjectionCallback for RecordingProjection {
     }
 
     fn on_closed(&self, _error: Option<kaleido_proto::error::CanonicalError>) {}
+}
+
+struct BlockingProjection {
+    entered: mpsc::Sender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+impl ProjectionCallback for BlockingProjection {
+    fn on_projection(&self, _projection: kaleido_proto::projection::ProjectionEnvelope) {
+        let _ = self.entered.send(());
+        let _ = self
+            .release
+            .lock()
+            .expect("blocking callback lock")
+            .recv_timeout(Duration::from_secs(2));
+    }
+
+    fn on_error(&self, _error: kaleido_proto::error::CanonicalError) {}
+
+    fn on_closed(&self, _error: Option<kaleido_proto::error::CanonicalError>) {}
+}
+
+#[test]
+fn mobile_subscribe_returns_only_after_the_initial_projection_is_applied() {
+    let (directory, broker, _) = replayed_broker();
+    let server = LanServer::bind(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        &directory.path().join("security"),
+        broker.clone(),
+        None,
+    )
+    .expect("bind product LAN server");
+    let bootstrap = server.issue_pairing(current_ms()).expect("pairing QR");
+    let uri = encode_uri(&bootstrap).expect("canonical QR URI");
+    let client = Arc::new(
+        MobileClient::new(
+            directory
+                .path()
+                .join("mobile")
+                .to_string_lossy()
+                .into_owned(),
+            Box::new(TestSigner {
+                key: Arc::new(SigningKey::random(&mut OsRng)),
+            }),
+        )
+        .expect("mobile client"),
+    );
+    client
+        .pair(uri, "ordered subscription mobile".to_owned())
+        .expect("pair through MobileClient");
+    client.connect().expect("challenge connect");
+
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let subscribing_client = Arc::clone(&client);
+    let host_id = broker.host_id();
+    let join = std::thread::spawn(move || {
+        let result = subscribing_client.subscribe(
+            ProjectionKey::ProjectIndex { host_id },
+            Box::new(BlockingProjection {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+            }),
+        );
+        let _ = finished_tx.send(result);
+    });
+
+    entered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("initial projection entered callback");
+    assert!(
+        finished_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err(),
+        "subscribe returned before its initial projection callback completed"
+    );
+    release_tx.send(()).expect("release callback");
+    let subscription = finished_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("subscribe completion")
+        .expect("synchronized subscription");
+    join.join().expect("subscribe thread");
+
+    subscription.unsubscribe().expect("unsubscribe");
+    client.disconnect().expect("disconnect");
+    server.shutdown().expect("shutdown server");
 }
 
 #[test]

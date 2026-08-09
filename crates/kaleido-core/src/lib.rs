@@ -16,9 +16,14 @@ pub mod cache;
 pub mod connection;
 pub mod credential;
 pub mod mobile;
+pub mod product;
 pub mod signer;
 
+pub use credential::{PairedHostInfo, SecureCredentialVault, SecureCredentialVaultError};
 pub use mobile::{MobileClient, MobileClientError, ProjectionCallback, ProjectionSubscription};
+pub use product::{
+    MobileActionAvailability, MobileActionBlocker, MobileSessionAction, MobileTextContent,
+};
 pub use signer::{DeviceSigner, DeviceSignerError};
 
 uniffi::setup_scaffolding!();

@@ -256,8 +256,14 @@ ContentWrite 的 `ContentWriteRequest { content_kind, byte_len, digest }` 是 JS
 4. 发送保留窗口或当前完整 projection；
 5. 只发送大于已发送 head 的 live entry。
 
-这个顺序保证 snapshot/replay 与 live 交界不漏不重。慢客户端一旦落后 bounded channel，服务端
-停止该订阅的后续 push，并发送：
+这个顺序保证 snapshot/replay 与 live 交界不漏不重。
+移动端需要知道首批 current/replay 已完整进入本地 cache 时，必须按
+[ADR-0023](adr/0023-projection-initial-sync-barrier.md) 在验证非 `Rejected` ack 后发送新的 `Ping`
+request，并等待匹配 `Pong`。同一连接的服务端只有写完该订阅的首批 envelopes 后才会读取 Ping，
+因此 Pong 是有序同步屏障；`since == head` 且没有 envelope 时也成立。`MobileClient::subscribe`
+必须等屏障与 cache/cursor 校验通过后才返回成功。
+
+慢客户端一旦落后 bounded channel，服务端停止该订阅的后续 push，并发送：
 
 ```text
 ProjectionSubscriptionClosed {

@@ -77,7 +77,7 @@ provider → reducer → canonical state → durable log → Rust diagnostic cli
 
 ## R3 — Android 局域网纵切
 
-状态：**进行中，2026-08-09**。旧入口前置 G-R1-1、P-1、D-B1 已分别由
+状态：**emulator implementation complete，实体设备门禁待执行（2026-08-10）**。旧入口前置 G-R1-1、P-1、D-B1 已分别由
 T-102、T-103、T-104 解除。
 
 R3 开工审计发现 projection cursor、可信 mobile command/content ingress 与 LAN 配对合同
@@ -86,6 +86,10 @@ R3 开工审计发现 projection cursor、可信 mobile command/content ingress 
 1. [T-106](tasks/T-106.md)：UACP 0.3 + TRANSPORT 0.1 合同；
 2. [T-107](tasks/T-107.md)：hostd LAN broker + Rust mobile core；
 3. [T-108](tasks/T-108.md)：Android Compose 与设备级纵切。
+
+T-108 已在 API 35 x86_64 emulator 上完成双 ABI App、真实 Codex LAN、错误 pin、七类
+projection 与 cursor 冷恢复验证。实体 arm64 的真实 Wi-Fi、OEM 后台与 hardware-backed
+Keystore 尚未登记，所以本里程碑仍未最终通过。
 
 产出最小 hostd + Android App：
 
