@@ -12,6 +12,12 @@ entries and 20 unique schema paths. None changes the 41 adapter-read JSON
 Pointers or their 47 schema anchors. A real structured app-server simple turn
 also completed successfully on the exact CLI.
 
+Merge review additionally verified the intermediate stable release `0.146.1`,
+which is included by the continuous supported range. Its exact schema has 0
+in-surface drift from `0.146.0`, and its native app-server completed a real
+structured simple turn. The supported interval therefore contains no release
+that is covered only by numeric ordering.
+
 No adapter, reducer, UACP, or proto change is required. T-105 therefore updates
 only the unmodified upstream snapshot, provenance/history, the evidence-backed
 Codex support interval, and documentation.
@@ -126,6 +132,40 @@ Approval recording was not required for this review: all six pinned
 file-change approval paths and its request/response schemas are unchanged.
 The drifting command-execution and request-user-input paths are deliberately
 not represented as supported R2 capabilities.
+
+## Merge-review follow-up: Codex 0.146.1
+
+The exact `@openai/codex@0.146.1` package was installed in a separate temporary
+npm prefix. Against the committed `0.146.0` baseline, with OpenCode pinned to
+`1.18.8` and ACP pinned to the verified schema artifact, the schema gate
+reported:
+
+```text
+schema: observed codex 0.146.1 (snapshot 0.146.0)
+in-surface    : 0 drift
+out-of-surface: 3 drift (3 added / 0 changed / 0 removed)
+schema diff: required surface is compatible (278 JSON files compared)
+SCHEMA_DIFF_EXIT=0
+```
+
+The same native executable then completed a real structured app-server run:
+
+```json
+{
+  "codex_version": "codex-cli 0.146.1",
+  "slice_exit": 0,
+  "termination": "turn_terminal",
+  "turn_count": 1,
+  "final_turn_status": "completed",
+  "streaming_observed": true
+}
+```
+
+No prompt, content body, temporary path, username or upstream raw ID is stored
+in this evidence. A first acquisition attempt through the npm `.cmd` wrapper
+could not terminate its exact descendant on Windows and exited 3; retrying the
+package's native `codex.exe` used the same version and completed with exit 0.
+This was a process-cleanup issue, not schema drift.
 
 ## Local schema gates
 

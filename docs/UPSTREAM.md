@@ -75,7 +75,7 @@ feature switches or schema-diff gates.
 
 | Upstream | Snapshot version | Supported range | Evidence |
 |---|---|---|---|
-| Codex app-server | `0.147.0` | `>=0.146.0, <=0.147.0` | T-100 recorded real `0.146.0` simple-turn and approval evidence. T-105 reviewed all 58 required-surface changes, resolved all 41 pinned paths / 47 schema anchors, and completed a real structured app-server simple turn on `0.147.0`. |
+| Codex app-server | `0.147.0` | `>=0.146.0, <=0.147.0` | T-100 recorded real `0.146.0` simple-turn and approval evidence. T-105 reviewed all 58 required-surface changes, resolved all 41 pinned paths / 47 schema anchors, and completed real structured app-server simple turns on `0.146.1` and `0.147.0`; exact `0.146.1` schema diff against `0.146.0` had 0 in-surface drift. |
 | OpenCode | `1.18.8` | `=1.18.8` | T-003 captured the OpenAPI document and T-004/T-006 validated real session and event traffic against `1.18.8`. |
 | ACP v1 schema artifact | `1.18.0` | `=1.18.0` | T-003 pinned the immutable artifact and T-004/T-006 validated ACP v1 lifecycle, filesystem, and terminal messages against it. |
 
@@ -94,6 +94,11 @@ fields, the `thread/list` pin-to-section model, and a new required
 by the current R2 adapter and therefore remain future integration risks rather
 than supported capabilities. The complete path-by-path accounting and real
 runtime evidence are recorded in `docs/gates/T-105-evidence.md`.
+
+Merge review also closed the otherwise implicit `0.146.1` interval member:
+its exact schema has 0 in-surface drift from `0.146.0` and its native
+app-server completed a real structured simple turn. The continuous supported
+range therefore contains no version that lacks both schema and runtime evidence.
 
 Adapter behavior must be selected from runtime capabilities and the observed
 schema, never from a comparison such as `if version >= ...`.
