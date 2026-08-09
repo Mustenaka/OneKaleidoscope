@@ -77,15 +77,15 @@ provider → reducer → canonical state → durable log → Rust diagnostic cli
 
 ## R3 — Android 局域网纵切
 
-**入口前置（三条，都必须先解除）：**
+状态：**进行中，2026-08-09**。旧入口前置 G-R1-1、P-1、D-B1 已分别由
+T-102、T-103、T-104 解除。
 
-| ID | 内容 | 为什么必须先解除 |
-|---|---|---|
-| G-R1-1 | UniFFI 的 callback / object / async / throwing 面未探针 | 决定投影能不能推送到手机，是 [ARCHITECTURE](ARCHITECTURE.md) §9 的模块边界问题，不是 UI 细节。见 [T-102](tasks/T-102.md) §5.2 |
-| P-1 | `AttentionState::Answered` 无法表达「观察到的外部应答」 | 手机会按 `command_id` 回查，现在那个 ID 可能指不到任何命令。见 [ADR-0014](adr/0014-codex-approval-families-and-timestamp-units.md) D-3 |
-| D-B1 | `LiveControl` 结构性不可达，`LiveBinding::Controlling` 永远到不了 | 手机靠它判断「我能不能干预」，不解决就永远渲染成只读。见 [T-100-result.md](gates/T-100-result.md) §4 |
+R3 开工审计发现 projection cursor、可信 mobile command/content ingress 与 LAN 配对合同
+仍需闭合，因此执行顺序固定为：
 
-P-1 与 D-B1 都要改 `kaleido-proto` 或协议，必须由主管单独开卡授权，不得夹带进别的卡。
+1. [T-106](tasks/T-106.md)：UACP 0.3 + TRANSPORT 0.1 合同；
+2. [T-107](tasks/T-107.md)：hostd LAN broker + Rust mobile core；
+3. [T-108](tasks/T-108.md)：Android Compose 与设备级纵切。
 
 产出最小 hostd + Android App：
 
