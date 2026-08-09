@@ -14,7 +14,7 @@ back into those directories.
 
 | Upstream | Snapshot version | Snapshot |
 |---|---|---|
-| Codex app-server | `codex-cli 0.146.0` / `@openai/codex@0.146.0` | `schemas/codex/` |
+| Codex app-server | `codex-cli 0.147.0` / `@openai/codex@0.147.0` | `schemas/codex/` |
 | OpenCode | `opencode 1.18.8` / `opencode-ai@1.18.8` | `schemas/opencode/openapi.json` |
 | Agent Client Protocol | crate `1.3.0`, wire v1, schema artifact `1.18.0` | `schemas/acp/` |
 
@@ -75,15 +75,30 @@ feature switches or schema-diff gates.
 
 | Upstream | Snapshot version | Supported range | Evidence |
 |---|---|---|---|
-| Codex app-server | `0.146.0` | `=0.146.0` | T-006 refreshed and validated the `0.146.0` schema; the owner's T-010 path recorded a real simple turn with this CLI. |
+| Codex app-server | `0.147.0` | `>=0.146.0, <=0.147.0` | T-100 recorded real `0.146.0` simple-turn and approval evidence. T-105 reviewed all 58 required-surface changes, resolved all 41 pinned paths / 47 schema anchors, and completed real structured app-server simple turns on `0.146.1` and `0.147.0`; exact `0.146.1` schema diff against `0.146.0` had 0 in-surface drift. |
 | OpenCode | `1.18.8` | `=1.18.8` | T-003 captured the OpenAPI document and T-004/T-006 validated real session and event traffic against `1.18.8`. |
 | ACP v1 schema artifact | `1.18.0` | `=1.18.0` | T-003 pinned the immutable artifact and T-004/T-006 validated ACP v1 lifecycle, filesystem, and terminal messages against it. |
 
-OpenCode `1.18.9` has been observed on the owner's machine but is not yet in
-the supported range. The previous exact-version gate prevented the comparison
-from running, so no compatibility claim is made yet. Under ADR-0008,
+OpenCode `1.18.9` and later versions have been observed but are not yet in the
+supported range. No compatibility claim is made for them yet. Under ADR-0008,
 `schema diff` must still run normally and print a prominent
 `unverified version` warning.
+
+### Codex 0.147.0 review
+
+T-105 grouped the 58 in-surface changes into 13 required-surface entries. None
+of them changed an adapter-read JSON Pointer or schema anchor. The changes are
+transitive `CommandAction.path` references, optional initialization and item
+fields, the `thread/list` pin-to-section model, and a new required
+`request_user_input.isBlocking` field. The last two areas are not implemented
+by the current R2 adapter and therefore remain future integration risks rather
+than supported capabilities. The complete path-by-path accounting and real
+runtime evidence are recorded in `docs/gates/T-105-evidence.md`.
+
+Merge review also closed the otherwise implicit `0.146.1` interval member:
+its exact schema has 0 in-surface drift from `0.146.0` and its native
+app-server completed a real structured simple turn. The continuous supported
+range therefore contains no version that lacks both schema and runtime evidence.
 
 Adapter behavior must be selected from runtime capabilities and the observed
 schema, never from a comparison such as `if version >= ...`.
@@ -159,8 +174,7 @@ observed versions, continue when they differ from the snapshot, fail only for
 in-surface drift or an unavailable tool, and retain the complete partitioned
 report. It must not contain a separate exact-version equality gate.
 
-The repository currently has no configured remote, so this workflow has not
-run on GitHub Actions. `schema diff` remains separate from `cargo xtask ci`
+The workflow is exercised on GitHub Actions. `schema diff` remains separate from `cargo xtask ci`
 because it needs external CLIs, outbound acquisition, and writes an observation
 to surface history; the normal deterministic CI gate does not.
 
