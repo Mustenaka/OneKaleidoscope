@@ -29,7 +29,8 @@ R3 开工审计又发现三个必须先闭合的合同缺口：
 3. 手机 prompt/free-form 没有安全的敏感正文写入入口，远端也不能被允许伪造 `Actor`。
 
 T-106 已以 UACP `0.3.0`、投影独立游标和 TRANSPORT `0.1.0` 关闭以上缺口。
-当前活动任务是 [T-107](tasks/T-107.md)，随后执行 [T-108](tasks/T-108.md)。
+[T-107](tasks/T-107.md) 的本地实现门禁已通过，正在等待新 SHA 三平台 CI；随后执行
+[T-108](tasks/T-108.md)。
 
 ## 2. 已完成
 
@@ -44,15 +45,16 @@ T-106 已以 UACP `0.3.0`、投影独立游标和 TRANSPORT `0.1.0` 关闭以上
 | T-103 | UACP `0.2.0` Attention provenance、旧 `0.1` 日志 fail-loud |
 | T-104 | `AcceptedByRuntime` → `LiveControl` → `Controlling`，含跨 runtime/session 防伪造守卫 |
 | T-106 | UACP `0.3.0` mobile contract、projection 独立游标、可信 command/content ingress、TRANSPORT `0.1.0` |
+| T-107（本地门禁） | pinned TLS LAN Broker、projection journal、可信 mobile ingress、Rust `MobileClient`、真实 Codex 冷重连纵切；等待新 SHA 三平台 CI |
 
 ## 3. 当前可用能力
 
 | 模块 | 当前能力 | 产品边界 |
 |---|---|---|
-| `kaleido-state` | canonical state、追加日志、内容寻址存储、六个投影、命令幂等与重放 | 尚无 projection journal / LAN subscription |
+| `kaleido-state` | canonical state、内容寻址存储、八类 projection builder、持久 projection journal、device command outbox | projection journal 尚无物理 checkpoint/compaction |
 | `kaleido-adapter-codex` | 真实 Codex JSON-RPC 会话、流式输出、file-change approval、prompt runtime ack | 尚无 interrupt/真实 steer delivery |
-| `kaleido-hostd` | `slice run/replay/show` 诊断纵切 | 尚非常驻服务，无设备与 LAN API |
-| `kaleido-core` | UniFFI 类型与调用面编译探针 | 尚无产品级 pair/connect/subscribe/command/cache |
+| `kaleido-hostd` | 常驻 Codex runtime、pinned TLS 配对/认证、订阅、content/command gateway、断线恢复 | 仅 LAN；公网 relay/push 在 R4 |
+| `kaleido-core` | 产品级 `MobileClient`、pair/connect/reconnect/subscribe/command/content、last-good cache | Android/iOS 仍需平台 UI 与 Keystore 实现 |
 | Android / iOS | Kotlin、Swift 绑定可生成并编译 | 尚无产品 App |
 
 因此当前仍不是手机可用成品：PC 端 Codex 核心纵切成立，移动连接与 UI 正在 R3 实现。
