@@ -1,5 +1,5 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
-//! Executable contract checks for UACP v0.2.
+//! Executable contract checks for UACP v0.3.
 //!
 //! These tests intentionally exercise both success and rejection paths. The
 //! Codex evidence checks read the committed recorder fixtures; they do not
@@ -19,10 +19,14 @@ use kaleido_proto::capability::{
     Capability, CapabilityEntry, CapabilityEvidence, CapabilityState, CapabilityUnavailableReason,
     EvidenceSource, RuntimeCapabilities,
 };
-use kaleido_proto::command::{Actor, Command, CommandAck, CommandEnvelope, CommandOutcome};
+use kaleido_proto::command::{
+    Actor, Command, CommandAck, CommandEnvelope, CommandOutcome, DeviceCommandRequest,
+    MAX_DEVICE_COMMAND_TTL_MS, MAX_IDEMPOTENCY_KEY_BYTES,
+};
 use kaleido_proto::content::{
     ContentAvailability, ContentKind, ContentReadChunk, ContentReadRequest, ContentReadResponse,
-    ContentRef, ContentUnavailableReason, Sensitivity, MAX_CONTENT_READ_BYTES,
+    ContentRef, ContentUnavailableReason, ContentWriteRequest, ContentWriteResponse, Sensitivity,
+    MAX_CONTENT_READ_BYTES, MAX_CONTENT_WRITE_BYTES,
 };
 use kaleido_proto::effect::{
     validate_replay_window, verify_contiguous, Cursor, DiagnosticCode, DiagnosticRecord,
@@ -35,13 +39,15 @@ use kaleido_proto::host::{
     ProviderFamily, ProviderRuntime, SessionCounts,
 };
 use kaleido_proto::ids::{
-    AgentTaskId, ArtifactId, AttentionId, BlockerId, CommandId, ContentId, HostId, ItemId,
-    ProjectBindingId, ProjectId, ProviderBindingHandle, ProviderBindingId, ProviderBindingKind,
-    ProviderRuntimeId, QueueEntryId, SessionId, StepId, TurnId, WorkflowId,
+    AgentTaskId, ArtifactId, AttentionId, BlockerId, CommandId, ContentId, DeviceId, HostId,
+    ItemId, ProjectBindingId, ProjectId, ProviderBindingHandle, ProviderBindingId,
+    ProviderBindingKind, ProviderRuntimeId, QueueEntryId, SessionId, StepId, TurnId, WorkflowId,
 };
 use kaleido_proto::projection::{
-    AttentionInboxView, InputQueueView, LiveActivityView, ProjectBindingSummary, ProjectIndexView,
-    ProjectSummary, ProjectionEnvelope, ProjectionPayload, ProviderGroup, RuntimeCapabilityView,
+    decide_projection_subscription, validate_projection_sequence, AttentionInboxView,
+    InputQueueView, LiveActivityView, ProjectBindingSummary, ProjectIndexView, ProjectSummary,
+    ProjectionEnvelope, ProjectionKey, ProjectionPayload, ProjectionSubscribe,
+    ProjectionSubscribeAck, ProjectionSubscribeOutcome, ProviderGroup, RuntimeCapabilityView,
     SessionIndexView, SessionSummary, TranscriptTurn, TranscriptView, WorkflowBoardStep,
     WorkflowBoardView, PROJECTION_VERSION,
 };
@@ -761,6 +767,134 @@ fn local_acceptance_and_runtime_acceptance_are_distinct() {
 }
 
 #[test]
+fn device_command_request_cannot_claim_trusted_envelope_fields() {
+    let request = DeviceCommandRequest {
+        idempotency_key: "mobile-submit-1".to_owned(),
+        ttl_ms: Some(30_000),
+        body: Command::SubmitPrompt {
+            session_id: session_id(),
+            body: sensitive_content("content-mobile-submit", ContentKind::PlainText),
+        },
+    };
+    request.validate().expect("valid device command request");
+    let encoded = serde_json::to_value(&request).expect("serialize device command request");
+    for forbidden in ["actor", "command_id", "issued_at_ms", "expires_at_ms"] {
+        assert!(
+            encoded.get(forbidden).is_none(),
+            "remote shape exposed {forbidden}"
+        );
+    }
+    assert!(
+        serde_json::from_value::<DeviceCommandRequest>(serde_json::json!({
+            "idempotency_key": "forged",
+            "ttl_ms": 1,
+            "body": request.body,
+            "actor": { "kind": "broker" },
+            "command_id": { "value": "forged-command" },
+            "issued_at_ms": NOW
+        }))
+        .is_err()
+    );
+    assert!(serde_json::from_value::<Actor>(serde_json::json!({
+        "kind": "human",
+        "device_label": "legacy-phone"
+    }))
+    .is_err());
+
+    assert_eq!(
+        DeviceCommandRequest {
+            idempotency_key: String::new(),
+            ttl_ms: None,
+            body: Command::CloseSession {
+                session_id: session_id(),
+            },
+        }
+        .validate(),
+        Err(ContractViolation::EmptyIdentifier {
+            field: "device_command.idempotency_key"
+        })
+    );
+    let oversized_key = "界".repeat((MAX_IDEMPOTENCY_KEY_BYTES / 3) + 1);
+    assert_eq!(
+        DeviceCommandRequest {
+            idempotency_key: oversized_key.clone(),
+            ttl_ms: None,
+            body: Command::CloseSession {
+                session_id: session_id(),
+            },
+        }
+        .validate(),
+        Err(ContractViolation::IdempotencyKeyTooLong {
+            byte_len: oversized_key.len()
+        })
+    );
+    for ttl_ms in [0, MAX_DEVICE_COMMAND_TTL_MS + 1] {
+        assert_eq!(
+            DeviceCommandRequest {
+                idempotency_key: "ttl-boundary".to_owned(),
+                ttl_ms: Some(ttl_ms),
+                body: Command::CloseSession {
+                    session_id: session_id(),
+                },
+            }
+            .validate(),
+            Err(ContractViolation::InvalidDeviceCommandTtl { ttl_ms })
+        );
+    }
+
+    let first = CommandEnvelope {
+        command_id: CommandId::new("command-first"),
+        idempotency_key: "same-key".to_owned(),
+        actor: Actor::Human {
+            device_id: DeviceId::new("device-first"),
+        },
+        issued_at_ms: NOW,
+        expires_at_ms: None,
+        body: Command::CloseSession {
+            session_id: session_id(),
+        },
+    };
+    let second = CommandEnvelope {
+        actor: Actor::Human {
+            device_id: DeviceId::new("device-second"),
+        },
+        ..first.clone()
+    };
+    assert_ne!(first.dedupe_key(), second.dedupe_key());
+    let separator_collision_left = CommandEnvelope {
+        actor: Actor::Human {
+            device_id: DeviceId::new("a"),
+        },
+        idempotency_key: "b|c".to_owned(),
+        ..first.clone()
+    };
+    let separator_collision_right = CommandEnvelope {
+        actor: Actor::Human {
+            device_id: DeviceId::new("a|b"),
+        },
+        idempotency_key: "c".to_owned(),
+        ..first.clone()
+    };
+    assert_ne!(
+        separator_collision_left.dedupe_key(),
+        separator_collision_right.dedupe_key(),
+        "typed length prefixes must keep arbitrary UTF-8 actor IDs and keys injective"
+    );
+    assert_eq!(
+        CommandEnvelope {
+            actor: Actor::Human {
+                device_id: DeviceId::new("")
+            },
+            ..first
+        }
+        .validate(),
+        Err(ContractViolation::EmptyIdentifier {
+            field: "actor.device_id"
+        })
+    );
+}
+
+#[test]
 fn queue_reorder_requires_the_exact_pending_set_of_one_session() {
     let first = pending_queue_entry("queue-1", "session-1", 0);
     let second = pending_queue_entry("queue-2", "session-1", 1);
@@ -961,7 +1095,9 @@ fn sensitive_content_and_unsafe_preview_cannot_enter_log_or_projection() {
     );
     let unsafe_projection = ProjectionEnvelope {
         projection_version: PROJECTION_VERSION,
-        stream: session_stream(),
+        key: ProjectionKey::InputQueue {
+            session_id: session_id(),
+        },
         cursor: Cursor { seq: 1 },
         payload: ProjectionPayload::InputQueue {
             view: InputQueueView {
@@ -1019,7 +1155,9 @@ fn raw_upstream_ids_are_rejected_in_logs_and_projections() {
     }
     let unsafe_projection = ProjectionEnvelope {
         projection_version: PROJECTION_VERSION,
-        stream: session_stream(),
+        key: ProjectionKey::InputQueue {
+            session_id: session_id(),
+        },
         cursor: Cursor { seq: 1 },
         payload: ProjectionPayload::InputQueue {
             view: InputQueueView {
@@ -1242,6 +1380,139 @@ fn content_ref_has_a_bounded_read_path_and_explicit_unavailable_state() {
     assert_json_roundtrip(&unavailable);
 }
 
+#[test]
+fn content_write_metadata_is_bounded_and_stored_sensitive_without_preview() {
+    let request = ContentWriteRequest {
+        content_kind: ContentKind::Markdown,
+        byte_len: 32,
+        digest: digest(),
+    };
+    request.validate().expect("valid content write metadata");
+    assert_json_roundtrip(&request);
+
+    let stored_ref = ContentRef {
+        content_id: ContentId::new("content-uploaded"),
+        kind: request.content_kind.clone(),
+        byte_len: request.byte_len,
+        digest: request.digest.clone(),
+        preview: None,
+        sensitivity: Sensitivity::Sensitive,
+        availability: ContentAvailability::Stored,
+    };
+    let response = ContentWriteResponse::Stored {
+        content_ref: stored_ref.clone(),
+    };
+    response
+        .validate_for(&request)
+        .expect("stored response must bind request metadata");
+    assert_json_roundtrip(&response);
+
+    for byte_len in [0, MAX_CONTENT_WRITE_BYTES + 1] {
+        assert_eq!(
+            ContentWriteRequest {
+                byte_len,
+                ..request.clone()
+            }
+            .validate(),
+            Err(ContractViolation::InvalidContentWriteSize { byte_len })
+        );
+    }
+    assert_eq!(
+        ContentWriteRequest {
+            content_kind: ContentKind::ToolArguments,
+            ..request.clone()
+        }
+        .validate(),
+        Err(ContractViolation::UnsupportedContentWriteKind {
+            content_kind: ContentKind::ToolArguments
+        })
+    );
+    assert!(matches!(
+        ContentWriteRequest {
+            digest: "sha256:ABC".to_owned(),
+            ..request.clone()
+        }
+        .validate(),
+        Err(ContractViolation::MalformedDigest { .. })
+    ));
+    assert!(
+        serde_json::from_value::<ContentWriteRequest>(serde_json::json!({
+            "content_kind": "markdown",
+            "byte_len": 32,
+            "digest": digest(),
+            "bytes": [1, 2, 3],
+            "preview": "must not be accepted",
+            "sensitivity": "business"
+        }))
+        .is_err()
+    );
+
+    assert_eq!(
+        ContentWriteResponse::Stored {
+            content_ref: ContentRef {
+                sensitivity: Sensitivity::Business,
+                ..stored_ref.clone()
+            }
+        }
+        .validate_for(&request),
+        Err(ContractViolation::SensitiveContentRequired {
+            field: "content_write.content_ref"
+        })
+    );
+    assert_eq!(
+        ContentWriteResponse::Stored {
+            content_ref: ContentRef {
+                preview: Some("secret".to_owned()),
+                ..stored_ref.clone()
+            }
+        }
+        .validate_for(&request),
+        Err(ContractViolation::SensitivePreview)
+    );
+    assert_eq!(
+        ContentWriteResponse::Stored {
+            content_ref: ContentRef {
+                availability: ContentAvailability::Evicted,
+                ..stored_ref.clone()
+            }
+        }
+        .validate_for(&request),
+        Err(ContractViolation::InvalidContentWriteAvailability {
+            availability: ContentAvailability::Evicted
+        })
+    );
+    for mismatched in [
+        ContentRef {
+            kind: ContentKind::PlainText,
+            ..stored_ref.clone()
+        },
+        ContentRef {
+            byte_len: request.byte_len + 1,
+            ..stored_ref.clone()
+        },
+        ContentRef {
+            digest: format!("sha256:{}", "1".repeat(64)),
+            ..stored_ref
+        },
+    ] {
+        assert_eq!(
+            ContentWriteResponse::Stored {
+                content_ref: mismatched
+            }
+            .validate_for(&request),
+            Err(ContractViolation::ContentWriteResponseMismatch)
+        );
+    }
+
+    let rejected = ContentWriteResponse::Rejected {
+        error: canonical_error(),
+    };
+    rejected
+        .validate_for(&request)
+        .expect("structured rejection must validate");
+    assert_json_roundtrip(&rejected);
+}
+
 // --- Workflow dependencies, gates and every manual action ----------------
 
 #[test]
@@ -1400,13 +1671,13 @@ fn unknown_provider_message_becomes_diagnostic_without_fabricating_support() {
 // --- Version boundary and projection refresh -----------------------------
 
 #[test]
-fn pre_one_compatibility_is_limited_to_the_zero_two_line() {
-    assert_eq!(PROTOCOL_VERSION, "0.2.0");
-    assert!(version_is_compatible("0.2.0"));
-    assert!(version_is_compatible("0.2.999"));
+fn pre_one_compatibility_is_limited_to_the_zero_three_line() {
+    assert_eq!(PROTOCOL_VERSION, "0.3.0");
+    assert!(version_is_compatible("0.3.0"));
+    assert!(version_is_compatible("0.3.999"));
     assert!(!version_is_compatible("0.0.9"));
     assert!(!version_is_compatible("0.1.999"));
-    assert!(!version_is_compatible("0.3.0"));
+    assert!(!version_is_compatible("0.2.999"));
     assert!(!version_is_compatible("1.0.0"));
     assert!(!version_is_compatible("0.2"));
     assert!(!version_is_compatible("0.2.0.1"));
@@ -1422,6 +1693,242 @@ fn stale_projection_version_requires_full_refresh() {
     assert!(!projection.requires_full_refresh());
     projection.projection_version += 1;
     assert!(projection.requires_full_refresh());
+}
+
+#[test]
+fn every_projection_key_matches_only_its_payload_and_exact_scope() {
+    let projections = all_projections();
+    let keys = projections
+        .iter()
+        .map(|projection| projection.key.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(keys.len(), 8);
+
+    for (payload_index, projection) in projections.iter().enumerate() {
+        for (key_index, key) in keys.iter().enumerate() {
+            let candidate = ProjectionEnvelope {
+                key: key.clone(),
+                ..projection.clone()
+            };
+            if payload_index == key_index {
+                candidate
+                    .validate_for_transport()
+                    .expect("matching key and payload must validate");
+            } else {
+                assert_eq!(
+                    candidate.validate_for_transport(),
+                    Err(ContractViolation::ProjectionKeyPayloadMismatch)
+                );
+            }
+        }
+    }
+
+    let runtime = projections
+        .last()
+        .expect("runtime projection fixture")
+        .clone();
+    for key in [
+        ProjectionKey::RuntimeCapability {
+            host_id: HostId::new("host-other"),
+            runtime_id: runtime_id(),
+        },
+        ProjectionKey::RuntimeCapability {
+            host_id: host_id(),
+            runtime_id: ProviderRuntimeId::new("runtime-other"),
+        },
+    ] {
+        assert_eq!(
+            ProjectionEnvelope {
+                key,
+                ..runtime.clone()
+            }
+            .validate_for_transport(),
+            Err(ContractViolation::ProjectionKeyPayloadMismatch)
+        );
+    }
+    assert!(serde_json::from_str::<ProjectionKey>(r#"{"kind":"future_projection"}"#).is_err());
+}
+
+#[test]
+fn projection_subscribe_decision_covers_resume_current_ahead_floor_and_overflow() {
+    let key = ProjectionKey::Transcript {
+        session_id: session_id(),
+    };
+    let request = |since| ProjectionSubscribe {
+        key: key.clone(),
+        since,
+    };
+    let floor = Cursor { seq: 5 };
+    let head = Cursor { seq: 10 };
+
+    assert_eq!(
+        decide_projection_subscription(&request(None), floor, head, NOW)
+            .expect("initial subscription"),
+        ProjectionSubscribeAck {
+            key: key.clone(),
+            outcome: ProjectionSubscribeOutcome::CurrentFollows {
+                current_cursor: head
+            }
+        }
+    );
+    for (since, from_cursor) in [(10, 11), (5, 6), (4, 5)] {
+        assert_eq!(
+            decide_projection_subscription(&request(Some(Cursor { seq: since })), floor, head, NOW)
+                .expect("retained resume"),
+            ProjectionSubscribeAck {
+                key: key.clone(),
+                outcome: ProjectionSubscribeOutcome::Resumed {
+                    from_cursor: Cursor { seq: from_cursor }
+                }
+            }
+        );
+    }
+    assert_eq!(
+        decide_projection_subscription(&request(Some(Cursor { seq: 3 })), floor, head, NOW)
+            .expect("cursor before retained predecessor needs current"),
+        ProjectionSubscribeAck {
+            key: key.clone(),
+            outcome: ProjectionSubscribeOutcome::CurrentFollows {
+                current_cursor: head
+            }
+        }
+    );
+    let ahead =
+        decide_projection_subscription(&request(Some(Cursor { seq: 11 })), floor, head, NOW)
+            .expect("ahead is a structured rejection");
+    assert!(matches!(
+        ahead.outcome,
+        ProjectionSubscribeOutcome::Rejected {
+            error: CanonicalError {
+                code: ErrorCode::CursorGap,
+                retriable: true,
+                ..
+            }
+        }
+    ));
+    assert_eq!(
+        decide_projection_subscription(&request(None), Cursor { seq: 11 }, head, NOW),
+        Err(ContractViolation::InvalidProjectionCursorWindow {
+            floor: 11,
+            head: 10
+        })
+    );
+    let overflow = decide_projection_subscription(
+        &request(Some(Cursor { seq: u64::MAX })),
+        Cursor { seq: u64::MAX },
+        Cursor { seq: u64::MAX },
+        NOW,
+    )
+    .expect("cursor overflow is a structured wire rejection");
+    assert!(matches!(
+        overflow.outcome,
+        ProjectionSubscribeOutcome::Rejected {
+            error: CanonicalError {
+                code: ErrorCode::CursorGap,
+                retriable: true,
+                ..
+            }
+        }
+    ));
+
+    let mut cross_key = decide_projection_subscription(&request(None), floor, head, NOW)
+        .expect("valid acknowledgement");
+    cross_key.key = ProjectionKey::LiveActivity {
+        session_id: session_id(),
+    };
+    assert_eq!(
+        cross_key.validate_for(&request(None)),
+        Err(ContractViolation::ProjectionSubscribeKeyMismatch)
+    );
+
+    let resumed_request = request(Some(Cursor { seq: 5 }));
+    let resumed = decide_projection_subscription(&resumed_request, floor, head, NOW)
+        .expect("resumed acknowledgement");
+    resumed
+        .validate_for(&resumed_request)
+        .expect("decision helper produces a bound resume cursor");
+    assert_eq!(
+        ProjectionSubscribeAck {
+            key: key.clone(),
+            outcome: ProjectionSubscribeOutcome::Resumed {
+                from_cursor: Cursor { seq: 7 }
+            }
+        }
+        .validate_for(&resumed_request),
+        Err(ContractViolation::ProjectionResumeCursorMismatch {
+            expected: 6,
+            found: 7
+        })
+    );
+    assert_eq!(
+        ProjectionSubscribeAck {
+            key: key.clone(),
+            outcome: ProjectionSubscribeOutcome::Resumed {
+                from_cursor: Cursor { seq: 1 }
+            }
+        }
+        .validate_for(&request(None)),
+        Err(ContractViolation::ProjectionResumeWithoutCursor)
+    );
+    assert_eq!(
+        ProjectionSubscribeAck {
+            key: key.clone(),
+            outcome: ProjectionSubscribeOutcome::CurrentFollows {
+                current_cursor: Cursor { seq: 5 }
+            }
+        }
+        .validate_for(&request(Some(Cursor { seq: 10 }))),
+        Err(ContractViolation::ProjectionCurrentCursorNotAhead {
+            since: 10,
+            current: 5
+        })
+    );
+}
+
+#[test]
+fn projection_sequence_rejects_repeat_gap_mixed_key_and_overflow() {
+    let mut first = all_projections()
+        .get(2)
+        .expect("transcript projection fixture")
+        .clone();
+    first.cursor = Cursor { seq: 6 };
+    let mut second = first.clone();
+    second.cursor = Cursor { seq: 7 };
+    assert!(
+        validate_projection_sequence(&first.key, Cursor { seq: 5 }, &[first.clone(), second])
+            .is_ok()
+    );
+
+    let mut repeated = first.clone();
+    repeated.cursor = Cursor { seq: 5 };
+    assert_eq!(
+        validate_projection_sequence(&first.key, Cursor { seq: 5 }, &[repeated]),
+        Err(ContractViolation::CursorRepeated { cursor: 5 })
+    );
+    let mut gap = first.clone();
+    gap.cursor = Cursor { seq: 7 };
+    assert_eq!(
+        validate_projection_sequence(&first.key, Cursor { seq: 5 }, &[gap]),
+        Err(ContractViolation::CursorGap {
+            expected: 6,
+            found: 7
+        })
+    );
+    let mut other = all_projections()
+        .get(3)
+        .expect("live activity projection fixture")
+        .clone();
+    other.cursor = Cursor { seq: 6 };
+    assert_eq!(
+        validate_projection_sequence(&first.key, Cursor { seq: 5 }, &[other]),
+        Err(ContractViolation::MixedProjectionKeys)
+    );
+    first.cursor = Cursor::START;
+    let key = first.key.clone();
+    assert_eq!(
+        validate_projection_sequence(&key, Cursor { seq: u64::MAX }, &[first]),
+        Err(ContractViolation::CursorOverflow)
+    );
 }
 
 // --- Exhaustive JSON round trips ----------------------------------------
@@ -1451,7 +1958,7 @@ fn every_command_variant_round_trips_in_an_envelope() {
             command_id: CommandId::new(format!("command-{index}")),
             idempotency_key: format!("idempotency-{index}"),
             actor: Actor::Human {
-                device_label: "phone".to_owned(),
+                device_id: DeviceId::new("device-phone"),
             },
             issued_at_ms: NOW,
             expires_at_ms: Some(NOW + 60_000),
@@ -2212,7 +2719,7 @@ fn all_commands() -> Vec<Command> {
 fn all_projections() -> Vec<ProjectionEnvelope> {
     let project_index = ProjectionEnvelope {
         projection_version: PROJECTION_VERSION,
-        stream: StreamKey::Host { host_id: host_id() },
+        key: ProjectionKey::ProjectIndex { host_id: host_id() },
         cursor: Cursor { seq: 1 },
         payload: ProjectionPayload::ProjectIndex {
             view: ProjectIndexView {
@@ -2245,7 +2752,7 @@ fn all_projections() -> Vec<ProjectionEnvelope> {
     };
     let session_index = ProjectionEnvelope {
         projection_version: PROJECTION_VERSION,
-        stream: StreamKey::Project {
+        key: ProjectionKey::SessionIndex {
             project_id: project_id(),
         },
         cursor: Cursor { seq: 2 },
@@ -2272,7 +2779,9 @@ fn all_projections() -> Vec<ProjectionEnvelope> {
     };
     let transcript = ProjectionEnvelope {
         projection_version: PROJECTION_VERSION,
-        stream: session_stream(),
+        key: ProjectionKey::Transcript {
+            session_id: session_id(),
+        },
         cursor: Cursor { seq: 3 },
         payload: ProjectionPayload::Transcript {
             view: TranscriptView {
@@ -2287,7 +2796,9 @@ fn all_projections() -> Vec<ProjectionEnvelope> {
     };
     let live_activity = ProjectionEnvelope {
         projection_version: PROJECTION_VERSION,
-        stream: session_stream(),
+        key: ProjectionKey::LiveActivity {
+            session_id: session_id(),
+        },
         cursor: Cursor { seq: 4 },
         payload: ProjectionPayload::LiveActivity {
             view: LiveActivityView {
@@ -2309,7 +2820,9 @@ fn all_projections() -> Vec<ProjectionEnvelope> {
     };
     let input_queue = ProjectionEnvelope {
         projection_version: PROJECTION_VERSION,
-        stream: session_stream(),
+        key: ProjectionKey::InputQueue {
+            session_id: session_id(),
+        },
         cursor: Cursor { seq: 5 },
         payload: ProjectionPayload::InputQueue {
             view: InputQueueView {
@@ -2322,7 +2835,7 @@ fn all_projections() -> Vec<ProjectionEnvelope> {
     };
     let attention_inbox = ProjectionEnvelope {
         projection_version: PROJECTION_VERSION,
-        stream: StreamKey::Host { host_id: host_id() },
+        key: ProjectionKey::AttentionInbox { host_id: host_id() },
         cursor: Cursor { seq: 6 },
         payload: ProjectionPayload::AttentionInbox {
             view: AttentionInboxView {
@@ -2332,7 +2845,7 @@ fn all_projections() -> Vec<ProjectionEnvelope> {
     };
     let workflow_board = ProjectionEnvelope {
         projection_version: PROJECTION_VERSION,
-        stream: StreamKey::Workflow {
+        key: ProjectionKey::WorkflowBoard {
             workflow_id: workflow_id(),
         },
         cursor: Cursor { seq: 7 },
@@ -2355,12 +2868,19 @@ fn all_projections() -> Vec<ProjectionEnvelope> {
     };
     let runtime_capability = ProjectionEnvelope {
         projection_version: PROJECTION_VERSION,
-        stream: StreamKey::Host { host_id: host_id() },
+        key: ProjectionKey::RuntimeCapability {
+            host_id: host_id(),
+            runtime_id: runtime_id(),
+        },
         cursor: Cursor { seq: 8 },
         payload: ProjectionPayload::RuntimeCapability {
-            view: RuntimeCapabilityView::from_capabilities(&runtime_capabilities(vec![
-                capability_entry(Capability::TurnPrompt, CapabilityState::Supported),
-            ])),
+            view: RuntimeCapabilityView::from_capabilities(
+                host_id(),
+                &runtime_capabilities(vec![capability_entry(
+                    Capability::TurnPrompt,
+                    CapabilityState::Supported,
+                )]),
+            ),
         },
     };
     vec![

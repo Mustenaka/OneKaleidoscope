@@ -21,21 +21,31 @@ use kaleido_proto::error::{CanonicalError, ErrorCode};
 use kaleido_proto::ids::{
     CommandId, HostId, ProjectId, ProviderRuntimeId, QueueEntryId, SessionId,
 };
-use kaleido_proto::projection::{ProjectionEnvelope, ProjectionPayload, PROJECTION_VERSION};
+use kaleido_proto::projection::{ProjectionKey, ProjectionPayload, PROJECTION_VERSION};
 use kaleido_proto::queue::{QueueEntry, QueueIntent, QueueState};
+use serde::{Deserialize, Serialize};
 
 use crate::content::{hex_digest, ContentStore};
 use crate::error::StateError;
 use crate::log::StreamLog;
-use crate::projection::{self, ProjectionName};
+use crate::projection::{self, DiagnosticProjectionEnvelope, ProjectionName};
 use crate::state::CanonicalState;
 
 /// File holding the idempotency side table.
 ///
 /// This is store bookkeeping rather than canonical state, so it is not a
 /// `LogRecord`. Only the digest of the `(actor, key)` pair is written, so a
-/// device label never lands on disk.
+/// device identifier never lands on disk.
 const IDEMPOTENCY_FILE: &str = "idempotency.jsonl";
+const IDEMPOTENCY_FORMAT_VERSION: u32 = 2;
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdempotencyRecord {
+    format_version: u32,
+    key_digest: String,
+    command_id: CommandId,
+}
 
 /// Where append timestamps come from.
 #[derive(Debug, Clone, Copy)]
@@ -191,27 +201,30 @@ impl CanonicalStore {
         self.cursors.get(stream).copied().unwrap_or(Cursor::START)
     }
 
-    /// Builds one read model as a transport-validated envelope.
+    /// Builds one read model as a local diagnostic envelope.
     ///
-    /// `validate_for_transport` is the point of the envelope rather than the
-    /// bare view: it re-checks stream scope and every sensitive reference, so a
-    /// projection that would leak a body or cross a scope is refused here.
+    /// This existing one-shot path retains its canonical stream cursor for
+    /// diagnostics only. It deliberately returns a state-local type so that a
+    /// canonical stream head cannot masquerade as a mobile projection cursor.
     pub fn projection(
         &self,
         name: ProjectionName,
         session_id: Option<&SessionId>,
-    ) -> Result<ProjectionEnvelope, StateError> {
+    ) -> Result<DiagnosticProjectionEnvelope, StateError> {
         let host_id = self
             .state
             .hosts()
             .next()
             .map(|host| host.id.clone())
             .ok_or(StateError::UnknownHost)?;
-        let (stream, payload) = match name {
+        let (source_stream, key, payload) = match name {
             ProjectionName::SessionIndex => {
                 let project_id = self.scoped_project(session_id)?;
                 (
                     StreamKey::Project {
+                        project_id: project_id.clone(),
+                    },
+                    ProjectionKey::SessionIndex {
                         project_id: project_id.clone(),
                     },
                     ProjectionPayload::SessionIndex {
@@ -225,6 +238,9 @@ impl CanonicalStore {
                     StreamKey::Session {
                         session_id: session_id.clone(),
                     },
+                    ProjectionKey::Transcript {
+                        session_id: session_id.clone(),
+                    },
                     ProjectionPayload::Transcript {
                         view: projection::transcript(&self.state, &session_id)?,
                     },
@@ -234,6 +250,9 @@ impl CanonicalStore {
                 let session_id = self.scoped_session(session_id)?;
                 (
                     StreamKey::Session {
+                        session_id: session_id.clone(),
+                    },
+                    ProjectionKey::LiveActivity {
                         session_id: session_id.clone(),
                     },
                     ProjectionPayload::LiveActivity {
@@ -247,6 +266,9 @@ impl CanonicalStore {
                     StreamKey::Session {
                         session_id: session_id.clone(),
                     },
+                    ProjectionKey::InputQueue {
+                        session_id: session_id.clone(),
+                    },
                     ProjectionPayload::InputQueue {
                         view: projection::input_queue(&self.state, &session_id)?,
                     },
@@ -254,6 +276,9 @@ impl CanonicalStore {
             }
             ProjectionName::AttentionInbox => (
                 StreamKey::Host {
+                    host_id: host_id.clone(),
+                },
+                ProjectionKey::AttentionInbox {
                     host_id: host_id.clone(),
                 },
                 ProjectionPayload::AttentionInbox {
@@ -266,20 +291,23 @@ impl CanonicalStore {
                     StreamKey::Host {
                         host_id: host_id.clone(),
                     },
+                    ProjectionKey::RuntimeCapability {
+                        host_id: host_id.clone(),
+                        runtime_id: runtime_id.clone(),
+                    },
                     ProjectionPayload::RuntimeCapability {
                         view: projection::runtime_capability(&self.state, &runtime_id)?,
                     },
                 )
             }
         };
-        let envelope = ProjectionEnvelope {
+        payload.validate_for_key(&key)?;
+        Ok(DiagnosticProjectionEnvelope {
             projection_version: PROJECTION_VERSION,
-            cursor: self.cursor_of(&stream),
-            stream,
+            cursor: self.cursor_of(&source_stream),
+            stream: source_stream,
             payload,
-        };
-        envelope.validate_for_transport()?;
-        Ok(envelope)
+        })
     }
 
     fn scoped_session(&self, session_id: Option<&SessionId>) -> Result<SessionId, StateError> {
@@ -566,7 +594,12 @@ impl CanonicalStore {
     fn record_idempotency(&mut self, key: &str, command_id: &CommandId) -> Result<(), StateError> {
         self.idempotency.insert(key.to_owned(), command_id.clone());
         let path = self.idempotency_path();
-        let line = format!("{key} {}\n", command_id.as_str());
+        let record = IdempotencyRecord {
+            format_version: IDEMPOTENCY_FORMAT_VERSION,
+            key_digest: key.to_owned(),
+            command_id: command_id.clone(),
+        };
+        let line = format!("{}\n", serde_json::to_string(&record)?);
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -592,14 +625,36 @@ impl CanonicalStore {
             if line.trim().is_empty() {
                 continue;
             }
-            let mut parts = line.splitn(2, ' ');
-            let (Some(key), Some(command_id)) = (parts.next(), parts.next()) else {
+            let record = serde_json::from_str::<IdempotencyRecord>(&line).map_err(|_| {
+                StateError::MalformedRecord {
+                    path: path.clone(),
+                    line: index + 1,
+                }
+            })?;
+            let digest_is_valid = record.key_digest.len() == 64
+                && record
+                    .key_digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
+            // #[allow(kaleido::version_branch)] reason: durable side-table format validation must reject incompatible on-disk records before replay
+            if record.format_version != IDEMPOTENCY_FORMAT_VERSION
+                || !digest_is_valid
+                || record.command_id.is_empty()
+            {
                 return Err(StateError::MalformedRecord {
                     path: path.clone(),
                     line: index + 1,
                 });
-            };
-            table.insert(key.to_owned(), CommandId::new(command_id));
+            }
+            if table
+                .insert(record.key_digest, record.command_id.clone())
+                .is_some_and(|existing| existing != record.command_id)
+            {
+                return Err(StateError::MalformedRecord {
+                    path: path.clone(),
+                    line: index + 1,
+                });
+            }
         }
         Ok(table)
     }

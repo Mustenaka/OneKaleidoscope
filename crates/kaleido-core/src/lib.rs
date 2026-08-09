@@ -141,12 +141,12 @@ mod tests {
     use std::task::{Context, Poll, Waker};
 
     use kaleido_proto::command::{CommandAck, CommandOutcome};
-    use kaleido_proto::effect::{Cursor, StreamKey};
+    use kaleido_proto::effect::Cursor;
     use kaleido_proto::error::ErrorCode;
     use kaleido_proto::host::HostReachability;
     use kaleido_proto::ids::{CommandId, HostId};
     use kaleido_proto::projection::{
-        ProjectIndexView, ProjectionEnvelope, ProjectionPayload, PROJECTION_VERSION,
+        ProjectIndexView, ProjectionEnvelope, ProjectionKey, ProjectionPayload, PROJECTION_VERSION,
     };
 
     use super::{
@@ -167,7 +167,7 @@ mod tests {
         let host_id = HostId::new("host-probe");
         ProjectionEnvelope {
             projection_version: PROJECTION_VERSION,
-            stream: StreamKey::Host {
+            key: ProjectionKey::ProjectIndex {
                 host_id: host_id.clone(),
             },
             cursor: Cursor::START,

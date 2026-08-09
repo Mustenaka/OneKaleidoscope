@@ -1,7 +1,7 @@
 # CLAUDE.md — 项目主管工作合同
 
 > Claude Code 的身份是项目主管（Orchestrator & Reviewer）。
-> 当前状态：**R2 已完成（[T-100](docs/tasks/T-100.md) 通过）；[T-102](docs/tasks/T-102.md) active。**
+> 当前状态：**R2 已完成；R3 已开工，[T-107](docs/tasks/T-107.md) active。**
 
 ## 1. 每次启动必须先读
 
@@ -37,36 +37,30 @@
 
 上游没有公开路径时，登记阻塞并保留失败验收格。不得隐藏、改名或降低需求来宣布完成。
 
-## 3. 当前工作：为 P-1 与 D-B1 开卡
+## 3. 当前工作：R3 Android 局域网纵切
 
-R1 已由主管评审，结论是 **有条件通过（携带 UB-R1-S）**，见
-[R1 评审](docs/gates/R1-result.md) §0 与 [ADR-0013](docs/adr/0013-platform-track-order.md)。
-Swift 编译门禁没有被删除或改小，它变成 R8 的硬前置，解除路径是
-[T-102](docs/tasks/T-102.md) 在已有 `macos-latest` CI job 上做真实编译。
+R0、R1、R2 已通过；仓库收敛、T-105 schema drift、T-103 Attention provenance 与
+T-104 LiveControl 均已结清。R3 固定拆成三个审核边界：
 
-[T-100 已通过](docs/gates/T-100-result.md)（R2 完成）、[T-102 已通过](docs/gates/T-102-result.md)
-（UB-R1-S 与 G-R1-1 解除）。主管当前的工作是：
+1. [T-106](docs/tasks/T-106.md)：UACP 0.3 projection cursor、可信 mobile ingress、
+   TRANSPORT 0.1；
+2. [T-107](docs/tasks/T-107.md)：hostd LAN broker、projection journal 与 Rust mobile core；
+3. [T-108](docs/tasks/T-108.md)：Android Compose 与断线/冷启恢复。
 
-1. **先提醒负责人收敛仓库**——本地 `main` 与 `origin/codex/t-102-uniffi-probe`
-   两个来源都不完整，见 [T-102 门禁结果](docs/gates/T-102-result.md) §4；
-2. 为 **P-1** 与 **D-B1** 各开一张卡。两者都授权改 `kaleido-proto` 或 `PROTOCOL.md`，
-   必须先写 ADR 再改代码，且**分开两张**——它们是不同的问题，合并会让审核失焦；
-3. 两张卡结清后才写 R3 的卡。
+T-106 必须先完成合同、双端绑定与三平台 CI；不得在合同未闭合时先私设 socket 或 Kotlin
+状态机。T-107、T-108 也必须分开审核。
 
-携带项总表，任何时候都不许在文档里写成已通过：
+仍携带的项目：
 
 | ID | 内容 | 阻塞谁 |
 |---|---|---|
-| P-1 | `AttentionState::Answered` 无法表达「观察到的外部应答」 | R3 |
-| D-B1 | `LiveControl` 不可达，`LiveBinding::Controlling` 永远到不了 | R3 |
 | D-B2 | 活进程树终止无测试 | R4 |
 | D-B6 / D-B7 | 跨平台路径校验规则未定 | R9 |
-| D-B11 | OpenCode 快照 1.18.8 vs 实机 1.18.9，1 处 out-of-surface removal | R5 |
-| D-B8 / D-B3 / P-2 / D-R1-1 | 见 [tasks/README](docs/tasks/README.md) | 不阻塞 |
+| D-B11 | OpenCode 实机与 schema 快照需在接入前重新对齐 | R5 |
+| D-B8 / P-2 | 见 [tasks/README](docs/tasks/README.md) | 不阻塞 |
 
-G-R1-1 虽已解除，但它的结论**有边界**：只证明了 UniFFI 能表达并编译回调/对象/async/
-throwing 四种形状，**没有**证明线程调度、背压、进程被杀后的恢复。R3 不得引用本结论
-当作那些问题已解决。
+G-R1-1 虽已解除，但它只证明 UniFFI 能表达并编译 callback/object/async/throwing；
+线程调度、背压、进程被杀后的恢复必须由 T-107/T-108 取得真实证据。
 
 `docs/PROTOCOL.md` 与 `crates/kaleido-proto` 现在是合同：修改必须先改协议、走 ADR，
 再改代码。协议从 canonical state、commands、projections 和 workflow 推导，

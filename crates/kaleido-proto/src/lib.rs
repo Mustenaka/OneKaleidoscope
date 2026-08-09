@@ -1,7 +1,7 @@
 //! UACP contract types.
 //!
 //! This crate is the machine-readable form of `docs/PROTOCOL.md`. Every type
-//! here has a definition in that document, and every version 0.2 type in that
+//! here has a definition in that document, and every version 0.3 type in that
 //! document exists here. Changing this crate requires changing the document and
 //! recording an ADR first (`AGENTS.md` section 2.1).
 //!
@@ -56,12 +56,12 @@ uniffi::setup_scaffolding!();
 ///
 /// Peers must refuse a different major version rather than guess
 /// (`docs/PROTOCOL.md` section 1).
-pub const PROTOCOL_VERSION: &str = "0.2.0";
+pub const PROTOCOL_VERSION: &str = "0.3.0";
 
 /// Whether a peer's protocol version is compatible with this build.
 ///
 /// Pre-1.0 minor versions are compatibility boundaries. This build therefore
-/// accepts `0.2.x`, but rejects every other `0.x` line. Once the protocol
+/// accepts `0.3.x`, but rejects every other `0.x` line. Once the protocol
 /// reaches 1.0, normal same-major compatibility applies.
 pub fn version_is_compatible(peer_version: &str) -> bool {
     fn parse(version: &str) -> Option<(u64, u64, u64)> {
@@ -104,6 +104,12 @@ pub enum ContractViolation {
     #[error("digest `{digest}` is not a canonical SHA-256 digest")]
     MalformedDigest { digest: String },
 
+    #[error("idempotency key of {byte_len} bytes exceeds the contract limit")]
+    IdempotencyKeyTooLong { byte_len: usize },
+
+    #[error("device command TTL {ttl_ms}ms is outside the allowed range")]
+    InvalidDeviceCommandTtl { ttl_ms: u64 },
+
     #[error("a projection preview contains unsafe text")]
     UnsafePreview,
 
@@ -136,6 +142,20 @@ pub enum ContractViolation {
 
     #[error("a terminal content read chunk must not carry a continuation offset")]
     ContentReadEofHasNext,
+
+    #[error("content kind {content_kind:?} cannot be written by a mobile device")]
+    UnsupportedContentWriteKind { content_kind: content::ContentKind },
+
+    #[error("content write size {byte_len} is outside the allowed range")]
+    InvalidContentWriteSize { byte_len: u64 },
+
+    #[error("stored content write response does not match its request metadata")]
+    ContentWriteResponseMismatch,
+
+    #[error("content write response has invalid availability {availability:?}")]
+    InvalidContentWriteAvailability {
+        availability: content::ContentAvailability,
+    },
 
     #[error("a turn carries an error while its status is {status:?}")]
     TurnErrorWithoutFailure { status: turn::TurnStatus },
@@ -240,6 +260,29 @@ pub enum ContractViolation {
 
     #[error("records from more than one stream were verified together")]
     MixedStreams,
+
+    #[error("projections from more than one key were verified together")]
+    MixedProjectionKeys,
+
+    #[error("projection payload does not match its key")]
+    ProjectionKeyPayloadMismatch,
+
+    #[error("projection subscription acknowledgement names another key")]
+    ProjectionSubscribeKeyMismatch,
+
+    #[error("a resumed projection subscription requires a prior cursor")]
+    ProjectionResumeWithoutCursor,
+
+    #[error("projection resume cursor mismatch: expected {expected}, found {found}")]
+    ProjectionResumeCursorMismatch { expected: u64, found: u64 },
+
+    #[error(
+        "projection current cursor must advance the requested cursor: since {since}, current {current}"
+    )]
+    ProjectionCurrentCursorNotAhead { since: u64, current: u64 },
+
+    #[error("projection retention window is inverted: floor {floor}, head {head}")]
+    InvalidProjectionCursorWindow { floor: u64, head: u64 },
 
     #[error("snapshot payload does not match its stream")]
     SnapshotStreamMismatch,

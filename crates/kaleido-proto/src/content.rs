@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::CanonicalError;
 use crate::ids::ContentId;
 use crate::ContractViolation;
 
@@ -13,6 +14,9 @@ pub const MAX_PREVIEW_BYTES: usize = 256;
 
 /// Largest content body chunk a reader may request at once.
 pub const MAX_CONTENT_READ_BYTES: u32 = 65_536;
+
+/// Largest sensitive body accepted by one authenticated content write.
+pub const MAX_CONTENT_WRITE_BYTES: u64 = 65_536;
 
 /// A reference to a payload body, never the body itself.
 ///
@@ -108,6 +112,30 @@ pub enum ContentUnavailableReason {
     NotFound,
     Unauthorized,
     DigestMismatch,
+}
+
+/// Metadata for one separately framed authenticated content upload.
+///
+/// The body bytes travel in the correlated binary transport frame, never in
+/// this record or ordinary JSON logs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[serde(deny_unknown_fields)]
+pub struct ContentWriteRequest {
+    /// Named differently from the transport frame's `kind` discriminator.
+    pub content_kind: ContentKind,
+    pub byte_len: u64,
+    /// Client-claimed integrity digest. The host recomputes it from the binary
+    /// body before storing; this layer validates only its canonical shape.
+    pub digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ContentWriteResponse {
+    Stored { content_ref: ContentRef },
+    Rejected { error: CanonicalError },
 }
 
 impl ContentRef {
@@ -235,6 +263,57 @@ impl ContentReadResponse {
                     Ok(())
                 }
             }
+        }
+    }
+}
+
+impl ContentWriteRequest {
+    pub fn validate(&self) -> Result<(), ContractViolation> {
+        if !matches!(
+            self.content_kind,
+            ContentKind::PlainText | ContentKind::Markdown
+        ) {
+            return Err(ContractViolation::UnsupportedContentWriteKind {
+                content_kind: self.content_kind.clone(),
+            });
+        }
+        if !(1..=MAX_CONTENT_WRITE_BYTES).contains(&self.byte_len) {
+            return Err(ContractViolation::InvalidContentWriteSize {
+                byte_len: self.byte_len,
+            });
+        }
+        validate_digest(&self.digest)
+    }
+}
+
+impl ContentWriteResponse {
+    /// Validates the response against the request metadata that the host
+    /// authenticated. Actual body length/digest recomputation belongs to the
+    /// transport/content-store write path.
+    pub fn validate_for(&self, request: &ContentWriteRequest) -> Result<(), ContractViolation> {
+        request.validate()?;
+        match self {
+            ContentWriteResponse::Stored { content_ref } => {
+                content_ref.validate()?;
+                if content_ref.sensitivity != Sensitivity::Sensitive {
+                    return Err(ContractViolation::SensitiveContentRequired {
+                        field: "content_write.content_ref",
+                    });
+                }
+                if content_ref.availability != ContentAvailability::Stored {
+                    return Err(ContractViolation::InvalidContentWriteAvailability {
+                        availability: content_ref.availability,
+                    });
+                }
+                if content_ref.kind != request.content_kind
+                    || content_ref.byte_len != request.byte_len
+                    || content_ref.digest != request.digest
+                {
+                    return Err(ContractViolation::ContentWriteResponseMismatch);
+                }
+                Ok(())
+            }
+            ContentWriteResponse::Rejected { error } => error.validate(),
         }
     }
 }

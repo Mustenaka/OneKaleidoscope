@@ -24,8 +24,9 @@ use kaleido_proto::host::{
     ProviderFamily, ProviderRuntime, SessionCounts,
 };
 use kaleido_proto::ids::{
-    AttentionId, CommandId, HostId, ItemId, ProjectBindingId, ProjectId, ProviderBindingHandle,
-    ProviderBindingId, ProviderBindingKind, ProviderRuntimeId, SessionId, TurnId,
+    AttentionId, CommandId, DeviceId, HostId, ItemId, ProjectBindingId, ProjectId,
+    ProviderBindingHandle, ProviderBindingId, ProviderBindingKind, ProviderRuntimeId, SessionId,
+    TurnId,
 };
 use kaleido_proto::projection::ProjectionPayload;
 use kaleido_proto::queue::{QueueIntent, QueueState};
@@ -304,7 +305,7 @@ fn reply(
         command_id: CommandId::new(format!("cmd_{command}")),
         idempotency_key: command.to_owned(),
         actor: Actor::Human {
-            device_label: "test-device".to_owned(),
+            device_id: DeviceId::new("device-test"),
         },
         issued_at_ms: NOW_MS,
         expires_at_ms: None,
@@ -326,7 +327,7 @@ fn prompt(fixture: &Fixture, command: &str) -> CommandEnvelope {
         command_id: CommandId::new(format!("cmd_{command}")),
         idempotency_key: command.to_owned(),
         actor: Actor::Human {
-            device_label: "test-device".to_owned(),
+            device_id: DeviceId::new("device-test"),
         },
         issued_at_ms: NOW_MS,
         expires_at_ms: None,
@@ -440,6 +441,39 @@ fn idempotency_survives_a_reload() {
             .expect("repeat after reload")
             .outcome,
         CommandOutcome::Duplicate { .. }
+    ));
+}
+
+#[test]
+fn zero_two_idempotency_table_fails_loud_instead_of_reexecuting() {
+    let fixture = scaffold(None);
+    let root = fixture.store.root().to_path_buf();
+    let envelope = reply(&fixture, "legacy-idempotency", "accept", None);
+    let mut store = fixture.store;
+    store
+        .submit_command(&envelope, NOW_MS)
+        .expect("first submission");
+    drop(store);
+
+    let path = root.join("idempotency.jsonl");
+    let current = std::fs::read_to_string(&path).expect("read versioned idempotency table");
+    let record: serde_json::Value =
+        serde_json::from_str(current.trim()).expect("parse current idempotency record");
+    let key_digest = record
+        .get("key_digest")
+        .and_then(serde_json::Value::as_str)
+        .expect("key digest");
+    let command_id = record
+        .get("command_id")
+        .and_then(|value| value.get("value"))
+        .and_then(serde_json::Value::as_str)
+        .expect("command identifier");
+    let legacy = format!("{} {}\n", key_digest, command_id);
+    std::fs::write(&path, legacy).expect("write v0.2 idempotency shape");
+
+    assert!(matches!(
+        CanonicalStore::load(&root, ClockSource::Fixed { at_ms: NOW_MS }),
+        Err(StateError::MalformedRecord { line: 1, .. })
     ));
 }
 
@@ -629,7 +663,7 @@ fn a_steering_intent_is_queued_rather_than_injected() {
         command_id: CommandId::new("cmd_steer"),
         idempotency_key: "steer".to_owned(),
         actor: Actor::Human {
-            device_label: "test-device".to_owned(),
+            device_id: DeviceId::new("device-test"),
         },
         issued_at_ms: NOW_MS,
         expires_at_ms: None,
