@@ -2,7 +2,10 @@
 
 use std::path::PathBuf;
 
-use kaleido_proto::ids::{AttentionId, ContentId, ProviderRuntimeId, SessionId, TurnId};
+use kaleido_proto::ids::{
+    AttentionId, CommandId, ContentId, HostId, ProviderRuntimeId, SessionId, TurnId, WorkflowId,
+};
+use kaleido_proto::projection::ProjectionKey;
 use kaleido_proto::ContractViolation;
 use thiserror::Error;
 
@@ -29,11 +32,20 @@ pub enum StateError {
     #[error("effect references unknown runtime {runtime_id}")]
     UnknownRuntime { runtime_id: ProviderRuntimeId },
 
+    #[error("an existing runtime cannot move to another host")]
+    RuntimeHostChanged,
+
     #[error("effect references unknown turn {turn_id}")]
     UnknownTurn { turn_id: TurnId },
 
     #[error("the store has no host record yet, so an effect cannot be routed to a stream")]
     UnknownHost,
+
+    #[error("the store has no host record for {host_id}")]
+    UnknownHostId { host_id: HostId },
+
+    #[error("the store has no workflow record for {workflow_id}")]
+    UnknownWorkflow { workflow_id: WorkflowId },
 
     #[error("projection scope is ambiguous: {detail}")]
     AmbiguousScope { detail: &'static str },
@@ -50,8 +62,44 @@ pub enum StateError {
     #[error("content {content_id} does not match its recorded digest")]
     ContentDigestMismatch { content_id: ContentId },
 
+    #[error("content {content_id} is not owned by the authenticated device")]
+    ContentUnauthorized { content_id: ContentId },
+
+    #[error("content {content_id} ownership has expired")]
+    ContentExpired { content_id: ContentId },
+
+    #[error("content {content_id} metadata does not match the authenticated upload")]
+    ContentMetadataMismatch { content_id: ContentId },
+
+    #[error("content identifier {content_id} is not a safe content-store path component")]
+    UnsafeContentId { content_id: ContentId },
+
+    #[error("content {content_id} read offset {offset} is outside the stored body")]
+    InvalidContentOffset { content_id: ContentId, offset: u64 },
+
     #[error("the durable log timestamp counter cannot advance further")]
     TimestampOverflow,
+
+    #[error("projection journal retention must contain at least one entry")]
+    InvalidProjectionRetention,
+
+    #[error("projection journal diverges from canonical history for {key:?}")]
+    ProjectionJournalDiverged { key: ProjectionKey },
+
+    #[error("device command {command_id} was already claimed or is not dispatchable")]
+    DispatchNotAvailable { command_id: CommandId },
+
+    #[error("device command {command_id} did not produce a local runtime-dispatch acceptance")]
+    DispatchNotAccepted { command_id: CommandId },
+
+    #[error("device command outbox has a conflicting durable record")]
+    CommandOutboxDiverged,
+
+    #[error("a durable append committed only partially; reload is required before more writes")]
+    RecoveryRequired,
+
+    #[error("device command envelope does not match the authenticated request: {detail}")]
+    DeviceCommandMismatch { detail: &'static str },
 
     #[error("only command submission may record local command acceptance")]
     UntrustedLocalAcknowledgement,

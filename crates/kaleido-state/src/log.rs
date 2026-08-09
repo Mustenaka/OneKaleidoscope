@@ -56,7 +56,8 @@ impl StreamLog {
             .map_err(|source| StateError::io(&path, source))?;
         file.flush()
             .map_err(|source| StateError::io(&path, source))?;
-        Ok(())
+        file.sync_data()
+            .map_err(|source| StateError::io(&path, source))
     }
 
     /// Reads every stream, verifies each one, and returns a deterministic

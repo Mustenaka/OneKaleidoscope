@@ -17,15 +17,17 @@ use std::collections::BTreeMap;
 use kaleido_proto::attention::{AttentionItem, AttentionState, AttentionSubject};
 use kaleido_proto::capability::{Capability, RuntimeCapabilities};
 use kaleido_proto::command::{CommandAck, CommandOutcome};
+use kaleido_proto::content::ContentRef;
 use kaleido_proto::effect::{DiagnosticRecord, SessionSnapshot, StateEffect};
 use kaleido_proto::host::{Host, Project, ProviderRuntime, SessionCounts};
 use kaleido_proto::ids::{
-    AttentionId, CommandId, HostId, ItemId, ProjectId, ProviderRuntimeId, QueueEntryId, SessionId,
-    TurnId,
+    ArtifactId, AttentionId, CommandId, ContentId, HostId, ItemId, ProjectId, ProviderRuntimeId,
+    QueueEntryId, SessionId, StepId, TurnId, WorkflowId,
 };
 use kaleido_proto::queue::QueueEntry;
 use kaleido_proto::session::{derive_session_status, Session, SessionStatus, StatusInputs};
-use kaleido_proto::turn::{Item, Turn, TurnOrigin};
+use kaleido_proto::turn::{FileChangeKind, Item, ItemBody, Turn, TurnOrigin};
+use kaleido_proto::workflow::{Artifact, Step, Workflow};
 
 use crate::error::StateError;
 
@@ -45,6 +47,9 @@ pub struct CanonicalState {
     queue: BTreeMap<QueueEntryId, QueueEntry>,
     attention: BTreeMap<AttentionId, AttentionItem>,
     attention_order: Vec<AttentionId>,
+    workflows: BTreeMap<WorkflowId, Workflow>,
+    steps: BTreeMap<StepId, Step>,
+    artifacts: BTreeMap<ArtifactId, Artifact>,
     diagnostics: BTreeMap<String, DiagnosticRecord>,
     acks: Vec<CommandAck>,
 }
@@ -66,6 +71,10 @@ impl CanonicalState {
         self.projects.values()
     }
 
+    pub fn project(&self, project_id: &ProjectId) -> Option<&Project> {
+        self.projects.get(project_id)
+    }
+
     pub fn sessions(&self) -> impl Iterator<Item = &Session> {
         self.sessions.values()
     }
@@ -85,6 +94,32 @@ impl CanonicalState {
         self.attention.get(attention_id)
     }
 
+    pub fn workflows(&self) -> impl Iterator<Item = &Workflow> {
+        self.workflows.values()
+    }
+
+    pub fn workflow(&self, workflow_id: &WorkflowId) -> Option<&Workflow> {
+        self.workflows.get(workflow_id)
+    }
+
+    pub fn step(&self, step_id: &StepId) -> Option<&Step> {
+        self.steps.get(step_id)
+    }
+
+    pub fn steps_of(&self, workflow_id: &WorkflowId) -> Vec<&Step> {
+        self.steps
+            .values()
+            .filter(|step| &step.workflow_id == workflow_id)
+            .collect()
+    }
+
+    pub fn artifacts_of(&self, workflow_id: &WorkflowId) -> Vec<&Artifact> {
+        self.artifacts
+            .values()
+            .filter(|artifact| &artifact.workflow_id == workflow_id)
+            .collect()
+    }
+
     pub fn diagnostics(&self) -> impl Iterator<Item = &DiagnosticRecord> {
         self.diagnostics.values()
     }
@@ -95,6 +130,89 @@ impl CanonicalState {
 
     pub fn item(&self, item_id: &ItemId) -> Option<&Item> {
         self.items.get(item_id)
+    }
+
+    pub fn queue_entry(&self, entry_id: &QueueEntryId) -> Option<&QueueEntry> {
+        self.queue.get(entry_id)
+    }
+
+    /// Resolves only references that are actually reachable from canonical
+    /// state. Mobile content reads use this instead of trusting a caller-built
+    /// `ContentRef`.
+    pub fn content_ref(&self, content_id: &ContentId) -> Option<&ContentRef> {
+        self.content_refs()
+            .into_iter()
+            .find(|reference| &reference.content_id == content_id)
+    }
+
+    /// Every content reference reachable from canonical state. Cleanup uses
+    /// this complete traversal as its deletion protection set.
+    pub fn content_refs(&self) -> Vec<&ContentRef> {
+        let mut references = Vec::new();
+        for runtime in self.runtimes.values() {
+            references.extend(
+                runtime
+                    .capabilities
+                    .entries
+                    .iter()
+                    .filter_map(|entry| entry.evidence.note_ref.as_ref()),
+            );
+        }
+        for project in self.projects.values() {
+            references.extend(project.bindings.iter().map(|binding| &binding.root_ref));
+        }
+        for session in self.sessions.values() {
+            references.extend(session.history_source.evidence.note_ref.iter());
+            let live_note = match &session.live_binding {
+                kaleido_proto::session::LiveBinding::Observing { evidence, .. }
+                | kaleido_proto::session::LiveBinding::Controlling { evidence, .. } => {
+                    evidence.note_ref.as_ref()
+                }
+                kaleido_proto::session::LiveBinding::NotBound { .. }
+                | kaleido_proto::session::LiveBinding::Blocked { .. } => None,
+            };
+            references.extend(live_note);
+        }
+        for turn in self.turns.values() {
+            references.extend(
+                turn.error
+                    .iter()
+                    .filter_map(|error| error.detail_ref.as_ref()),
+            );
+        }
+        for item in self.items.values() {
+            references.extend(item_content_refs(item));
+        }
+        for entry in self.queue.values() {
+            references.push(&entry.body);
+        }
+        for item in self.attention.values() {
+            references.extend(attention_content_refs(item));
+        }
+        for step in self.steps.values() {
+            references.push(&step.assignment.worktree_ref);
+            references.extend(
+                step.audit
+                    .iter()
+                    .filter_map(|transition| transition.reason_ref.as_ref()),
+            );
+        }
+        for artifact in self.artifacts.values() {
+            references.push(&artifact.content);
+        }
+        references.extend(
+            self.diagnostics
+                .values()
+                .filter_map(|diagnostic| diagnostic.detail_ref.as_ref()),
+        );
+        references.extend(self.acks.iter().filter_map(|ack| match &ack.outcome {
+            CommandOutcome::AcceptedLocally { note_ref } => note_ref.as_ref(),
+            CommandOutcome::Rejected { error } => error.detail_ref.as_ref(),
+            CommandOutcome::AcceptedByRuntime { .. }
+            | CommandOutcome::Enqueued { .. }
+            | CommandOutcome::Duplicate { .. } => None,
+        }));
+        references
     }
 
     /// Turns of one session, in the order they were first observed.
@@ -193,6 +311,13 @@ impl CanonicalState {
                 self.hosts.insert(host.id.clone(), host.clone());
             }
             StateEffect::RuntimeUpserted { runtime } => {
+                if self
+                    .runtimes
+                    .get(&runtime.id)
+                    .is_some_and(|existing| existing.host_id != runtime.host_id)
+                {
+                    return Err(StateError::RuntimeHostChanged);
+                }
                 if runtime.capabilities.permits(&Capability::LiveControl)
                     && !self.has_runtime_acceptance_for(&runtime.id)
                 {
@@ -375,15 +500,14 @@ impl CanonicalState {
                 self.diagnostics
                     .insert(diagnostic_key(diagnostic), diagnostic.clone());
             }
-            StateEffect::WorkflowUpserted { .. }
-            | StateEffect::StepUpserted { .. }
-            | StateEffect::ArtifactUpserted { .. } => {
-                // Workflow state is defined by the contract but is out of scope
-                // for this slice; recording it here without the board read
-                // model would be state nothing can observe.
-                return Err(StateError::UnsupportedEffect {
-                    detail: "workflow effects are not part of this vertical slice",
-                });
+            StateEffect::WorkflowUpserted { workflow } => {
+                self.workflows.insert(workflow.id.clone(), workflow.clone());
+            }
+            StateEffect::StepUpserted { step } => {
+                self.steps.insert(step.id.clone(), step.clone());
+            }
+            StateEffect::ArtifactUpserted { artifact } => {
+                self.artifacts.insert(artifact.id.clone(), artifact.clone());
             }
         }
         self.recompute_derived();
@@ -579,11 +703,19 @@ impl CanonicalState {
                     .count(),
             )
             .unwrap_or(u32::MAX);
+            let workflow_count = u32::try_from(
+                self.workflows
+                    .values()
+                    .filter(|workflow| workflow.project_id == project_id)
+                    .count(),
+            )
+            .unwrap_or(u32::MAX);
             let Some(project) = self.projects.get_mut(&project_id) else {
                 continue;
             };
             project.session_counts = counts;
             project.attention_count = attention_count;
+            project.workflow_count = workflow_count;
             if last_activity_at_ms > project.last_activity_at_ms {
                 project.last_activity_at_ms = last_activity_at_ms;
             }
@@ -596,6 +728,52 @@ impl CanonicalState {
             .get(attention_id)
             .is_some_and(|entry| matches!(entry.state, AttentionState::Answered { .. }))
     }
+}
+
+fn item_content_refs(item: &Item) -> Vec<&ContentRef> {
+    match &item.body {
+        ItemBody::UserMessage { content }
+        | ItemBody::AgentMessage { content, .. }
+        | ItemBody::Reasoning { content } => vec![content],
+        ItemBody::ToolCall {
+            arguments, output, ..
+        } => arguments.iter().chain(output.iter()).collect(),
+        ItemBody::FileEdit { change_set } => change_set
+            .entries
+            .iter()
+            .flat_map(|entry| {
+                let from = match &entry.kind {
+                    FileChangeKind::Rename { from_ref } => Some(from_ref),
+                    FileChangeKind::Add | FileChangeKind::Modify | FileChangeKind::Delete => None,
+                };
+                std::iter::once(&entry.path_ref)
+                    .chain(entry.diff.iter())
+                    .chain(from)
+            })
+            .collect(),
+        ItemBody::PlanUpdate { entries } => entries.iter().map(|entry| &entry.title_ref).collect(),
+        ItemBody::TaskUpdate { tasks } => tasks.iter().map(|task| &task.title_ref).collect(),
+        ItemBody::Diagnostic { detail, .. } => vec![detail],
+    }
+}
+
+fn attention_content_refs(item: &AttentionItem) -> Vec<&ContentRef> {
+    let mut references = match &item.subject {
+        AttentionSubject::Approval { request } => std::iter::once(&request.summary_ref)
+            .chain(request.detail_ref.iter())
+            .collect(),
+        AttentionSubject::Question { request } => vec![&request.prompt_ref],
+        AttentionSubject::WorkflowGate { request } => vec![&request.prompt_ref],
+        AttentionSubject::ConnectionFault { .. } => Vec::new(),
+    };
+    if let AttentionState::Answered {
+        free_form_ref: Some(reference),
+        ..
+    } = &item.state
+    {
+        references.push(reference);
+    }
+    references
 }
 
 /// Diagnostics aggregate per code and scope, so the key must include both.
