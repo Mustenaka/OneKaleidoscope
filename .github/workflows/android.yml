@@ -2,6 +2,8 @@ name: Android CI
 
 'on':
   push:
+    branches:
+      - main
     paths:
       - 'apps/android/**'
       - 'crates/kaleido-core/**'
@@ -109,6 +111,7 @@ jobs:
           arch: x86_64
           target: google_apis
           profile: pixel_6
+          working-directory: apps/android
           disable-animations: true
           emulator-options: >-
             -no-window
@@ -117,14 +120,12 @@ jobs:
             -no-boot-anim
             -camera-back none
           script: |
-            apps/android/gradlew \
-              --project-dir apps/android \
+            ./gradlew \
               --no-daemon \
               --console=plain \
               :app:connectedDebugAndroidTest \
               -Pandroid.testInstrumentationRunnerArguments.class=com.onekaleidoscope.integration.NativeUniFfiSmokeTest
-            apps/android/gradlew \
-              --project-dir apps/android \
+            ./gradlew \
               --no-daemon \
               --console=plain \
               :app:connectedDebugAndroidTest
