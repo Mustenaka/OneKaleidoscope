@@ -18,11 +18,13 @@ mod windows {
         CodexRuntimeConfig, CodexRuntimeSession, CodexSandboxMode, ReducerConfig,
     };
     use kaleido_proto::capability::{Capability, CapabilityState, EvidenceSource};
+    use kaleido_proto::command::CommandOutcome;
     use kaleido_proto::content::{ContentKind, Sensitivity};
     use kaleido_proto::effect::StateEffect;
     use kaleido_proto::host::{
         ConnectionFaultReason, ConnectionState, HostPlatform, LaunchSurface,
     };
+    use kaleido_proto::ids::{CommandId, ProviderBindingKind};
     use kaleido_proto::session::{LiveBinding, LiveUnboundReason};
     use kaleido_proto::turn::TurnOrigin;
 
@@ -62,12 +64,76 @@ mod windows {
                 b"not emitted by the fake runtime",
             )
             .expect("store prompt");
+        let command_id = CommandId::new("cmd_live_prompt");
         let prompt_effects = session
-            .submit_prompt(&prompt_ref, &mut content)
+            .submit_prompt(&command_id, &prompt_ref, &mut content)
             .expect("submit prompt");
-        assert!(prompt_effects
+        assert!(prompt_effects.iter().any(|effect| matches!(
+            effect,
+            StateEffect::TurnUpserted { turn }
+                if matches!(
+                    &turn.origin,
+                    TurnOrigin::RemoteCommand { command_id: origin_command_id }
+                        if origin_command_id == &command_id
+                )
+        )));
+        let capability_index = prompt_effects
             .iter()
-            .any(|effect| matches!(effect, StateEffect::TurnUpserted { .. })));
+            .position(|effect| {
+                matches!(
+                    effect,
+                    StateEffect::CapabilitiesUpdated { capabilities }
+                        if capabilities.state_of(&Capability::LiveControl)
+                            == CapabilityState::Supported
+                )
+            })
+            .expect("the matched response must prove live control");
+        let ack_index = prompt_effects
+            .iter()
+            .position(|effect| {
+                matches!(
+                    effect,
+                    StateEffect::CommandAcknowledged { ack }
+                        if ack.command_id == command_id
+                            && matches!(ack.outcome, CommandOutcome::AcceptedByRuntime { .. })
+                )
+            })
+            .expect("the matched response must acknowledge the command");
+        let controlling_index = prompt_effects
+            .iter()
+            .position(|effect| {
+                matches!(
+                    effect,
+                    StateEffect::SessionUpserted { session }
+                        if matches!(session.live_binding, LiveBinding::Controlling { .. })
+                )
+            })
+            .expect("the matched response must promote the session");
+        assert!(
+            ack_index < capability_index && capability_index < controlling_index,
+            "the acknowledgement must validate before capability and controlling state"
+        );
+        assert!(prompt_effects.iter().any(|effect| matches!(
+            effect,
+            StateEffect::CommandAcknowledged { ack }
+                if ack.command_id == command_id
+                    && matches!(
+                        &ack.outcome,
+                        CommandOutcome::AcceptedByRuntime { binding_handle }
+                            if binding_handle.kind
+                                == ProviderBindingKind::RuntimeAcknowledgement
+                                && binding_handle.runtime_id == *session.runtime_id()
+                    )
+        )));
+        let capabilities = session.capability_probe().to_capabilities();
+        assert_eq!(
+            capabilities.state_of(&Capability::LiveControl),
+            CapabilityState::Supported
+        );
+        assert_eq!(
+            capabilities.state_of(&Capability::TurnSteer),
+            CapabilityState::NotVerified
+        );
 
         let closed = session.close().expect("clean close");
         assert!(closed.iter().any(|effect| matches!(
@@ -147,9 +213,10 @@ mod windows {
                 b"fixture-driven transport probe",
             )
             .expect("store prompt");
+        let command_id = CommandId::new("cmd_exiting_prompt");
 
         let effects = session
-            .submit_prompt(&prompt_ref, &mut content)
+            .submit_prompt(&command_id, &prompt_ref, &mut content)
             .expect("process exit is expressed as effects");
         assert!(effects.iter().any(|effect| matches!(
             effect,
@@ -165,6 +232,22 @@ mod windows {
         assert!(effects
             .iter()
             .any(|effect| matches!(effect, StateEffect::AttentionUpserted { .. })));
+        assert!(effects.iter().all(|effect| !matches!(
+            effect,
+            StateEffect::CommandAcknowledged {
+                ack: kaleido_proto::command::CommandAck {
+                    outcome: CommandOutcome::AcceptedByRuntime { .. },
+                    ..
+                }
+            }
+        )));
+        assert_eq!(
+            session
+                .capability_probe()
+                .to_capabilities()
+                .state_of(&Capability::LiveControl),
+            CapabilityState::NotVerified
+        );
         assert!(matches!(
             session.drain_effects(&mut content),
             Err(RuntimeSessionError::NotConnected)

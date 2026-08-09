@@ -39,6 +39,7 @@ pub trait ProviderRuntimeSession {
     /// Sends a prompt whose body is already stored.
     fn submit_prompt(
         &mut self,
+        command_id: &CommandId,
         body: &ContentRef,
         content: &mut dyn ContentAccess,
     ) -> Result<Vec<StateEffect>, RuntimeSessionError>;

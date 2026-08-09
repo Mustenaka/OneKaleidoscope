@@ -129,6 +129,8 @@ pub struct RunOutcome {
 #[derive(Debug, Default)]
 struct LiveEvidence {
     session_index_while_observing: Option<serde_json::Value>,
+    session_index_while_controlling: Option<serde_json::Value>,
+    runtime_capability_while_controlling: Option<serde_json::Value>,
     live_activity_while_streaming: Option<serde_json::Value>,
     steer_delivery_ever_observed: bool,
 }
@@ -281,7 +283,7 @@ pub fn run_with_session(
         },
     };
     reject_if_command_failed(store.submit_command(&prompt_envelope, system_time_ms())?)?;
-    let effects = runtime.submit_prompt(&prompt_ref, &mut access)?;
+    let effects = runtime.submit_prompt(&prompt_envelope.command_id, &prompt_ref, &mut access)?;
     apply_live_effects(&mut store, &effects, &mut evidence)?;
     store.session_snapshot(&session_id)?;
 
@@ -385,6 +387,24 @@ fn latch_live_evidence(
         };
         if observing {
             evidence.session_index_while_observing = Some(serde_json::to_value(projection)?);
+        }
+    }
+    if evidence.session_index_while_controlling.is_none() {
+        let projection = store.projection(ProjectionName::SessionIndex, Some(session_id))?;
+        let controlling = match &projection.payload {
+            ProjectionPayload::SessionIndex { view } => view
+                .active
+                .iter()
+                .chain(view.history.iter())
+                .chain(view.archived.iter())
+                .any(|summary| matches!(summary.live_binding, LiveBinding::Controlling { .. })),
+            _ => false,
+        };
+        if controlling {
+            evidence.session_index_while_controlling = Some(serde_json::to_value(projection)?);
+            evidence.runtime_capability_while_controlling = Some(serde_json::to_value(
+                store.projection(ProjectionName::RuntimeCapability, Some(session_id))?,
+            )?);
         }
     }
     if evidence.live_activity_while_streaming.is_none() {
@@ -528,6 +548,8 @@ fn render_run_outcome(
         "termination": termination,
         "observed": {
             "session_index_while_observing": evidence.session_index_while_observing,
+            "session_index_while_controlling": evidence.session_index_while_controlling,
+            "runtime_capability_while_controlling": evidence.runtime_capability_while_controlling,
             "live_activity_while_streaming": evidence.live_activity_while_streaming,
             "steer_delivery_ever_observed": evidence.steer_delivery_ever_observed,
         },
@@ -538,6 +560,7 @@ fn render_run_outcome(
         session = %session_id,
         termination,
         observed_live_binding = evidence.session_index_while_observing.is_some(),
+        observed_controlling_binding = evidence.session_index_while_controlling.is_some(),
         observed_streaming_item = evidence.live_activity_while_streaming.is_some(),
         "completed a live diagnostic session"
     );

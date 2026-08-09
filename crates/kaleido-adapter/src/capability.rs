@@ -9,7 +9,8 @@ use kaleido_proto::capability::{
     Capability, CapabilityEntry, CapabilityEvidence, CapabilityState, EvidenceSource,
     RuntimeCapabilities,
 };
-use kaleido_proto::ids::ProviderRuntimeId;
+use kaleido_proto::command::CommandOutcome;
+use kaleido_proto::ids::{ProviderBindingKind, ProviderRuntimeId};
 
 /// Every capability the contract defines, in a fixed order.
 ///
@@ -73,6 +74,26 @@ impl CapabilityProbe {
         self.proven.contains(&capability)
     }
 
+    /// Records session control only when live structured traffic proves that
+    /// the runtime accepted a real broker command.
+    ///
+    /// Local acceptance, queueing and recorded fixtures are deliberately
+    /// insufficient: they do not prove control on the current connection.
+    pub fn observe_runtime_acceptance(&mut self, outcome: &CommandOutcome) -> bool {
+        let CommandOutcome::AcceptedByRuntime { binding_handle } = outcome else {
+            return false;
+        };
+        if self.evidence_source != EvidenceSource::ObservedInTraffic
+            || binding_handle.runtime_id != self.runtime_id
+            || binding_handle.kind != ProviderBindingKind::RuntimeAcknowledgement
+            || outcome.validate().is_err()
+        {
+            return false;
+        }
+        self.prove(Capability::LiveControl);
+        true
+    }
+
     /// Everything traffic has proven so far, in the order it was proven.
     pub fn proven(&self) -> &[Capability] {
         &self.proven
@@ -128,6 +149,9 @@ impl CapabilityProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kaleido_proto::ids::{
+        ProviderBindingHandle, ProviderBindingId, ProviderBindingKind, QueueEntryId,
+    };
 
     #[test]
     fn an_unproven_capability_is_not_verified_rather_than_unsupported() {
@@ -171,5 +195,61 @@ mod tests {
             steer.map(|entry| entry.evidence.source),
             Some(EvidenceSource::Absent)
         );
+    }
+
+    #[test]
+    fn only_live_runtime_acceptance_proves_control() {
+        let runtime_id = ProviderRuntimeId::new("rtm_0123456789abcdef");
+        let runtime_accepted = CommandOutcome::AcceptedByRuntime {
+            binding_handle: ProviderBindingHandle {
+                id: ProviderBindingId::new("bnd_0123456789abcdef"),
+                runtime_id: runtime_id.clone(),
+                kind: ProviderBindingKind::RuntimeAcknowledgement,
+            },
+        };
+        let mut live = CapabilityProbe::new(
+            runtime_id.clone(),
+            1_785_378_397_000,
+            EvidenceSource::ObservedInTraffic,
+        );
+        assert!(
+            !live.observe_runtime_acceptance(&CommandOutcome::AcceptedLocally { note_ref: None })
+        );
+        assert!(!live.observe_runtime_acceptance(&CommandOutcome::Enqueued {
+            entry_id: QueueEntryId::new("queue-local"),
+        }));
+        assert!(!live.is_proven(Capability::LiveControl));
+
+        let wrong_runtime = CommandOutcome::AcceptedByRuntime {
+            binding_handle: ProviderBindingHandle {
+                id: ProviderBindingId::new("bnd_wrong_runtime"),
+                runtime_id: ProviderRuntimeId::new("rtm_other_runtime"),
+                kind: ProviderBindingKind::RuntimeAcknowledgement,
+            },
+        };
+        assert!(!live.observe_runtime_acceptance(&wrong_runtime));
+        assert!(!live.is_proven(Capability::LiveControl));
+
+        let wrong_kind = CommandOutcome::AcceptedByRuntime {
+            binding_handle: ProviderBindingHandle {
+                id: ProviderBindingId::new("bnd_wrong_kind"),
+                runtime_id: runtime_id.clone(),
+                kind: ProviderBindingKind::Session,
+            },
+        };
+        assert!(!live.observe_runtime_acceptance(&wrong_kind));
+        assert!(!live.is_proven(Capability::LiveControl));
+
+        assert!(live.observe_runtime_acceptance(&runtime_accepted));
+        assert!(live.is_proven(Capability::LiveControl));
+        assert!(!live.is_proven(Capability::TurnSteer));
+
+        let mut replay = CapabilityProbe::new(
+            runtime_id,
+            1_785_378_397_000,
+            EvidenceSource::RecordedFixture,
+        );
+        assert!(!replay.observe_runtime_acceptance(&runtime_accepted));
+        assert!(!replay.is_proven(Capability::LiveControl));
     }
 }

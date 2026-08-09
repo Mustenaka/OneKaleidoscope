@@ -15,16 +15,17 @@
 use std::collections::BTreeMap;
 
 use kaleido_proto::attention::{AttentionItem, AttentionState, AttentionSubject};
-use kaleido_proto::capability::RuntimeCapabilities;
-use kaleido_proto::command::CommandAck;
+use kaleido_proto::capability::{Capability, RuntimeCapabilities};
+use kaleido_proto::command::{CommandAck, CommandOutcome};
 use kaleido_proto::effect::{DiagnosticRecord, SessionSnapshot, StateEffect};
 use kaleido_proto::host::{Host, Project, ProviderRuntime, SessionCounts};
 use kaleido_proto::ids::{
-    AttentionId, HostId, ItemId, ProjectId, ProviderRuntimeId, QueueEntryId, SessionId, TurnId,
+    AttentionId, CommandId, HostId, ItemId, ProjectId, ProviderRuntimeId, QueueEntryId, SessionId,
+    TurnId,
 };
 use kaleido_proto::queue::QueueEntry;
 use kaleido_proto::session::{derive_session_status, Session, SessionStatus, StatusInputs};
-use kaleido_proto::turn::{Item, Turn};
+use kaleido_proto::turn::{Item, Turn, TurnOrigin};
 
 use crate::error::StateError;
 
@@ -192,9 +193,19 @@ impl CanonicalState {
                 self.hosts.insert(host.id.clone(), host.clone());
             }
             StateEffect::RuntimeUpserted { runtime } => {
+                if runtime.capabilities.permits(&Capability::LiveControl)
+                    && !self.has_runtime_acceptance_for(&runtime.id)
+                {
+                    return Err(StateError::LiveControlCapabilityWithoutRuntimeAcceptance);
+                }
                 self.runtimes.insert(runtime.id.clone(), runtime.clone());
             }
             StateEffect::CapabilitiesUpdated { capabilities } => {
+                if capabilities.permits(&Capability::LiveControl)
+                    && !self.has_runtime_acceptance_for(&capabilities.runtime_id)
+                {
+                    return Err(StateError::LiveControlCapabilityWithoutRuntimeAcceptance);
+                }
                 let runtime = self
                     .runtimes
                     .get_mut(&capabilities.runtime_id)
@@ -208,9 +219,30 @@ impl CanonicalState {
             }
             StateEffect::SessionUpserted { session } => {
                 // Rule R-P7 in the write path: a live binding is only accepted
-                // when the negotiated capabilities actually support it.
-                if let Some(capabilities) = self.capabilities_of(session) {
-                    session.live_binding.validate_against(capabilities)?;
+                // when the candidate session itself resolves to a runtime whose
+                // negotiated capabilities actually support it. Looking up the
+                // previous stored session here would let an update remove or
+                // rewrite its runtime binding while borrowing stale evidence.
+                if let kaleido_proto::session::LiveBinding::Observing { .. }
+                | kaleido_proto::session::LiveBinding::Controlling { .. } = &session.live_binding
+                {
+                    let candidate_runtime = self.live_runtime_of(session)?;
+                    session
+                        .live_binding
+                        .validate_against(&candidate_runtime.capabilities)?;
+                }
+                if matches!(
+                    session.live_binding,
+                    kaleido_proto::session::LiveBinding::Controlling { .. }
+                ) {
+                    let candidate_runtime = self.live_runtime_of(session)?;
+                    let has_runtime_acceptance = self.acks.iter().any(|ack| {
+                        self.accepted_runtime_turn(ack, &candidate_runtime.id)
+                            .is_some_and(|turn| turn.session_id == session.id)
+                    });
+                    if !has_runtime_acceptance {
+                        return Err(StateError::ControllingBindingWithoutRuntimeAcceptance);
+                    }
                 }
                 let mut merged = session.clone();
                 if let Some(existing) = self.sessions.get(&session.id) {
@@ -227,8 +259,34 @@ impl CanonicalState {
                 self.reported_status.insert(session_id.clone(), *status);
             }
             StateEffect::TurnUpserted { turn } => {
+                if let TurnOrigin::RemoteCommand { command_id } = &turn.origin {
+                    let command_already_bound = self.turns.values().any(|existing| {
+                        existing.id != turn.id
+                            && matches!(
+                                &existing.origin,
+                                TurnOrigin::RemoteCommand {
+                                    command_id: existing_command_id
+                                } if existing_command_id == command_id
+                            )
+                    });
+                    if command_already_bound {
+                        return Err(StateError::RemoteCommandTurnConflict);
+                    }
+                }
                 let mut merged = turn.clone();
                 if let Some(existing) = self.turns.get(&turn.id) {
+                    if existing.session_id != turn.session_id {
+                        return Err(StateError::TurnSessionChanged);
+                    }
+                    if existing.origin != turn.origin {
+                        return Err(StateError::TurnOriginChanged);
+                    }
+                    if existing.binding_handle.is_some()
+                        && turn.binding_handle.is_some()
+                        && existing.binding_handle != turn.binding_handle
+                    {
+                        return Err(StateError::TurnBindingChanged);
+                    }
                     // Section 4.4: a completion payload may not shrink or
                     // replace the accumulated list, it may only extend it.
                     let mut item_ids = existing.item_ids.clone();
@@ -240,6 +298,9 @@ impl CanonicalState {
                     merged.item_ids = item_ids;
                     if merged.started_at_ms.is_none() {
                         merged.started_at_ms = existing.started_at_ms;
+                    }
+                    if merged.binding_handle.is_none() {
+                        merged.binding_handle = existing.binding_handle.clone();
                     }
                 }
                 merged.validate()?;
@@ -280,6 +341,34 @@ impl CanonicalState {
                 self.attention.insert(item.id.clone(), item.clone());
             }
             StateEffect::CommandAcknowledged { ack } => {
+                if let CommandOutcome::AcceptedByRuntime { binding_handle } = &ack.outcome {
+                    let accepted_locally = self.acks.iter().any(|existing| {
+                        existing.command_id == ack.command_id
+                            && matches!(existing.outcome, CommandOutcome::AcceptedLocally { .. })
+                    });
+                    if !accepted_locally {
+                        return Err(StateError::UncorrelatedRuntimeAcknowledgement);
+                    }
+                    let already_accepted_by_runtime = self.acks.iter().any(|existing| {
+                        existing.command_id == ack.command_id
+                            && matches!(existing.outcome, CommandOutcome::AcceptedByRuntime { .. })
+                    });
+                    if already_accepted_by_runtime {
+                        return Err(StateError::DuplicateRuntimeAcknowledgement);
+                    }
+                    let turn = self.remote_command_turn(&ack.command_id)?;
+                    let session = self.sessions.get(&turn.session_id).ok_or_else(|| {
+                        StateError::UnknownSession {
+                            session_id: turn.session_id.clone(),
+                        }
+                    })?;
+                    let runtime_matches = self
+                        .runtime_of(session)
+                        .is_some_and(|runtime| runtime.id == binding_handle.runtime_id);
+                    if !runtime_matches {
+                        return Err(StateError::RuntimeAcknowledgementRuntimeMismatch);
+                    }
+                }
                 self.acks.push(ack.clone());
             }
             StateEffect::DiagnosticRecorded { diagnostic } => {
@@ -299,6 +388,62 @@ impl CanonicalState {
         }
         self.recompute_derived();
         Ok(())
+    }
+
+    fn has_runtime_acceptance_for(&self, runtime_id: &ProviderRuntimeId) -> bool {
+        self.acks
+            .iter()
+            .any(|ack| self.accepted_runtime_turn(ack, runtime_id).is_some())
+    }
+
+    fn live_runtime_of(&self, session: &Session) -> Result<&ProviderRuntime, StateError> {
+        let runtime_id = session
+            .binding_handle
+            .as_ref()
+            .map(|handle| &handle.runtime_id)
+            .or(session.history_source.runtime_id.as_ref())
+            .ok_or(StateError::LiveSessionWithoutRuntimeReference)?;
+        self.runtimes
+            .get(runtime_id)
+            .ok_or_else(|| StateError::UnknownRuntime {
+                runtime_id: runtime_id.clone(),
+            })
+    }
+
+    fn accepted_runtime_turn<'a>(
+        &'a self,
+        ack: &CommandAck,
+        runtime_id: &ProviderRuntimeId,
+    ) -> Option<&'a Turn> {
+        let CommandOutcome::AcceptedByRuntime { binding_handle } = &ack.outcome else {
+            return None;
+        };
+        if binding_handle.runtime_id != *runtime_id {
+            return None;
+        }
+        let turn = self.remote_command_turn(&ack.command_id).ok()?;
+        let session = self.sessions.get(&turn.session_id)?;
+        self.runtime_of(session)
+            .is_some_and(|runtime| runtime.id == *runtime_id)
+            .then_some(turn)
+    }
+
+    fn remote_command_turn(&self, command_id: &CommandId) -> Result<&Turn, StateError> {
+        let mut matches = self.turns.values().filter(|turn| {
+            matches!(
+                &turn.origin,
+                TurnOrigin::RemoteCommand {
+                    command_id: turn_command_id
+                } if turn_command_id == command_id
+            )
+        });
+        let Some(turn) = matches.next() else {
+            return Err(StateError::RuntimeAcknowledgementWithoutRemoteTurn);
+        };
+        if matches.next().is_some() {
+            return Err(StateError::AmbiguousRuntimeAcknowledgement);
+        }
+        Ok(turn)
     }
 
     /// Recomputes every field the store owns rather than an effect.

@@ -13,8 +13,11 @@ mod support;
 use kaleido_adapter::IdentityMint;
 use kaleido_hostd::slice::{self, ApprovalDecision, ReplayRequest, RunRequest, REPLAY_BASE_AT_MS};
 use kaleido_proto::attention::{AttentionAnswerSource, AttentionState, AttentionSubject};
+use kaleido_proto::capability::Capability;
+use kaleido_proto::command::CommandOutcome;
 use kaleido_proto::effect::StateEffect;
 use kaleido_proto::host::{ConnectionFaultReason, ConnectionState};
+use kaleido_proto::ids::ProviderBindingKind;
 use kaleido_proto::session::{LiveBinding, LiveUnboundReason, SessionStatus};
 use kaleido_proto::ContractViolation;
 use kaleido_state::{CanonicalStore, ClockSource, ProjectionName, StateError};
@@ -242,9 +245,35 @@ fn the_inbox_shows_an_open_approval_while_it_is_undecided() {
 }
 
 #[test]
+fn fixture_replay_never_claims_live_control_or_a_controlling_binding() {
+    for name in FIXTURES {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let request = ReplayRequest::new(fixture(name), directory.path().join("log"));
+        let (outcome, store) =
+            slice::replay_into_store(&request).expect("replay the recorded fixture");
+        assert!(
+            !outcome.probe.is_proven(Capability::LiveControl),
+            "{name}: recorded traffic is not current runtime acceptance"
+        );
+        assert!(
+            !matches!(
+                store
+                    .state()
+                    .session(&outcome.session_id)
+                    .expect("session")
+                    .live_binding,
+                LiveBinding::Controlling { .. }
+            ),
+            "{name}: replay must not become controlling"
+        );
+    }
+}
+
+#[test]
 fn live_orchestration_latches_streaming_and_keeps_steer_pending() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let command_id = IdentityMint::new("hostd-live-test").command_id("submit");
+    let submitted_command_id = command_id.clone();
     let mut runtime = FixtureRuntime::new("03-permission-approve.jsonl", command_id.clone());
     let identity = runtime.identity();
     let runtime_id = identity.runtime_id.clone();
@@ -270,6 +299,59 @@ fn live_orchestration_latches_streaming_and_keeps_steer_pending() {
         })
         .and_then(serde_json::Value::as_str);
     assert_eq!(observing, Some("observing"));
+    let controlling = report
+        .pointer("/observed/session_index_while_controlling/payload/view/active/0/live_binding/kind")
+        .or_else(|| {
+            report.pointer(
+                "/observed/session_index_while_controlling/payload/view/history/0/live_binding/kind",
+            )
+        })
+        .and_then(serde_json::Value::as_str);
+    assert_eq!(
+        controlling,
+        Some("controlling"),
+        "the matched turn/start response must promote only this live session"
+    );
+    let controlling_capabilities = report
+        .pointer("/observed/runtime_capability_while_controlling/payload/view/entries")
+        .and_then(serde_json::Value::as_array)
+        .expect("runtime capabilities are sampled with the controlling binding");
+    let live_control = controlling_capabilities
+        .iter()
+        .find(|entry| {
+            entry.get("capability").and_then(serde_json::Value::as_str) == Some("live_control")
+        })
+        .expect("live_control remains explicit");
+    assert_eq!(
+        live_control
+            .pointer("/state/kind")
+            .and_then(serde_json::Value::as_str),
+        Some("supported")
+    );
+    assert_eq!(
+        live_control
+            .pointer("/evidence/source")
+            .and_then(serde_json::Value::as_str),
+        Some("observed_in_traffic")
+    );
+    let controlling_turn_steer = controlling_capabilities
+        .iter()
+        .find(|entry| {
+            entry.get("capability").and_then(serde_json::Value::as_str) == Some("turn_steer")
+        })
+        .expect("turn_steer remains explicit");
+    assert_eq!(
+        controlling_turn_steer
+            .pointer("/state/kind")
+            .and_then(serde_json::Value::as_str),
+        Some("not_verified")
+    );
+    assert_eq!(
+        controlling_turn_steer
+            .pointer("/evidence/source")
+            .and_then(serde_json::Value::as_str),
+        Some("absent")
+    );
     let streaming = report
         .pointer("/observed/live_activity_while_streaming/payload/view/streaming_item_ids")
         .and_then(serde_json::Value::as_array)
@@ -372,6 +454,26 @@ fn live_orchestration_latches_streaming_and_keeps_steer_pending() {
     reloaded
         .session_snapshot(&outcome.session_id)
         .expect("the live session remains contract-valid after reload");
+    let submitted_acks = reloaded
+        .state()
+        .acknowledgements()
+        .iter()
+        .filter(|ack| ack.command_id == submitted_command_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        submitted_acks.len(),
+        2,
+        "one local acceptance must be followed by one correlated runtime acceptance"
+    );
+    assert!(matches!(
+        submitted_acks.first().map(|ack| &ack.outcome),
+        Some(CommandOutcome::AcceptedLocally { .. })
+    ));
+    assert!(matches!(
+        submitted_acks.get(1).map(|ack| &ack.outcome),
+        Some(CommandOutcome::AcceptedByRuntime { binding_handle })
+            if binding_handle.kind == ProviderBindingKind::RuntimeAcknowledgement
+    ));
     assert!(matches!(
         reloaded
             .state()

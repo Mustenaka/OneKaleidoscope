@@ -124,6 +124,24 @@ impl CanonicalStore {
 
     /// Validates, transitions, assigns a cursor and appends.
     pub fn apply(&mut self, effect: &StateEffect) -> Result<Vec<LogRecord>, StateError> {
+        if matches!(
+            effect,
+            StateEffect::CommandAcknowledged {
+                ack: CommandAck {
+                    outcome: CommandOutcome::AcceptedLocally { .. },
+                    ..
+                }
+            }
+        ) {
+            return Err(StateError::UntrustedLocalAcknowledgement);
+        }
+        self.apply_trusted(effect)
+    }
+
+    /// Applies an effect from a broker-owned path that has already established
+    /// its provenance. In particular, only `submit_command` may use this path
+    /// to persist `AcceptedLocally`.
+    fn apply_trusted(&mut self, effect: &StateEffect) -> Result<Vec<LogRecord>, StateError> {
         effect.validate_for_log()?;
         let stream = self.stream_for(effect)?;
         self.state.apply(effect)?;
@@ -366,7 +384,7 @@ impl CanonicalStore {
             outcome,
             acked_at_ms: now_ms,
         };
-        self.apply(&StateEffect::CommandAcknowledged { ack: ack.clone() })?;
+        self.apply_trusted(&StateEffect::CommandAcknowledged { ack: ack.clone() })?;
         self.record_idempotency(&key, &envelope.command_id)?;
         Ok(ack)
     }

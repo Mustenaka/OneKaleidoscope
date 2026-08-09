@@ -312,6 +312,7 @@ impl ProviderRuntimeSession for CodexRuntimeSession {
 
     fn submit_prompt(
         &mut self,
+        command_id: &CommandId,
         body: &ContentRef,
         content: &mut dyn ContentAccess,
     ) -> Result<Vec<StateEffect>, RuntimeSessionError> {
@@ -332,7 +333,13 @@ impl ProviderRuntimeSession for CodexRuntimeSession {
             .to_owned();
         let request_id = self.next_client_request_id;
         self.next_client_request_id = self.next_client_request_id.saturating_add(1);
-        let mut effects = self.send_value(
+        if !self
+            .reducer
+            .register_local_turn_start(request_id, command_id)
+        {
+            return Err(RuntimeSessionError::CapabilityUnavailable);
+        }
+        let sent = self.send_value(
             &json!({
                 "id": request_id,
                 "method": "turn/start",
@@ -342,11 +349,23 @@ impl ProviderRuntimeSession for CodexRuntimeSession {
                 }
             }),
             content,
-        )?;
+        );
+        let mut effects = match sent {
+            Ok(effects) => effects,
+            Err(error) => {
+                self.reducer.cancel_local_turn_start(request_id);
+                return Err(error);
+            }
+        };
         if self.exit_reported {
+            self.reducer.cancel_local_turn_start(request_id);
             return Ok(effects);
         }
-        let _ = self.await_response(request_id, content, &mut effects)?;
+        if let Err(error) = self.await_response(request_id, content, &mut effects) {
+            self.reducer.cancel_local_turn_start(request_id);
+            return Err(error);
+        }
+        self.reducer.cancel_local_turn_start(request_id);
         Ok(effects)
     }
 
