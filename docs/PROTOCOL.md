@@ -1,14 +1,16 @@
-# PROTOCOL — UACP v0.2
+# PROTOCOL — UACP v0.3
 
-> 状态：**v0.2 合同定稿，2026-08-09**
+> 状态：**v0.3 合同定稿，2026-08-09**
 > 需求真源是 [REQUIREMENTS.md](REQUIREMENTS.md)。本文件在其之下、在任务卡之上。
 > 相关决策：[ADR-0009](adr/0009-session-broker.md)、[ADR-0010](adr/0010-canonical-state-and-workflow.md)、
 > [ADR-0011](adr/0011-self-hosted-connectivity.md)、[ADR-0012](adr/0012-provider-decode-strategy.md)、
-> [ADR-0018](adr/0018-attention-answer-provenance.md)。
+> [ADR-0018](adr/0018-attention-answer-provenance.md)、
+> [ADR-0020](adr/0020-projection-cursors-and-mobile-ingress.md)、
+> [ADR-0021](adr/0021-r3-lan-security.md)。
 
 本文件定义 UACP（Unified Agent Control Protocol）的**规范化状态、命令、状态转移、
 投影、cursor 与能力语义**。它是 `crates/kaleido-proto` 的逐字来源：proto 中出现的每个类型
-都必须能在本文件找到定义，本文件定义的每个 v0.2 类型都必须在 proto 中存在。
+都必须能在本文件找到定义，本文件定义的每个 v0.3 类型都必须在 proto 中存在。
 
 **关键词**：必须 / 不得 / 应当 / 可以，按 RFC 2119 语义解释。
 
@@ -34,7 +36,8 @@ provider 报文
   → provider reducer
   → StateEffect（canonical 状态转移）
   → durable log（分配 cursor）
-  → projection（订阅者读模型）
+  → projection fanout（按 ProjectionKey 重算读模型）
+  → projection journal（按 key 分配独立 cursor）
 ```
 
 其中 Codex app-server decoder 由
@@ -46,16 +49,22 @@ provider 报文
 ## 1. 版本与兼容
 
 ```
-PROTOCOL_VERSION = "0.2.0"
+PROTOCOL_VERSION = "0.3.0"
 ```
 
 - 握手时双方交换 `protocol_version`，格式必须是三个十进制分量
   `major.minor.patch`，不得带缺失分量、前后缀或非数字字符。
-- v0.2 是 pre-1.0。**minor 是兼容边界**：本实现只接受 `0.2.x`；`0.0.x`、
-  `0.1.x`、其他 `0.x`、`1.x` 和畸形版本都必须在解码业务消息前拒绝。
-- `0.2.x` 的 patch 版本只允许文档澄清和不改变 wire 形状的修复。
-- 所有 v0.2 UACP wire enum 都是**闭合合同**。未知 UACP `kind` 必须解码失败，
+- R3 LAN 上的交换顺序、Host SPKI pin、设备认证与 frame 由
+  [TRANSPORT 0.1](TRANSPORT.md) 定义：先接受 transport hello，再接受 UACP hello，最后完成
+  设备认证；三者全部成功前不得解码业务消息。版本失败是 transport error，不是 provider
+  `CanonicalError`。
+- v0.3 是 pre-1.0。**minor 是兼容边界**：本实现只接受 `0.3.x`；`0.0.x`、
+  `0.1.x`、`0.2.x`、其他 `0.x`、`1.x` 和畸形版本都必须在解码业务消息前拒绝。
+- `0.3.x` 的 patch 版本只允许文档澄清和不改变 wire 形状的修复。
+- 所有 v0.3 UACP wire enum 都是**闭合合同**。未知 UACP `kind` 必须解码失败，
   不得猜成相近语义，也不得声称新增变体天然向前兼容。
+- v0.2 durable data 不做启发式迁移；特别是旧 `Actor::Human { device_label }` 不得按显示名
+  铸造 `DeviceId`。遇到旧形状必须 fail-loud，再由显式离线迁移工具或清理策略处理。
 - 上游 provider 标签不直接成为 UACP enum。adapter 遇到未知 method、item 类型、
   status 或标签时，按 provider 合同产生 `DiagnosticRecorded` 或
   `RuntimeProtocolViolation`；原始标签只可放进敏感 `ContentRef`，不得进入普通日志。
@@ -81,8 +90,9 @@ PROTOCOL_VERSION = "0.2.0"
 `StepRole`、`StepState`、`CompletionCondition`、`ArtifactKind`,
 `WorkflowAction`、`StepBlocker`、`ErrorCode`、`Actor`、`Command`、
 `CommandOutcome`、`StateEffect`、`DiagnosticCode`、`StreamKey`、
-`SnapshotPayload`、`SubscribeOutcome`、`ProjectionPayload` 和
-`ContentReadResponse`。v0.2 没有用于承接上游未知标签的开放 wire enum。
+`SnapshotPayload`、`SubscribeOutcome`、`ProjectionKey`、`ProjectionPayload`、
+`ProjectionSubscribeOutcome`、`ContentWriteResponse` 和
+`ContentReadResponse`。v0.3 没有用于承接上游未知标签的开放 wire enum。
 
 ---
 
@@ -111,6 +121,7 @@ R-P8、R-P9、R-P10 各自有一手证据或直接需求来源，见 §11 与 §
 
 ```
 HostId { value: String }
+DeviceId { value: String }
 ProviderRuntimeId { value: String }
 ProjectId { value: String }
 ProjectBindingId { value: String }
@@ -697,7 +708,7 @@ AttentionResponse {
 
 ### 4.8 Workflow
 
-Workflow 是 v1 必做（[ADR-0010](adr/0010-canonical-state-and-workflow.md) D-4），v0.2 只定义状态与人工推进，不含自动调度策略。
+Workflow 是 v1 必做（[ADR-0010](adr/0010-canonical-state-and-workflow.md) D-4），v0.3 只定义状态与人工推进，不含自动调度策略。
 
 ```
 Workflow {
@@ -842,7 +853,7 @@ ContentAvailability = Inline | Stored | Evicted | NeverStored
 
 ### 4.10 内容读取
 
-手机通过独立的鉴权、E2EE 内容查询读取 `ContentRef` 正文。它不是 `Command`，
+手机通过独立的鉴权、加密内容查询读取 `ContentRef` 正文。它不是 `Command`，
 不是 `StateEffect`，也不写 durable log、projection、push 或 relay 元数据。
 
 ```
@@ -877,8 +888,45 @@ ContentUnavailableReason =
 原 ContentRef 的 digest 验证；`next_offset` 必须等于
 `offset.checked_add(bytes.len)`。`eof = true` 时它必须为 `None`，否则必须为上述
 `Some(next_offset)`；overflow 或不一致都明确拒绝。`Evicted`/`NeverStored` 必须显式
-返回，不得以空 bytes 冒充成功。transport 在发送 bytes 前必须完成设备鉴权与 E2EE，
-会话/内容授权属于 R4。
+返回，不得以空 bytes 冒充成功。transport 在发送 bytes 前必须完成 Host pin、设备鉴权与
+TLS 1.3 加密。R3 的读取请求绑定当前已认证 `DeviceId`；更细粒度的多用户/团队 ACL 不属于
+v0.3。
+
+### 4.11 内容写入
+
+手机写入 prompt、free-form answer 或 reason 正文时，先通过独立的鉴权内容写入取得
+`ContentRef`，再把该引用放入 `Command`。写入操作不是 `Command`、`StateEffect`、durable
+log 或 projection。
+
+```
+ContentWriteRequest {
+  content_kind: ContentKind,
+  byte_len: u64,
+  digest: String,
+}
+
+ContentWriteResponse =
+  | Stored   { content_ref: ContentRef }
+  | Rejected { error: CanonicalError }
+```
+
+正文不内嵌在 JSON record 中。`ContentWriteRequest` 是控制头；同一个 transport request ID
+关联唯一 binary content frame。host 必须在保存前对实际 bytes 重新计算长度与 SHA-256，
+不能信任客户端声明。
+
+规范：
+
+- `content_kind` 只允许 `PlainText` 或 `Markdown`；`byte_len` 必须在 `1..=65536`；
+- `digest` 必须严格是 `sha256:` 加 64 个小写十六进制字符，并与实际 bytes 一致；长度或
+  digest 不一致时返回 `Rejected { error.code = InvalidCommand }`，不得留下正文或元数据；
+- `Stored.content_ref` 的 kind、byte_len 与 digest 必须和已验证请求一致，并且必须为
+  `sensitivity = Sensitive`、`preview = None`、`availability = Stored`；客户端没有声明或
+  降低 sensitivity、添加 preview 的入口；
+- host 根据实际 bytes 自行计算 `ContentId`。相同内容可以命中已有内容寻址对象，但响应仍
+  必须满足上述完整性约束；
+- 上传、后续 ContentRead 与引用该内容的 DeviceCommandRequest 必须绑定同一已认证
+  `DeviceId`。孤儿上传受 TTL 与每设备配额约束；
+- 正文、digest 以外的内容指纹和 binary frame 不得进入普通 tracing、push 或 relay metadata。
 
 ---
 
@@ -1035,7 +1083,13 @@ CommandEnvelope {
   body: Command,
 }
 
-Actor = Human { device_label: String } | Workflow { workflow_id: WorkflowId } | Broker
+Actor = Human { device_id: DeviceId } | Workflow { workflow_id: WorkflowId } | Broker
+
+DeviceCommandRequest {
+  idempotency_key: String,
+  ttl_ms: Option<u64>,
+  body: Command,
+}
 
 Command =
   | SubmitPrompt      { session_id: SessionId, body: ContentRef }
@@ -1058,10 +1112,26 @@ Command =
   | CancelWorkflow    { workflow_id: WorkflowId }
 ```
 
-注意 v0.2 **没有** `SteerActiveTurn` 命令。引导一律通过
+注意 v0.3 **没有** `SteerActiveTurn` 命令。引导一律通过
 `EnqueueInput { intent: SteerActiveTurn }` 表达，由 Broker 依据能力和 runtime 确认决定
 它最终是 `DeliveredAsSteer` 还是留在 `Pending`。这样协议层面就不存在「假装已引导」的
 表达方式（R-P9）。
+
+`DeviceCommandRequest` 是已认证移动连接唯一允许提交的命令入口。它在类型上没有
+`Actor`、`CommandId`、`issued_at_ms` 或 `expires_at_ms`，因此远端不能声明 Broker/Workflow
+身份或伪造 canonical ID/时间。hostd 必须：
+
+1. 从连接设备目录取得可信 `DeviceId`，注入 `Actor::Human { device_id }`；
+2. 分配新的 `CommandId`，以 host 当前时间写入 `issued_at_ms`；
+3. 要求 `idempotency_key` 为 `1..=128` UTF-8 bytes；若有 `ttl_ms`，它必须在
+   `1..=300000`，并用 checked addition 计算 `expires_at_ms`；越界或 overflow 必须以
+   `InvalidCommand` 拒绝；
+4. 在 canonical 命令进入 write path 前持久化规范化请求摘要。
+
+移动幂等域固定为 `(device_id, idempotency_key)`。同一域、同一规范化请求摘要的重试返回
+`Duplicate` 并指向首次 command；同一域不同摘要返回 `IdempotencyConflict`。设备显示名是
+transport 目录元数据，不得进入 Actor、授权判断或幂等域。内部 Broker/Workflow 仍可直接
+构造受信 `CommandEnvelope`，但该入口不得暴露成 mobile business frame。
 
 ### 6.1 确认
 
@@ -1144,6 +1214,10 @@ ErrorCode =
 投影是订阅者读模型。每个投影都必须能由 §5 的快照与日志纯函数式导出，且带
 `projection_version`，客户端据此判断是否需要全量刷新。
 
+```
+PROJECTION_VERSION = 2
+```
+
 | Projection | 内容 | 需求来源 |
 |---|---|---|
 | `ProjectIndexView` | provider 分组、跨 provider 全部项目、`SessionCounts`、`attention_count`、host `reachability` | REQUIREMENTS §2.1 |
@@ -1156,9 +1230,19 @@ ErrorCode =
 | `RuntimeCapabilityView` | `CapabilityEntry` 列表，含 `state` 与 `evidence` 原因 | §4.2、OBJ-2 |
 
 ```
+ProjectionKey =
+  | ProjectIndex      { host_id: HostId }
+  | SessionIndex      { project_id: ProjectId }
+  | Transcript        { session_id: SessionId }
+  | LiveActivity      { session_id: SessionId }
+  | InputQueue        { session_id: SessionId }
+  | AttentionInbox    { host_id: HostId }
+  | WorkflowBoard     { workflow_id: WorkflowId }
+  | RuntimeCapability { host_id: HostId, runtime_id: ProviderRuntimeId }
+
 ProjectionEnvelope {
   projection_version: u32,
-  stream: StreamKey,
+  key: ProjectionKey,
   cursor: Cursor,
   payload: ProjectionPayload,
 }
@@ -1268,6 +1352,7 @@ WorkflowBoardStep {
 }
 
 RuntimeCapabilityView {
+  host_id: HostId,
   runtime_id: ProviderRuntimeId,
   negotiated_at_ms: i64,
   entries: Vec<CapabilityEntry>,
@@ -1279,14 +1364,24 @@ RuntimeCapabilityView {
 - 投影**不得**新增 canonical state 里没有的语义。它只能选择、排序、聚合和截断。
 - 任何「不支持/未验证/被阻塞」都必须在投影中可见，禁止隐藏控件后宣布完成
   （REQUIREMENTS §1）。
-- `ProjectIndex` 与 `AttentionInbox` 属于 Host 流，`SessionIndex` 属于 Project 流，
-  `Transcript` / `LiveActivity` / `InputQueue` 属于 Session 流，`WorkflowBoard`
-  属于 Workflow 流；`RuntimeCapability` 属于 Host 流。payload 与 stream scope 不匹配
-  必须拒绝。
+- `ProjectionEnvelope.cursor` 只在同一个 `ProjectionKey` 内有意义。它由持久 projection
+  journal 独立分配并严格 `+1`；canonical `StreamKey` 的 head 不得再冒充 projection cursor。
+- 每条 journal entry 都是该 key 在该 cursor 下的**完整读模型**，不是增量 patch。canonical
+  append 后按显式 fanout matrix 重算受影响 key；只有 payload 逐字段变化时才追加 entry。
+- key 与 payload 必须逐一同名且 scope 一致：ProjectIndex 的 `view.host_id` 等于 key host；
+  SessionIndex 的 `view.project_id` 等于 key project；Transcript、LiveActivity、InputQueue 的
+  `view.session_id` 等于各自 key session；AttentionInbox 的每个 entry 都属于 key host；
+  WorkflowBoard 的 `view.workflow_id` 等于 key workflow；RuntimeCapability 的
+  `view.host_id` / `view.runtime_id` 分别等于 key host/runtime。
+  任一错配必须 fail-closed。
+- 同一 key 内 duplicate cursor、非 `previous + 1` 的 gap、cursor arithmetic overflow 都是
+  journal/订阅错误；不得静默覆盖缓存、跳到 current 或复用其他 key 的 cursor。
 
 ---
 
 ## 9. 订阅、重放与背压
+
+### 9.1 Canonical stream 重放（host 内部）
 
 ```
 Subscribe { stream: StreamKey, since: Option<Cursor> }
@@ -1313,6 +1408,48 @@ Project、Session、Workflow 流分别发送 `HostSnapshot`、`ProjectSnapshot`�
 - 服务端**不得**丢弃状态转移。确实无法保序时，必须返回 `ErrorCode::CursorGap`，
   强制客户端重取快照。
 - 推送唤醒只携带 `StreamKey` 与计数，不含任何 `ContentRef` 正文（§10、ADR-0011 D-3）。
+
+`Subscribe` / `SubscribeAck` / `SnapshotEnvelope` / `LogRecord` 保留给 host 内部 canonical
+恢复、诊断和复制。它们不是 R3 mobile transport 的业务 frame；Android 不接收 canonical
+log/snapshot，也不实现 canonical reducer。
+
+### 9.2 Mobile projection 订阅
+
+```
+ProjectionSubscribe {
+  key: ProjectionKey,
+  since: Option<Cursor>,
+}
+
+ProjectionSubscribeAck {
+  key: ProjectionKey,
+  outcome: ProjectionSubscribeOutcome,
+}
+
+ProjectionSubscribeOutcome =
+  | Resumed        { from_cursor: Cursor }
+  | CurrentFollows { current_cursor: Cursor }
+  | Rejected       { error: CanonicalError }
+```
+
+`ProjectionSubscribe` 的 key 是授权、保留窗口与 cursor 的唯一域。服务端必须先在同一
+锁/actor 顺序中注册 live tail，再读取该 key 的 floor/head 与 `since`，然后：
+
+- `since.checked_next() >= floor` 时可连续恢复，返回
+  `Resumed { from_cursor = since.checked_next() }`，随后从该 cursor 严格连续发送完整
+  `ProjectionEnvelope`。因此 `since = floor - 1` 仍可恢复；`since = head` 时 from_cursor 是
+  下一条尚未产生的 cursor，服务端不重发 head，只等待 live entry；
+- 首次订阅（`since = None`），或 `since.checked_next() < floor` 时，返回
+  `CurrentFollows { current_cursor = head }`，随后恰好发送该 cursor 的当前完整 projection；
+- `since > head`、key 无权访问、key/payload 无法构造、版本不兼容或 cursor arithmetic
+  overflow 时返回 `Rejected`。cursor 相关拒绝使用 `ErrorCode::CursorGap`，不得截断或回绕；
+- 收到 ack 后只发送大于已发送 head 的 live entry。replay/current 与 live 的交界不得漏发或
+  重发同一 cursor。
+
+客户端对每个 `ProjectionKey` 分别持久化最后**完整验证并应用**的 cursor。任一 key 错配、
+duplicate、gap、overflow 或 payload 验证失败都必须关闭该订阅，并用最后成功 cursor 重连；
+不得静默接受 current。服务端 live channel 背压到无法继续保序时，返回/关闭为 CursorGap，
+不能丢 entry 或让慢订阅者阻塞 Broker。Kotlin/Swift 只消费完整 projection callback。
 
 ---
 
@@ -1405,9 +1542,9 @@ diff 或命令内容。可展示上下文在 `:48` 的 item 报文里。因此 `
 两条 reasoning、两条 agentMessage 和一条 fileChange。因此 `Turn.item_ids` 必须由逐条
 item 转移累积，见 §4.4。
 
-### 11.3 观测到但 v0.2 不使用的面
+### 11.3 观测到但 v0.3 不使用的面
 
-以下 method 在真实录制中出现，v0.2 **不**建模，一律走 `DiagnosticRecorded`：
+以下 method 在真实录制中出现，v0.3 **不**建模，一律走 `DiagnosticRecorded`：
 
 `mcpServer/startupStatus/updated`、`thread/tokenUsage/updated`、
 `account/rateLimits/updated`、`remoteControl/status/changed`。
@@ -1418,11 +1555,11 @@ item 转移累积，见 §4.4。
 
 ---
 
-## 12. v0.2 明确不含
+## 12. v0.3 明确不含
 
 | 项 | 归属 |
 |---|---|
-| 传输分帧、配对、E2EE、relay 路由 | R4，另开 `docs/TRANSPORT.md` |
+| 公网 rendezvous、relay 路由与 push | R4；R3 LAN 的 TLS、分帧、配对、认证与吊销由 [TRANSPORT 0.1](TRANSPORT.md) 定义 |
 | Workflow 自动调度与自动质量评估 | ADR-0010 D-4 允许后做 |
 | 文件树、代码预览、Git 命令投影 | R9 |
 | OpenCode / Claude / ACP 映射附录 | R5，各自接入时追加 §11 同构章节 |
@@ -1443,11 +1580,12 @@ item 转移累积，见 §4.4。
 | §4.6 | `queue` |
 | §4.7 | `attention` |
 | §4.8 | `workflow` |
-| §4.9 / §4.10 | `content` |
+| §4.9 / §4.10 / §4.11 | `content` |
 | §5 | `effect` |
 | §6 | `command` |
 | §7 | `error` |
 | §8 | `projection` |
+| §9.2 | `projection` |
 
 `kaleido-proto` 是合同。修改它必须先修改本文件并走 ADR（`AGENTS.md` §2.1、
 [MILESTONES](MILESTONES.md) 任务规则）。

@@ -12,13 +12,33 @@
 ```text
 TCP connect
 → TLS 1.3 + exact Host public-key pin
-→ TransportHello(transport_version, max_frame_bytes)
+→ TransportHello / TransportHelloAck
+→ UacpHello / UacpHelloAck
 → Pair 或 DeviceChallenge/Auth
-→ UacpHello(protocol_version)
 → authenticated business frames
 ```
 
-业务 frame 在两次版本协商与设备认证完成前一律拒绝。R3 没有明文 fallback。
+```
+TransportHello {
+  request_id: u64,
+  transport_version: String,
+  max_frame_length: u32,
+}
+
+TransportHelloAck {
+  request_id: u64,
+  transport_version: String,
+  max_frame_length: u32,
+}
+
+UacpHello { request_id: u64, protocol_version: String }
+UacpHelloAck { request_id: u64, protocol_version: String }
+```
+
+TRANSPORT 0.1 的 `max_frame_length` 固定为 65,545。双方必须先接受 `0.1.x` transport，再接受
+`0.3.x` UACP；ack 回显 responder 的完整版本和相同 frame 上限。minor 不兼容、畸形版本、
+上限不等或顺序错误均返回 `VersionMismatch`（若可安全编码）并关闭连接。任何业务 frame 在
+两次版本协商与设备认证完成前一律拒绝。R3 没有明文 fallback。
 
 ## 2. Pairing bootstrap
 
@@ -36,6 +56,12 @@ PairingBootstrap {
 
 endpoint 只允许 `host:port`，不得含用户名、query 或业务路径。secret 只在 bootstrap 明文中
 出现一次；host 只保存 SHA-256 digest，默认 5 分钟、原子单次消费。
+
+`host_public_key_pin` 的唯一合法编码是
+`sha256:` + `base64url-no-pad(SHA-256(DER SubjectPublicKeyInfo))`：前缀后恰好 43 个
+base64url 字符，无 `=` padding。客户端从 TLS 1.3 peer certificate 提取 DER SPKI 后计算
+digest，解码 pin 并恒时比较 32 bytes；格式错误或不相等都在发送 secret 前终止 TLS。它不是
+certificate pin；系统/用户 CA 或 hostname 验证不能替代该精确 SPKI pin。
 
 手机验证 pin 后发送：
 
@@ -58,47 +84,117 @@ PairResponse {
 
 公钥必须是 P-256 SPKI；label 去首尾空白后长度为 `1..=80`，只用于显示。
 
+secret 错误、已过期、已使用或不存在，对 wire 一律只返回
+`TransportErrorCode::PairingInvalid` 并应用同一限速；不得用错误码或日志区分目录状态。host
+必须对收到的 secret 计算 SHA-256 后，与目录 digest 恒时比较。
+成功路径必须在返回 PairResponse 前，把 secret 单次消费与新 DeviceId/public key 目录记录作为
+同一持久事务提交并 fsync。PairResponse 发送后当前连接即认证为该 DeviceId，无需再走
+Challenge。host 内部可以分别记录安全计数，但日志不得包含 secret/digest。
+
 ## 3. 重连认证
 
 ```text
 ChallengeRequest  { request_id, device_id }
-DeviceChallenge   { request_id, challenge_id, nonce, expires_at_ms }
-ChallengeProof    { request_id, challenge_id, signature_der }
-AuthAccepted      { request_id, connection_id, expires_at_ms }
+DeviceChallenge   { request_id, challenge_id: Vec<u8>, nonce: Vec<u8>, expires_at_ms }
+ChallengeProof    { request_id, challenge_id: Vec<u8>, signature_der: Vec<u8> }
+AuthAccepted      { request_id, connection_id: String, expires_at_ms }
 ```
 
-签名输入使用固定域分隔并按字段长度编码：transport version、UACP version、HostId、DeviceId、
-TLS channel binding、challenge ID、32-byte nonce、expiry。任何字段替换、nonce 重放或过期都
-必须让验签失败。challenge 成功或失败后都立即作废。
+`challenge_id` 恰好 16 random bytes；`nonce` 恰好 32 random bytes。challenge 默认 30 秒
+到期、单次使用，成功或任一失败后立即从可用集合移除。`connection_id` 是 host 分配的非空
+opaque canonical ID；短期 session credential 只存在于内存，不写磁盘。
+
+TLS channel binding 固定为 TLS exporter：label
+`EXPORTER-OneKaleidoscope-R3-DeviceAuth`、无 context、输出 32 bytes。签名 transcript 是以下
+字节的无分隔拼接：
+
+```text
+ASCII("OneKaleidoscope.DeviceAuth.v1")
+u16be(len(transport_version UTF-8)) || transport_version UTF-8
+u16be(len(UACP_version UTF-8))      || UACP_version UTF-8
+u16be(len(HostId UTF-8))           || HostId UTF-8
+u16be(len(DeviceId UTF-8))         || DeviceId UTF-8
+tls_exporter[32]
+challenge_id[16]
+nonce[32]
+i64be(expires_at_ms)
+```
+
+四个变长字段按 UTF-8 byte length 编码，非空 ID、版本格式与已协商值必须先验证；任一长度超过
+`u16::MAX`、固定数组长度不符、expiry 已到或不属于该 challenge 都拒绝。设备用 Android
+Keystore P-256 private key 对完整 transcript 做 ECDSA-SHA256，`signature_der` 必须是严格 DER；
+host 用目录中该 DeviceId 的 SPKI 验证。字段替换、TLS 连接变化、nonce/challenge 重放、错误
+key 与已吊销 DeviceId 都不得认证成功。
 
 ## 4. Frame
 
 每个 TLS application frame：
 
 ```text
-u32 big-endian byte_length
-byte_length bytes of UTF-8 JSON control frame or declared binary content frame
+u32 big-endian frame_length
+u8 frame_kind                       // 0x01 = JSON control, 0x02 = content body
+frame body
+
+JSON control body  = frame_length - 1 bytes of UTF-8 JSON
+content body       = u64 big-endian request_id + 1..=65536 raw bytes
 ```
 
-- 控制 frame 与 content frame 均最大 65,536 bytes；
-- 长度必须在读取/分配前验证；
-- 零长、截断、无效 UTF-8/JSON、未知 `kind`、重复 request ID 均关闭连接；
+- JSON control body 最大 65,536 bytes；content raw bytes 最大 65,536 bytes。因此接收端在分配
+  前接受的 `frame_length` 上限固定为 65,545（1-byte kind + 8-byte request ID + body）；
+- 长度与 kind 必须在读取/分配前验证；JSON control body 不得为空，content raw bytes 必须在
+  `1..=65536`；
+- 零长、截断、无效 UTF-8/JSON、未知 `frame_kind`、重复 request ID 均关闭连接；
 - 所有数据 enum 闭合，未知 kind 不降级；
 - 每连接最多 32 个 pending request、16 个 active subscription；每 DeviceId 最多 2 个连接。
 
+所有多字节整数使用 big-endian。content frame 的 request ID 必须对应一个已接受、正在等待
+正文且尚未绑定 binary frame 的 ContentWrite 控制头；否则关闭连接。解析器不得先按声明长度
+分配，再检查 65,545 上限。
+
 ## 5. 业务 frame
 
-认证后允许：
+每个 JSON control body 是一个内部标签闭合 enum，标签键固定为 `kind`、变体名为
+`snake_case`。除 hello/pair/auth 的 §1～§3 record 外，认证后允许的业务变体只有：
 
-- `ProjectionSubscribe` / `ProjectionSubscribeAck`；
-- `ProjectionEnvelope`；
-- `ContentWriteRequest/Response`；
-- `ContentReadRequest/Response`；
-- `DeviceCommandRequest` / `CommandAck`；
-- ping/pong、unsubscribe、structured transport error。
+```text
+ProjectionSubscribeFrame {
+  request_id: u64,
+  subscription_id: u64,
+  subscribe: ProjectionSubscribe,
+}
+ProjectionSubscribeAckFrame {
+  request_id: u64,
+  subscription_id: u64,
+  ack: ProjectionSubscribeAck,
+}
+ProjectionEnvelopeFrame {
+  subscription_id: u64,
+  envelope: ProjectionEnvelope,
+}
+UnsubscribeRequest { request_id: u64, subscription_id: u64 }
+UnsubscribeAck     { request_id: u64, subscription_id: u64 }
 
-ContentWrite 的 bytes 使用 binary content frame，通过 request ID 与控制头关联，不进入 JSON
-日志。其他业务载荷直接使用 UACP JSON 编码。
+ContentWriteHeader { request_id: u64, request: ContentWriteRequest }
+ContentWriteResult { request_id: u64, response: ContentWriteResponse }
+ContentReadFrame   { request_id: u64, request: ContentReadRequest }
+ContentReadResult  { request_id: u64, response: ContentReadResponse }
+
+DeviceCommandFrame { request_id: u64, request: DeviceCommandRequest }
+DeviceCommandAck   { request_id: u64, ack: CommandAck }
+
+Ping { request_id: u64, nonce: u64 }
+Pong { request_id: u64, nonce: u64 }
+TransportError
+```
+
+`request_id` 和 `subscription_id` 必须非零，在一条连接的每个发送方向由请求方单调分配且不得复用；响应
+逐字回显 request ID，projection push 逐字回显 subscription ID。未知 control `kind`、响应 ID
+错配、subscription ID 冲突或已 unsubscribe 后继续 push 都是 `MalformedFrame` 并关闭连接。
+
+ContentWrite 的 `ContentWriteRequest { content_kind, byte_len, digest }` 是 JSON 控制头；正文
+使用其后、同一 request ID 的唯一 binary content frame，不内嵌 JSON，也不进入 JSON
+日志。缺失、重复、request ID 错配、声明长度/digest 与实际 bytes 不一致都关闭该请求且不得
+写入内容存储。其他业务载荷直接使用 UACP JSON 编码。
 
 ## 6. Projection subscription
 
@@ -118,30 +214,56 @@ ContentWrite 的 bytes 使用 binary content frame，通过 request ID 与控制
 DeviceCommandRequest 不含 Actor、CommandId、issued_at。hostd 从已认证 DeviceId 构造
 canonical envelope；连接身份和请求摘要进入持久幂等/outbox 事务。
 
-ContentWrite 只允许 PlainText/Markdown、≤64 KiB。host 计算 digest 并强制 Sensitive、无
-preview。ContentRead 继续按 UACP chunk/digest 规则；任何正文、签名、secret、私钥、完整路径
-不得进入普通 tracing、push 或 transport metadata。
+ContentWrite 只允许 PlainText/Markdown，声明与实际 `byte_len` 均在 `1..=65536`。host 对
+binary body 复算长度与 digest，并强制响应 `ContentRef` 为 Sensitive、无 preview、Stored；
+不能信任控制头声明。ContentRead 继续按 UACP chunk/digest 规则；任何正文、签名、secret、
+私钥、完整路径不得进入普通 tracing、push 或 transport metadata。
 
 ## 8. 吊销与错误
 
 Device registry 至少保存 DeviceId、公钥、创建时间、吊销时间。吊销立即关闭该设备连接并
 阻止重新认证。
 
+吊销只允许本机 hostd 管理命令或受信本地 API 发起，不存在 LAN revoke/self-service frame。
+host 必须先在一个事务中写入并 fsync `revoked_at_ms`，之后才：
+
+1. 对仍可安全写入的连接发送 `TransportError { code = DeviceRevoked }`；
+2. 终止该 DeviceId 的所有 subscription、未提交 request 与不完整 content upload；
+3. 对全部连接发送 TLS `close_notify` 并关闭；
+4. 拒绝该 DeviceId 后续所有 challenge。
+
+已经进入 canonical durable write path 的命令不回滚；尚未提交的请求不得在吊销后继续进入
+Broker。进程在 fsync 后、断连前崩溃时，重启必须先读到 revoked 状态并拒绝认证。
+
+```
+TransportError {
+  request_id: Option<u64>,
+  code: TransportErrorCode,
+  retriable: bool,
+}
+```
+
 闭合 TransportErrorCode：
 
 ```text
 VersionMismatch | MalformedFrame | FrameTooLarge | RateLimited
-PairingInvalid | PairingExpired | PairingAlreadyUsed
+PairingInvalid
 AuthenticationFailed | ChallengeExpired | ChallengeReplayed | DeviceRevoked
 TooManyConnections | TooManySubscriptions | Internal
 ```
 
-外部错误不包含 secret、signature、endpoint、路径或自由文本详情。认证后的 canonical 业务拒绝
-仍使用 UACP `CanonicalError`。
+`PairingInvalid` 覆盖 secret 错误、过期、已消费和不存在；wire 不得出现更细的配对错误码。
+`request_id` 仅在已经安全解析到非零 ID 时为 Some。error 没有 detail/string/source 字段，不包含
+secret、signature、endpoint、路径或自由文本详情。TLS/pin 失败与无法安全解析的 pre-auth frame
+直接关闭；已认证结构错误可以先发送一条安全 `TransportError`，随后必须关闭。认证后的
+canonical 业务拒绝仍使用 UACP `CanonicalError`，不得伪装成 provider 错误。
 
 ## 9. 日志与测试红线
 
 - 日志允许 DeviceId、connection ID、错误码、计数和时间；
-- 日志禁止 pairing secret/digest、私钥、公钥原文、签名、正文、完整 endpoint/path；
+- 日志禁止 pairing secret/digest、Host pin、TLS exporter、challenge ID/nonce、私钥、公钥原文、
+  签名、正文、完整 endpoint/path；
 - 任何跳过 pin、鉴权、长度上限、cursor checked arithmetic 或吊销检查的变异必须让测试变红；
+- pairing invalid/expired/used 返回不同 wire code、先断连后持久化吊销、或在签名 transcript
+  漏掉任一字段的变异也必须让测试变红；
 - transport 不读取终端、PTY、ANSI 或 provider transcript 文件。

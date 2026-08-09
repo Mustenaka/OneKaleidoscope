@@ -24,8 +24,9 @@ use kaleido_proto::host::{
     ProviderFamily, ProviderRuntime, SessionCounts,
 };
 use kaleido_proto::ids::{
-    AttentionId, CommandId, HostId, ItemId, ProjectBindingId, ProjectId, ProviderBindingHandle,
-    ProviderBindingId, ProviderBindingKind, ProviderRuntimeId, SessionId, TurnId,
+    AttentionId, CommandId, DeviceId, HostId, ItemId, ProjectBindingId, ProjectId,
+    ProviderBindingHandle, ProviderBindingId, ProviderBindingKind, ProviderRuntimeId, SessionId,
+    TurnId,
 };
 use kaleido_proto::projection::ProjectionPayload;
 use kaleido_proto::queue::{QueueIntent, QueueState};
@@ -304,7 +305,7 @@ fn reply(
         command_id: CommandId::new(format!("cmd_{command}")),
         idempotency_key: command.to_owned(),
         actor: Actor::Human {
-            device_label: "test-device".to_owned(),
+            device_id: DeviceId::new("device-test"),
         },
         issued_at_ms: NOW_MS,
         expires_at_ms: None,
@@ -326,7 +327,7 @@ fn prompt(fixture: &Fixture, command: &str) -> CommandEnvelope {
         command_id: CommandId::new(format!("cmd_{command}")),
         idempotency_key: command.to_owned(),
         actor: Actor::Human {
-            device_label: "test-device".to_owned(),
+            device_id: DeviceId::new("device-test"),
         },
         issued_at_ms: NOW_MS,
         expires_at_ms: None,
@@ -629,7 +630,7 @@ fn a_steering_intent_is_queued_rather_than_injected() {
         command_id: CommandId::new("cmd_steer"),
         idempotency_key: "steer".to_owned(),
         actor: Actor::Human {
-            device_label: "test-device".to_owned(),
+            device_id: DeviceId::new("device-test"),
         },
         issued_at_ms: NOW_MS,
         expires_at_ms: None,

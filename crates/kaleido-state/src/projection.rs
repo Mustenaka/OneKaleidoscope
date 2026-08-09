@@ -6,16 +6,31 @@
 //! visible rather than hiding the control.
 
 use kaleido_proto::capability::Capability;
+use kaleido_proto::effect::{Cursor, StreamKey};
 use kaleido_proto::ids::{ItemId, ProjectId, ProviderRuntimeId, SessionId};
 use kaleido_proto::projection::{
-    AttentionInboxView, InputQueueView, LiveActivityView, RuntimeCapabilityView, SessionIndexView,
-    SessionSummary, TranscriptTurn, TranscriptView,
+    AttentionInboxView, InputQueueView, LiveActivityView, ProjectionPayload, RuntimeCapabilityView,
+    SessionIndexView, SessionSummary, TranscriptTurn, TranscriptView,
 };
 use kaleido_proto::session::{Session, SessionStatus};
 use kaleido_proto::turn::{ItemBody, ItemStatus};
+use serde::{Deserialize, Serialize};
 
 use crate::error::StateError;
 use crate::state::CanonicalState;
+
+/// One-shot local diagnostic view built from a canonical stream head.
+///
+/// It is intentionally not a UACP projection envelope and is never exported
+/// through UniFFI. T-107's projection journal is the only component allowed to
+/// construct mobile [`kaleido_proto::projection::ProjectionEnvelope`] values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticProjectionEnvelope {
+    pub projection_version: u32,
+    pub stream: StreamKey,
+    pub cursor: Cursor,
+    pub payload: ProjectionPayload,
+}
 
 /// The six read models this slice produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,6 +233,7 @@ pub fn runtime_capability(
             runtime_id: runtime_id.clone(),
         })?;
     Ok(RuntimeCapabilityView::from_capabilities(
+        runtime.host_id.clone(),
         &runtime.capabilities,
     ))
 }

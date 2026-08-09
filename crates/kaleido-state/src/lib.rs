@@ -26,6 +26,6 @@ pub mod store;
 pub use content::ContentStore;
 pub use error::StateError;
 pub use log::StreamLog;
-pub use projection::ProjectionName;
+pub use projection::{DiagnosticProjectionEnvelope, ProjectionName};
 pub use state::CanonicalState;
 pub use store::{CanonicalStore, ClockSource};

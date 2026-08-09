@@ -6,12 +6,18 @@ use crate::attention::AttentionResponse;
 use crate::content::{ContentRef, Sensitivity};
 use crate::error::CanonicalError;
 use crate::ids::{
-    CommandId, ProjectId, ProviderBindingHandle, ProviderBindingKind, ProviderRuntimeId,
+    CommandId, DeviceId, ProjectId, ProviderBindingHandle, ProviderBindingKind, ProviderRuntimeId,
     QueueEntryId, SessionId, StepId, TurnId, WorkflowId,
 };
 use crate::queue::QueueIntent;
 use crate::workflow::StepAssignment;
 use crate::ContractViolation;
+
+/// Longest device-supplied idempotency key, measured as encoded UTF-8 bytes.
+pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
+
+/// Longest relative lifetime a mobile command may request.
+pub const MAX_DEVICE_COMMAND_TTL_MS: u64 = 300_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
@@ -29,9 +35,24 @@ pub struct CommandEnvelope {
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Actor {
-    Human { device_label: String },
+    Human { device_id: DeviceId },
     Workflow { workflow_id: WorkflowId },
     Broker,
+}
+
+/// The only command shape accepted from an authenticated mobile device.
+///
+/// Identity, canonical command identifiers and absolute timestamps are
+/// deliberately absent. The host injects them from the authenticated
+/// connection before constructing a [`CommandEnvelope`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[serde(deny_unknown_fields)]
+pub struct DeviceCommandRequest {
+    pub idempotency_key: String,
+    /// Relative to the host's receive time. `None` selects the host policy.
+    pub ttl_ms: Option<u64>,
+    pub body: Command,
 }
 
 /// There is deliberately no direct steering command.
@@ -179,7 +200,7 @@ impl CommandEnvelope {
     /// The idempotency scope key. Two envelopes sharing it are the same command.
     pub fn dedupe_key(&self) -> String {
         let actor = match &self.actor {
-            Actor::Human { device_label } => format!("human:{device_label}"),
+            Actor::Human { device_id } => format!("human:{device_id}"),
             Actor::Workflow { workflow_id } => format!("workflow:{workflow_id}"),
             Actor::Broker => "broker".to_owned(),
         };
@@ -196,6 +217,46 @@ impl CommandEnvelope {
             return Err(ContractViolation::EmptyIdentifier {
                 field: "idempotency_key",
             });
+        }
+        self.actor.validate()?;
+        self.body.validate()
+    }
+}
+
+impl Actor {
+    pub fn validate(&self) -> Result<(), ContractViolation> {
+        match self {
+            Actor::Human { device_id } if device_id.is_empty() => {
+                Err(ContractViolation::EmptyIdentifier {
+                    field: "actor.device_id",
+                })
+            }
+            Actor::Workflow { workflow_id } if workflow_id.is_empty() => {
+                Err(ContractViolation::EmptyIdentifier {
+                    field: "actor.workflow_id",
+                })
+            }
+            Actor::Human { .. } | Actor::Workflow { .. } | Actor::Broker => Ok(()),
+        }
+    }
+}
+
+impl DeviceCommandRequest {
+    pub fn validate(&self) -> Result<(), ContractViolation> {
+        if self.idempotency_key.is_empty() {
+            return Err(ContractViolation::EmptyIdentifier {
+                field: "device_command.idempotency_key",
+            });
+        }
+        if self.idempotency_key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
+            return Err(ContractViolation::IdempotencyKeyTooLong {
+                byte_len: self.idempotency_key.len(),
+            });
+        }
+        if let Some(ttl_ms) = self.ttl_ms {
+            if !(1..=MAX_DEVICE_COMMAND_TTL_MS).contains(&ttl_ms) {
+                return Err(ContractViolation::InvalidDeviceCommandTtl { ttl_ms });
+            }
         }
         self.body.validate()
     }

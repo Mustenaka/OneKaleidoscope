@@ -38,20 +38,42 @@ Host public-key pin、256-bit 随机 secret 与 expiry。
 
 手机必须先验证 Host pin，之后才发送 pairing secret，防止把 secret 交给中间人。
 
+Host pin 的 wire 形状固定为
+`sha256:` + `base64url-no-pad(SHA-256(DER SubjectPublicKeyInfo))`。它 pin 的是 TLS 证书里的
+SPKI，不是整张证书、证书链或主机名。客户端从握手证书提取 DER SPKI、计算 32-byte digest，
+解码 bootstrap pin 后恒时比较；任何格式错误或不相等都让 TLS 握手失败，且在发送 pairing
+secret 前结束。系统 CA、用户安装 CA 或主机名匹配不得替代该 pin。
+
+错误 secret、过期 secret、已使用 secret 对 wire 统一为 `PairingInvalid`，避免把配对目录
+状态暴露为 oracle。host 内部可以分别计数，但不得记录 secret 或其 digest。
+
 ### D-3 Android Keystore 设备身份
 
 Android 在 Keystore 生成不可导出的 P-256 signing key。配对时上传公钥，host 分配 DeviceId
 并持久化公钥/状态。显示名只用于 UI，不参与授权。
 
 重连认证绑定：TLS channel、Host nonce、DeviceId、transport version、UACP version 和
-请求时间窗。nonce 单次、短时；签名重放、错误 key、已吊销 DeviceId 均拒绝。认证成功后的
+请求时间窗。TLS channel binding 固定使用 exporter label
+`EXPORTER-OneKaleidoscope-R3-DeviceAuth`、无 context、输出 32 bytes。
+
+签名 transcript 逐字节固定为 ASCII magic `OneKaleidoscope.DeviceAuth.v1`，随后依次编码
+transport version、UACP version、HostId、DeviceId；四个变长字段都使用 `u16` big-endian
+byte length + UTF-8 bytes。其后依次拼接 TLS exporter 32 bytes、challenge ID 16 raw bytes、
+nonce 32 raw bytes、`expires_at_ms` 的 `i64` big-endian。任一变长字段超过 `u16::MAX`、ID
+为空或固定长度不符都在验签前拒绝。设备使用 P-256 ECDSA-SHA256，wire signature 为严格 DER。
+
+nonce/challenge 单次、短时；签名重放、错误 key、已吊销 DeviceId 均拒绝。认证成功后的
 短期 session credential 只在内存存在。
 
-吊销持久化，并让该 DeviceId 的现有连接和订阅立即失效。
+吊销只允许本机 hostd 管理命令或受信本地 API 发起，不开放 LAN 自助入口。host 必须先原子
+持久化并 fsync `revoked_at_ms`，再向该 DeviceId 的连接发送 `DeviceRevoked`（若连接仍可安全
+写入）、终止其订阅与未提交请求、关闭全部连接并发送 TLS `close_notify`。后续 challenge 一律
+拒绝；不得先断连后异步写吊销状态。
 
 ### D-4 有界 frame 与连接资源
 
-- 控制 frame 最大 64 KiB；ContentWrite 单次正文最大 64 KiB；
+- JSON 控制正文最大 64 KiB；ContentWrite 单次正文最大 64 KiB；frame 另有 1-byte kind，
+  content frame 另有 8-byte request ID；
 - 长度前缀在分配前 checked，零长、超限、截断和未知 frame kind fail-closed；
 - 每设备连接、订阅和并发请求有固定上限；
 - 慢订阅者不能让 Broker 丢 projection，发生 lag 时以 CursorGap 断开；

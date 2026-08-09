@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::attention::AttentionItem;
 use crate::capability::{CapabilityEntry, RuntimeCapabilities};
-use crate::effect::{Cursor, StreamKey};
+use crate::effect::Cursor;
+use crate::error::{CanonicalError, ErrorCode};
 use crate::host::{HostReachability, ProviderFamily, SessionCounts};
 use crate::ids::{
     HostId, ItemId, ProjectBindingId, ProjectId, ProviderRuntimeId, SessionId, StepId, TurnId,
@@ -21,15 +22,74 @@ use crate::workflow::{Artifact, StepAssignment, StepBlocker, StepState, Workflow
 use crate::ContractViolation;
 
 /// Bumped whenever a payload shape changes so clients know to refresh fully.
-pub const PROJECTION_VERSION: u32 = 1;
+pub const PROJECTION_VERSION: u32 = 2;
+
+/// The sole cursor domain for one projection.
+///
+/// Unlike a canonical [`crate::effect::StreamKey`], the projection kind is
+/// part of the key. Two read models over the same session therefore cannot
+/// accidentally share a cursor.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProjectionKey {
+    ProjectIndex {
+        host_id: HostId,
+    },
+    SessionIndex {
+        project_id: ProjectId,
+    },
+    Transcript {
+        session_id: SessionId,
+    },
+    LiveActivity {
+        session_id: SessionId,
+    },
+    InputQueue {
+        session_id: SessionId,
+    },
+    AttentionInbox {
+        host_id: HostId,
+    },
+    WorkflowBoard {
+        workflow_id: WorkflowId,
+    },
+    RuntimeCapability {
+        host_id: HostId,
+        runtime_id: ProviderRuntimeId,
+    },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct ProjectionEnvelope {
     pub projection_version: u32,
-    pub stream: StreamKey,
+    pub key: ProjectionKey,
     pub cursor: Cursor,
     pub payload: ProjectionPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct ProjectionSubscribe {
+    pub key: ProjectionKey,
+    pub since: Option<Cursor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct ProjectionSubscribeAck {
+    pub key: ProjectionKey,
+    pub outcome: ProjectionSubscribeOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProjectionSubscribeOutcome {
+    Resumed { from_cursor: Cursor },
+    CurrentFollows { current_cursor: Cursor },
+    Rejected { error: CanonicalError },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,14 +234,16 @@ pub struct WorkflowBoardStep {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct RuntimeCapabilityView {
+    pub host_id: HostId,
     pub runtime_id: ProviderRuntimeId,
     pub negotiated_at_ms: i64,
     pub entries: Vec<CapabilityEntry>,
 }
 
 impl RuntimeCapabilityView {
-    pub fn from_capabilities(capabilities: &RuntimeCapabilities) -> Self {
+    pub fn from_capabilities(host_id: HostId, capabilities: &RuntimeCapabilities) -> Self {
         Self {
+            host_id,
             runtime_id: capabilities.runtime_id.clone(),
             negotiated_at_ms: capabilities.negotiated_at_ms,
             entries: capabilities.entries.clone(),
@@ -189,6 +251,11 @@ impl RuntimeCapabilityView {
     }
 
     fn validate(&self) -> Result<(), ContractViolation> {
+        if self.host_id.is_empty() {
+            return Err(ContractViolation::EmptyIdentifier {
+                field: "runtime_capability.host_id",
+            });
+        }
         RuntimeCapabilities {
             runtime_id: self.runtime_id.clone(),
             negotiated_at_ms: self.negotiated_at_ms,
@@ -486,6 +553,170 @@ impl WorkflowBoardView {
     }
 }
 
+impl ProjectionKey {
+    pub fn validate(&self) -> Result<(), ContractViolation> {
+        match self {
+            ProjectionKey::ProjectIndex { host_id } | ProjectionKey::AttentionInbox { host_id }
+                if host_id.is_empty() =>
+            {
+                Err(ContractViolation::EmptyIdentifier {
+                    field: "projection_key.host_id",
+                })
+            }
+            ProjectionKey::SessionIndex { project_id } if project_id.is_empty() => {
+                Err(ContractViolation::EmptyIdentifier {
+                    field: "projection_key.project_id",
+                })
+            }
+            ProjectionKey::Transcript { session_id }
+            | ProjectionKey::LiveActivity { session_id }
+            | ProjectionKey::InputQueue { session_id }
+                if session_id.is_empty() =>
+            {
+                Err(ContractViolation::EmptyIdentifier {
+                    field: "projection_key.session_id",
+                })
+            }
+            ProjectionKey::WorkflowBoard { workflow_id } if workflow_id.is_empty() => {
+                Err(ContractViolation::EmptyIdentifier {
+                    field: "projection_key.workflow_id",
+                })
+            }
+            ProjectionKey::RuntimeCapability { host_id, .. } if host_id.is_empty() => {
+                Err(ContractViolation::EmptyIdentifier {
+                    field: "projection_key.host_id",
+                })
+            }
+            ProjectionKey::RuntimeCapability { runtime_id, .. } if runtime_id.is_empty() => {
+                Err(ContractViolation::EmptyIdentifier {
+                    field: "projection_key.runtime_id",
+                })
+            }
+            ProjectionKey::ProjectIndex { .. }
+            | ProjectionKey::SessionIndex { .. }
+            | ProjectionKey::Transcript { .. }
+            | ProjectionKey::LiveActivity { .. }
+            | ProjectionKey::InputQueue { .. }
+            | ProjectionKey::AttentionInbox { .. }
+            | ProjectionKey::WorkflowBoard { .. }
+            | ProjectionKey::RuntimeCapability { .. } => Ok(()),
+        }
+    }
+}
+
+impl ProjectionSubscribeAck {
+    /// Rejects an acknowledgement that was replayed or routed from another
+    /// projection subscription.
+    pub fn validate_for(&self, request: &ProjectionSubscribe) -> Result<(), ContractViolation> {
+        request.key.validate()?;
+        self.key.validate()?;
+        if self.key != request.key {
+            return Err(ContractViolation::ProjectionSubscribeKeyMismatch);
+        }
+        match &self.outcome {
+            ProjectionSubscribeOutcome::Resumed { from_cursor } => {
+                let since = request
+                    .since
+                    .ok_or(ContractViolation::ProjectionResumeWithoutCursor)?;
+                let expected = since.next()?;
+                if *from_cursor != expected {
+                    return Err(ContractViolation::ProjectionResumeCursorMismatch {
+                        expected: expected.seq,
+                        found: from_cursor.seq,
+                    });
+                }
+            }
+            ProjectionSubscribeOutcome::Rejected { error } => error.validate()?,
+            ProjectionSubscribeOutcome::CurrentFollows { .. } => {}
+        }
+        Ok(())
+    }
+}
+
+/// Chooses the control response for a projection subscription without reading
+/// or mutating a journal.
+///
+/// The caller obtains `retained_floor` and `current_head` from one stable
+/// journal view. A cursor ahead of the head is a wire-visible rejection; an
+/// internally inverted floor/head pair is a contract violation.
+pub fn decide_projection_subscription(
+    request: &ProjectionSubscribe,
+    retained_floor: Cursor,
+    current_head: Cursor,
+    at_ms: i64,
+) -> Result<ProjectionSubscribeAck, ContractViolation> {
+    request.key.validate()?;
+    if retained_floor.seq > current_head.seq {
+        return Err(ContractViolation::InvalidProjectionCursorWindow {
+            floor: retained_floor.seq,
+            head: current_head.seq,
+        });
+    }
+
+    let outcome = match request.since {
+        None => ProjectionSubscribeOutcome::CurrentFollows {
+            current_cursor: current_head,
+        },
+        Some(since) if since.seq > current_head.seq => ProjectionSubscribeOutcome::Rejected {
+            error: CanonicalError {
+                code: ErrorCode::CursorGap,
+                retriable: true,
+                detail_ref: None,
+                at_ms,
+            },
+        },
+        Some(since) => {
+            let next = since.next()?;
+            if next.seq < retained_floor.seq {
+                ProjectionSubscribeOutcome::CurrentFollows {
+                    current_cursor: current_head,
+                }
+            } else {
+                ProjectionSubscribeOutcome::Resumed { from_cursor: next }
+            }
+        }
+    };
+
+    Ok(ProjectionSubscribeAck {
+        key: request.key.clone(),
+        outcome,
+    })
+}
+
+/// Verifies a retained or live run after the client's last applied cursor.
+///
+/// This helper deliberately contains no journal implementation. It gives both
+/// host and mobile core one fail-closed rule for key mismatch, repetition,
+/// gaps and checked cursor overflow.
+pub fn validate_projection_sequence(
+    key: &ProjectionKey,
+    after: Cursor,
+    envelopes: &[ProjectionEnvelope],
+) -> Result<(), ContractViolation> {
+    key.validate()?;
+    let mut previous = after;
+    for envelope in envelopes {
+        envelope.validate_for_transport()?;
+        if &envelope.key != key {
+            return Err(ContractViolation::MixedProjectionKeys);
+        }
+        if envelope.cursor == previous {
+            return Err(ContractViolation::CursorRepeated {
+                cursor: envelope.cursor.seq,
+            });
+        }
+        let expected = previous.next()?;
+        if envelope.cursor != expected {
+            return Err(ContractViolation::CursorGap {
+                expected: expected.seq,
+                found: envelope.cursor.seq,
+            });
+        }
+        previous = envelope.cursor;
+    }
+    Ok(())
+}
+
 impl ProjectionEnvelope {
     /// Whether the client must discard cached state and refetch.
     pub fn requires_full_refresh(&self) -> bool {
@@ -494,33 +725,43 @@ impl ProjectionEnvelope {
 
     /// Rejects projections that would leak unsafe content or cross stream scope.
     pub fn validate_for_transport(&self) -> Result<(), ContractViolation> {
-        match (&self.stream, &self.payload) {
-            (StreamKey::Host { host_id }, ProjectionPayload::ProjectIndex { view })
+        self.key.validate()?;
+        self.payload.validate_for_key(&self.key)
+    }
+}
+
+impl ProjectionPayload {
+    /// Validates one complete read model against its unique cursor scope.
+    pub fn validate_for_key(&self, key: &ProjectionKey) -> Result<(), ContractViolation> {
+        key.validate()?;
+        match (key, self) {
+            (ProjectionKey::ProjectIndex { host_id }, ProjectionPayload::ProjectIndex { view })
                 if host_id == &view.host_id =>
             {
                 view.validate()
             }
-            (StreamKey::Project { project_id }, ProjectionPayload::SessionIndex { view })
-                if project_id == &view.project_id =>
-            {
-                view.validate()
-            }
-            (StreamKey::Session { session_id }, ProjectionPayload::Transcript { view })
+            (
+                ProjectionKey::SessionIndex { project_id },
+                ProjectionPayload::SessionIndex { view },
+            ) if project_id == &view.project_id => view.validate(),
+            (ProjectionKey::Transcript { session_id }, ProjectionPayload::Transcript { view })
                 if session_id == &view.session_id =>
             {
                 view.validate()
             }
-            (StreamKey::Session { session_id }, ProjectionPayload::LiveActivity { view })
+            (
+                ProjectionKey::LiveActivity { session_id },
+                ProjectionPayload::LiveActivity { view },
+            ) if session_id == &view.session_id => view.validate(),
+            (ProjectionKey::InputQueue { session_id }, ProjectionPayload::InputQueue { view })
                 if session_id == &view.session_id =>
             {
                 view.validate()
             }
-            (StreamKey::Session { session_id }, ProjectionPayload::InputQueue { view })
-                if session_id == &view.session_id =>
-            {
-                view.validate()
-            }
-            (StreamKey::Host { host_id }, ProjectionPayload::AttentionInbox { view }) => {
+            (
+                ProjectionKey::AttentionInbox { host_id },
+                ProjectionPayload::AttentionInbox { view },
+            ) => {
                 view.validate()?;
                 if view.entries.iter().any(|entry| &entry.host_id != host_id) {
                     return Err(ContractViolation::DanglingReference {
@@ -529,17 +770,18 @@ impl ProjectionEnvelope {
                 }
                 Ok(())
             }
-            (StreamKey::Workflow { workflow_id }, ProjectionPayload::WorkflowBoard { view })
-                if workflow_id == &view.workflow_id =>
-            {
-                view.validate()
-            }
-            (StreamKey::Host { .. }, ProjectionPayload::RuntimeCapability { view }) => {
-                view.validate()
-            }
-            _ => Err(ContractViolation::DanglingReference {
-                field: "projection.stream",
-            }),
+            (
+                ProjectionKey::WorkflowBoard { workflow_id },
+                ProjectionPayload::WorkflowBoard { view },
+            ) if workflow_id == &view.workflow_id => view.validate(),
+            (
+                ProjectionKey::RuntimeCapability {
+                    host_id,
+                    runtime_id,
+                },
+                ProjectionPayload::RuntimeCapability { view },
+            ) if host_id == &view.host_id && runtime_id == &view.runtime_id => view.validate(),
+            _ => Err(ContractViolation::ProjectionKeyPayloadMismatch),
         }
     }
 }
