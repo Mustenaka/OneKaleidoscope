@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kaleido_proto::command::{CommandAck, DeviceCommandRequest};
 use kaleido_proto::content::{
@@ -23,7 +23,7 @@ use kaleido_transport::auth::{
 use kaleido_transport::bootstrap::decode_uri;
 use kaleido_transport::control::{ControlFrame, PairRequest};
 use kaleido_transport::frame::Frame;
-use kaleido_transport::{MAX_FRAME_LENGTH, TRANSPORT_VERSION};
+use kaleido_transport::{FRAME_IO_TIMEOUT_MS, MAX_FRAME_LENGTH, TRANSPORT_VERSION};
 use zeroize::Zeroize;
 
 use crate::cache::{CacheApply, ProjectionCache};
@@ -708,10 +708,15 @@ fn wait_for<T>(
     cache: &Arc<Mutex<ProjectionCache>>,
     mut select: impl FnMut(&ControlFrame) -> Option<T>,
 ) -> Result<T, MobileClientError> {
+    let timeout_ms = u64::try_from(FRAME_IO_TIMEOUT_MS).map_err(|_| MobileClientError::Contract)?;
+    let deadline = Instant::now()
+        .checked_add(Duration::from_millis(timeout_ms))
+        .ok_or(MobileClientError::Contract)?;
     loop {
-        let frame = wire
-            .receive()
-            .map_err(|_| MobileClientError::WorkerStopped)?;
+        let frame = poll_until(deadline, || {
+            wire.try_receive()
+                .map_err(|_| MobileClientError::WorkerStopped)
+        })?;
         if let Frame::Control(bytes) = &frame {
             let control = ControlFrame::decode(bytes).map_err(|_| MobileClientError::Contract)?;
             if let Some(value) = select(&control) {
@@ -719,6 +724,20 @@ fn wait_for<T>(
             }
         }
         handle_unsolicited(wire, frame, callbacks, current_snapshots, cache)?;
+    }
+}
+
+fn poll_until<T>(
+    deadline: Instant,
+    mut poll: impl FnMut() -> Result<Option<T>, MobileClientError>,
+) -> Result<T, MobileClientError> {
+    loop {
+        if Instant::now() >= deadline {
+            return Err(MobileClientError::WorkerStopped);
+        }
+        if let Some(value) = poll()? {
+            return Ok(value);
+        }
     }
 }
 
@@ -992,6 +1011,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use kaleido_proto::effect::Cursor;
     use kaleido_proto::error::CanonicalError;
@@ -1003,8 +1023,8 @@ mod tests {
     };
 
     use super::{
-        apply_projection, close_callbacks, validate_synchronized_cursor, ActiveSubscription,
-        MobileClient, MobileClientError, ProjectionCallback,
+        apply_projection, close_callbacks, poll_until, validate_synchronized_cursor,
+        ActiveSubscription, MobileClient, MobileClientError, ProjectionCallback,
     };
     use crate::cache::ProjectionCache;
     use crate::credential::{
@@ -1132,6 +1152,19 @@ mod tests {
             "a contiguous live projection may be published before hostd reads the barrier Ping"
         );
         assert!(validate_synchronized_cursor(&outcome, None, Cursor { seq: 9 }).is_err());
+    }
+
+    #[test]
+    fn a_request_wait_tolerates_empty_worker_polls_before_the_response() {
+        let mut polls = 0_u8;
+        let response = poll_until(Instant::now() + Duration::from_secs(1), || {
+            polls = polls.saturating_add(1);
+            Ok((polls == 3).then_some("response"))
+        })
+        .expect("response after bounded empty polls");
+
+        assert_eq!(response, "response");
+        assert_eq!(polls, 3);
     }
 
     #[test]
