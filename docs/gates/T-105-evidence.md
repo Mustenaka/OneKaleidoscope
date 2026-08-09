@@ -195,8 +195,17 @@ then reproduced. The mutation never entered a commit.
 
 ## Remote validation
 
-Remote run URLs and the tested implementation commit are recorded here after
-the local full gate is green and the branch is pushed.
+Implementation commit:
+`0d31e033f60f89d26c4a239ec09d238abf02a467`.
+
+| Gate | Result | Run |
+|---|---|---|
+| Three-platform CI | Ubuntu, Windows and macOS succeeded | [31302047169](https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31302047169) |
+| Schema drift, exact reviewed versions | Codex `0.147.0` + OpenCode `1.18.8`, succeeded | [31302055234](https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31302055234) |
+| Schema drift, npm current latest | Codex `0.147.0` + OpenCode `1.18.15`, succeeded | [31302056764](https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31302056764) |
+
+All three runs tested the same implementation commit. The only annotation was
+an unrelated Homebrew tap-trust notice on macOS; it did not fail a step.
 
 ## Deviations and findings
 
