@@ -7,7 +7,7 @@
 > **当前状态（2026-08-09，R3 开工）**：先读 `docs/STATUS.md`。
 > `docs/PROTOCOL.md` 与 `crates/kaleido-proto` 是**正式合同**。
 > **R2 已完成**；T-102、T-105、T-103、T-104 均已通过。
-> **R3 当前活动任务是 `docs/tasks/T-106.md`。**
+> **R3 当前活动任务是 `docs/tasks/T-107.md`。**
 > T-001～T-013 已冻结，T-014 已撤销，T-101 已作废。
 > 下文旧版本/工具示例不能覆盖新任务卡的合同；特别注意 §3.2 的 Codex 一栏已被
 > `docs/adr/0012-provider-decode-strategy.md` 取代。

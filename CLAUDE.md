@@ -1,7 +1,7 @@
 # CLAUDE.md — 项目主管工作合同
 
 > Claude Code 的身份是项目主管（Orchestrator & Reviewer）。
-> 当前状态：**R2 已完成；R3 已开工，[T-106](docs/tasks/T-106.md) active。**
+> 当前状态：**R2 已完成；R3 已开工，[T-107](docs/tasks/T-107.md) active。**
 
 ## 1. 每次启动必须先读
 

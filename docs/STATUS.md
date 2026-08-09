@@ -1,7 +1,7 @@
 # OneKaleidoscope 当前状态
 
 > 生效：2026-08-09
-> 进度基线：`main@710d2d9`，三平台 [CI 全绿](https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31310658346)。
+> 进度基线：T-106 实现 `8cd949e`，三平台 [CI 全绿](https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31313728415)。
 
 ## 1. 当前结论
 
@@ -28,9 +28,8 @@ R3 开工审计又发现三个必须先闭合的合同缺口：
 2. UACP 把配对/分帧留到 R4，但 R3 本身要求安全 LAN 配对和重连；
 3. 手机 prompt/free-form 没有安全的敏感正文写入入口，远端也不能被允许伪造 `Actor`。
 
-当前活动任务是 [T-106](tasks/T-106.md)：以 UACP `0.3.0`、投影独立游标和
-TRANSPORT `0.1.0` 关闭以上缺口。随后依次执行 [T-107](tasks/T-107.md) 与
-[T-108](tasks/T-108.md)。
+T-106 已以 UACP `0.3.0`、投影独立游标和 TRANSPORT `0.1.0` 关闭以上缺口。
+当前活动任务是 [T-107](tasks/T-107.md)，随后执行 [T-108](tasks/T-108.md)。
 
 ## 2. 已完成
 
@@ -44,6 +43,7 @@ TRANSPORT `0.1.0` 关闭以上缺口。随后依次执行 [T-107](tasks/T-107.md
 | T-105 | Codex `0.147.0` required-surface 审查完成；`0.146.0..=0.147.0` 证据闭合，Schema drift 恢复 |
 | T-103 | UACP `0.2.0` Attention provenance、旧 `0.1` 日志 fail-loud |
 | T-104 | `AcceptedByRuntime` → `LiveControl` → `Controlling`，含跨 runtime/session 防伪造守卫 |
+| T-106 | UACP `0.3.0` mobile contract、projection 独立游标、可信 command/content ingress、TRANSPORT `0.1.0` |
 
 ## 3. 当前可用能力
 
