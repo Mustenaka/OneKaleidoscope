@@ -65,6 +65,10 @@ Session → Turn → command → runtime ack 链；只有 capability、另一个
 handle，或经通用 effect ingestion 伪造的 `AcceptedLocally` 都不够。未来若为不产生 Turn 的命令
 增加 runtime acceptance，必须先定义同等级的 canonical 归属关联，不能绕开这条检查。
 
+该关联一旦写入即不可被后续 effect 改写：同一 remote command 不能创建第二个 Turn，既有
+Turn 不能更换 Session、origin 或 provider binding identity。live Session 的更新也必须使用候选
+对象自身可解析的 runtime 引用，不能借 store 中旧 Session 的绑定通过验证。
+
 ### D-3 `Controlling` 是 Session 级、连接存活期间锁存的证据
 
 某 Session 的本地命令第一次得到 `AcceptedByRuntime` 后：

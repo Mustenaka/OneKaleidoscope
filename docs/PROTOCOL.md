@@ -388,6 +388,9 @@ LiveUnboundReason =
   command 的 `AcceptedByRuntime`；另一个 Session 或 runtime 的证据不得借用。
 - `Observing` / `Controlling` 的 `runtime_id` 必须等于用于验证的
   `RuntimeCapabilities.runtime_id`。
+- 写入 `Observing` / `Controlling` 时，候选 Session 必须从它自己的 binding 或 history
+  runtime 引用解析到当前 runtime；不得在候选对象删除或改写引用后，借用 store 中旧 Session
+  的 runtime 或 capability 通过校验。
 - `BrokerManaged`、`SharedRuntime` 与 `ExternalNative` 使用相同的控制证据门槛；ownership
   不构成能力证据。Replay、仅观察、无本地 command correlation 或只有本地接受的路径不得进入
   `Controlling`。
@@ -435,6 +438,8 @@ TurnOrigin =
 - `RemoteCommand.command_id` 必须是触发这个 Turn 的真实 `CommandEnvelope.command_id`。对于
   Codex `turn/start`，只有显式关联到该 command 的 response 才能设置这个 origin；replay 或
   未关联流量不得反推成本地命令来源。
+- 一个 `RemoteCommand.command_id` 只能绑定一个 Turn。Turn 建立后，后续 upsert 不得改写其
+  `session_id`、`origin` 或已存在的 provider binding identity；冲突必须在追加日志前拒绝。
 
 ### 4.5 Item
 
