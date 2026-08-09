@@ -120,15 +120,8 @@ jobs:
             -no-boot-anim
             -camera-back none
           script: |
-            ./gradlew \
-              --no-daemon \
-              --console=plain \
-              :app:connectedDebugAndroidTest \
-              -Pandroid.testInstrumentationRunnerArguments.class=com.onekaleidoscope.integration.NativeUniFfiSmokeTest
-            ./gradlew \
-              --no-daemon \
-              --console=plain \
-              :app:connectedDebugAndroidTest
+            ./gradlew --no-daemon --console=plain :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.onekaleidoscope.integration.NativeUniFfiSmokeTest
+            ./gradlew --no-daemon --console=plain :app:connectedDebugAndroidTest
 
       - name: Upload Android artifacts
         if: always()
