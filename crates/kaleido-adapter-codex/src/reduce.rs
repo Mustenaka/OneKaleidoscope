@@ -27,6 +27,7 @@ use kaleido_proto::attention::{
     DecisionSemantics, JoinFailureReason, JoinState,
 };
 use kaleido_proto::capability::{Capability, CapabilityEvidence, EvidenceSource};
+use kaleido_proto::command::{CommandAck, CommandOutcome};
 use kaleido_proto::content::{ContentKind, ContentRef, Sensitivity};
 use kaleido_proto::effect::{DiagnosticCode, DiagnosticRecord, StateEffect};
 use kaleido_proto::error::{CanonicalError, ErrorCode};
@@ -35,7 +36,8 @@ use kaleido_proto::host::{
     Project, ProjectBinding, ProviderFamily, ProviderRuntime, SessionCounts,
 };
 use kaleido_proto::ids::{
-    AttentionId, HostId, ItemId, ProjectBindingId, ProjectId, ProviderRuntimeId, SessionId, TurnId,
+    AttentionId, CommandId, HostId, ItemId, ProjectBindingId, ProjectId, ProviderBindingKind,
+    ProviderRuntimeId, SessionId, TurnId,
 };
 use kaleido_proto::session::Session;
 use kaleido_proto::session::{
@@ -99,11 +101,13 @@ pub struct CodexReducer {
     project_binding_id: ProjectBindingId,
     bindings: BindingStore,
     pending_client_calls: BTreeMap<i64, ClientCall>,
+    pending_local_control: BTreeMap<i64, CommandId>,
     pending_approvals: BTreeMap<i64, PendingApproval>,
     raw_thread_id: Option<String>,
     session_id: Option<SessionId>,
     session: Option<Session>,
     current_turn: Option<TurnId>,
+    turn_origins: BTreeMap<TurnId, TurnOrigin>,
     next_sequence: u64,
     agent_text: BTreeMap<ItemId, String>,
     items: BTreeMap<ItemId, Item>,
@@ -135,11 +139,13 @@ impl CodexReducer {
             project_binding_id,
             bindings: BindingStore::default(),
             pending_client_calls: BTreeMap::new(),
+            pending_local_control: BTreeMap::new(),
             pending_approvals: BTreeMap::new(),
             raw_thread_id: None,
             session_id: None,
             session: None,
             current_turn: None,
+            turn_origins: BTreeMap::new(),
             next_sequence: 0,
             agent_text: BTreeMap::new(),
             items: BTreeMap::new(),
@@ -198,6 +204,33 @@ impl CodexReducer {
 
     pub fn capability_probe(&self) -> CapabilityProbe {
         self.probe.clone()
+    }
+
+    /// Correlates one broker command with the exact client request that will
+    /// carry it to the live runtime.
+    ///
+    /// Recorded traffic and duplicate request/command identifiers are refused:
+    /// neither can prove that this connection accepted a command now.
+    pub fn register_local_turn_start(&mut self, request_id: i64, command_id: &CommandId) -> bool {
+        if self.config.evidence != EvidenceSource::ObservedInTraffic
+            || command_id.is_empty()
+            || self.pending_local_control.contains_key(&request_id)
+            || self
+                .pending_local_control
+                .values()
+                .any(|pending| pending == command_id)
+        {
+            return false;
+        }
+        self.pending_local_control
+            .insert(request_id, command_id.clone());
+        true
+    }
+
+    /// Removes a correlation when the request never reached a matching
+    /// structured response (for example, a transport write failure).
+    pub fn cancel_local_turn_start(&mut self, request_id: i64) {
+        self.pending_local_control.remove(&request_id);
     }
 
     /// Records an unexpected child-process exit exactly once.
@@ -307,17 +340,34 @@ impl CodexReducer {
         // produces. Neither depends on the session, so both can be emitted from
         // the first frame observed.
         let mut effects = self.ensure_bootstrapped(at_ms);
-        effects.extend(self.dispatch_frame(frame, at_ms, content)?);
+        let mut frame_effects = self.dispatch_frame(frame, at_ms, content)?;
         // Capabilities are evidence-driven, so they can only ever grow as
         // traffic proves them. Republishing on change is what lets a reader see
         // "approval works here" the moment the runtime demonstrates it, without
         // ever inferring it from a provider name.
         if self.probe.proven() != self.published_capabilities.as_slice() {
             self.published_capabilities = self.probe.proven().to_vec();
-            effects.push(StateEffect::CapabilitiesUpdated {
+            let capability_effect = StateEffect::CapabilitiesUpdated {
                 capabilities: self.probe.to_capabilities(),
-            });
+            };
+            if let Some(controlling_index) = frame_effects.iter().position(|effect| {
+                matches!(
+                    effect,
+                    StateEffect::SessionUpserted { session }
+                        if matches!(session.live_binding, LiveBinding::Controlling { .. })
+                )
+            }) {
+                frame_effects.insert(controlling_index, capability_effect);
+            } else {
+                frame_effects.push(capability_effect);
+            }
         }
+        // CanonicalStore::apply_all is deliberately non-transactional. Keep a
+        // correlated Turn and runtime acknowledgement before LiveControl so a
+        // rejected acknowledgement cannot leave a false capability behind;
+        // publish the capability immediately before Controlling so that binding
+        // validation still observes the newly proved runtime state.
+        effects.extend(frame_effects);
         Ok(effects)
     }
 
@@ -475,9 +525,114 @@ impl CodexReducer {
     ) -> Result<Vec<StateEffect>, CodexAdapterError> {
         match self.pending_client_calls.remove(&id) {
             Some(ClientCall::ThreadStart) => self.bootstrap_session(frame, at_ms, content),
-            Some(ClientCall::TurnStart) => self.reduce_turn_created(frame, at_ms),
+            Some(ClientCall::TurnStart) => {
+                let local_command = self.pending_local_control.remove(&id);
+                if frame.payload().get("error").is_some() {
+                    return Ok(local_command
+                        .map(|command_id| StateEffect::CommandAcknowledged {
+                            ack: CommandAck {
+                                command_id,
+                                outcome: CommandOutcome::Rejected {
+                                    error: CanonicalError {
+                                        code: ErrorCode::UpstreamRejected,
+                                        retriable: false,
+                                        detail_ref: None,
+                                        at_ms,
+                                    },
+                                },
+                                acked_at_ms: at_ms,
+                            },
+                        })
+                        .into_iter()
+                        .collect());
+                }
+
+                let origin = local_command
+                    .as_ref()
+                    .map(|command_id| TurnOrigin::RemoteCommand {
+                        command_id: command_id.clone(),
+                    })
+                    .unwrap_or_else(|| self.config.turn_origin.clone());
+                let mut effects = self.reduce_turn_created(frame, at_ms, origin)?;
+                if let Some(command_id) = local_command {
+                    effects.extend(self.runtime_acceptance_effects(command_id, at_ms)?);
+                }
+                Ok(effects)
+            }
             Some(ClientCall::Unmodelled) | None => Ok(Vec::new()),
         }
+    }
+
+    fn runtime_acceptance_effects(
+        &mut self,
+        command_id: CommandId,
+        at_ms: i64,
+    ) -> Result<Vec<StateEffect>, CodexAdapterError> {
+        let (since_at_ms, already_controlling, mut controlling_session) = {
+            let Some(session) = self.session.as_ref() else {
+                return Err(CodexAdapterError::ControlEvidenceUnavailable);
+            };
+            let since_at_ms = match &session.live_binding {
+                LiveBinding::Observing {
+                    runtime_id,
+                    since_at_ms,
+                    ..
+                }
+                | LiveBinding::Controlling {
+                    runtime_id,
+                    since_at_ms,
+                    ..
+                } if runtime_id == &self.runtime_id => *since_at_ms,
+                _ => return Err(CodexAdapterError::ControlEvidenceUnavailable),
+            };
+            (
+                since_at_ms,
+                session.live_binding.accepts_control(),
+                session.clone(),
+            )
+        };
+
+        let outcome = CommandOutcome::AcceptedByRuntime {
+            binding_handle: self.mint.binding_handle(
+                &self.runtime_id,
+                ProviderBindingKind::RuntimeAcknowledgement,
+                command_id.as_str(),
+            ),
+        };
+        if !self.probe.observe_runtime_acceptance(&outcome) {
+            return Err(CodexAdapterError::ControlEvidenceUnavailable);
+        }
+
+        let ack = StateEffect::CommandAcknowledged {
+            ack: CommandAck {
+                command_id,
+                outcome,
+                acked_at_ms: at_ms,
+            },
+        };
+        if already_controlling {
+            return Ok(vec![ack]);
+        }
+        controlling_session.live_binding = LiveBinding::Controlling {
+            runtime_id: self.runtime_id.clone(),
+            since_at_ms,
+            evidence: CapabilityEvidence {
+                source: EvidenceSource::ObservedInTraffic,
+                observed_at_ms: at_ms,
+                note_ref: None,
+            },
+        };
+        controlling_session.updated_at_ms = controlling_session.updated_at_ms.max(at_ms);
+        controlling_session.last_activity_at_ms =
+            controlling_session.last_activity_at_ms.max(at_ms);
+        self.session = Some(controlling_session.clone());
+
+        Ok(vec![
+            ack,
+            StateEffect::SessionUpserted {
+                session: controlling_session,
+            },
+        ])
     }
 
     fn bootstrap_session(
@@ -599,6 +754,7 @@ impl CodexReducer {
         &mut self,
         frame: &TranscriptFrame,
         at_ms: i64,
+        origin: TurnOrigin,
     ) -> Result<Vec<StateEffect>, CodexAdapterError> {
         let payload = frame.payload().clone();
         let raw_turn = self
@@ -615,12 +771,13 @@ impl CodexReducer {
             self.bindings
                 .bind_turn(&self.mint, &self.runtime_id, &raw_turn, &session_id);
         self.current_turn = Some(turn_id.clone());
+        self.turn_origins.insert(turn_id.clone(), origin.clone());
         Ok(vec![StateEffect::TurnUpserted {
             turn: Turn {
                 id: turn_id,
                 session_id,
                 status,
-                origin: self.config.turn_origin.clone(),
+                origin,
                 started_at_ms: None,
                 completed_at_ms: terminal_timestamp(status, at_ms),
                 // Section 4.4: accumulated from item transitions only.
@@ -759,6 +916,11 @@ impl CodexReducer {
             self.bindings
                 .bind_turn(&self.mint, &self.runtime_id, &raw_turn, &session_id);
         let status = turn_status(&raw_status, SurfacePurpose::TurnNotificationStatus)?;
+        let origin = self
+            .turn_origins
+            .entry(turn_id.clone())
+            .or_insert_with(|| self.config.turn_origin.clone())
+            .clone();
         let error = if status == TurnStatus::Failed {
             Some(CanonicalError {
                 code: ErrorCode::UpstreamRejected,
@@ -779,7 +941,7 @@ impl CodexReducer {
                 id: turn_id,
                 session_id: session_id.clone(),
                 status,
-                origin: self.config.turn_origin.clone(),
+                origin,
                 started_at_ms: started_at.map(seconds_to_millis),
                 completed_at_ms: completed_at
                     .map(seconds_to_millis)
@@ -1504,5 +1666,85 @@ fn terminal_timestamp(status: TurnStatus, at_ms: i64) -> Option<i64> {
         Some(at_ms)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::panic)]
+
+    use super::*;
+
+    #[test]
+    fn later_runtime_acceptance_keeps_the_first_control_evidence() {
+        let mut reducer = CodexReducer::new(ReducerConfig {
+            host_display_name: "control-test-host".to_owned(),
+            host_platform: HostPlatform::Windows,
+            project_display_name: "control-test-project".to_owned(),
+            identity_salt: "control-test-salt".to_owned(),
+            evidence: EvidenceSource::ObservedInTraffic,
+            launch_surface: LaunchSurface::BrokerLaunched,
+            turn_origin: TurnOrigin::LocalSurface,
+            base_at_ms: 100,
+            runtime_version_label: None,
+        });
+        let session_id = SessionId::new("ses_control_test");
+        reducer.session_id = Some(session_id.clone());
+        reducer.session = Some(Session {
+            id: session_id,
+            project_id: reducer.project_id.clone(),
+            project_binding_id: reducer.project_binding_id.clone(),
+            ownership: OwnershipMode::BrokerManaged,
+            history_source: HistorySource {
+                kind: HistorySourceKind::BrokerLog,
+                runtime_id: Some(reducer.runtime_id.clone()),
+                evidence: reducer.evidence(100),
+            },
+            live_binding: LiveBinding::Observing {
+                runtime_id: reducer.runtime_id.clone(),
+                since_at_ms: 100,
+                evidence: reducer.evidence(100),
+            },
+            status: SessionStatus::Idle,
+            title: None,
+            created_at_ms: 100,
+            updated_at_ms: 100,
+            last_activity_at_ms: 100,
+            active_turn_id: None,
+            queue_depth: 0,
+            open_attention_count: 0,
+            archived: false,
+            binding_handle: None,
+        });
+
+        let first = reducer
+            .runtime_acceptance_effects(CommandId::new("cmd_first"), 200)
+            .unwrap_or_else(|error| panic!("first acceptance failed: {error}"));
+        assert!(first
+            .iter()
+            .any(|effect| matches!(effect, StateEffect::SessionUpserted { .. })));
+
+        let second = reducer
+            .runtime_acceptance_effects(CommandId::new("cmd_second"), 300)
+            .unwrap_or_else(|error| panic!("second acceptance failed: {error}"));
+        assert_eq!(second.len(), 1);
+        assert!(matches!(
+            second.first(),
+            Some(StateEffect::CommandAcknowledged { .. })
+        ));
+        let Some(session) = reducer.session.as_ref() else {
+            panic!("the session must remain bound");
+        };
+        assert!(matches!(
+            session.live_binding,
+            LiveBinding::Controlling {
+                since_at_ms: 100,
+                evidence: CapabilityEvidence {
+                    observed_at_ms: 200,
+                    ..
+                },
+                ..
+            }
+        ));
     }
 }

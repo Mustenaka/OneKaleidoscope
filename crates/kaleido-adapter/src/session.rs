@@ -9,7 +9,7 @@ use kaleido_proto::attention::AttentionResponse;
 use kaleido_proto::content::ContentRef;
 use kaleido_proto::effect::StateEffect;
 use kaleido_proto::host::ConnectionFaultReason;
-use kaleido_proto::ids::{ProjectBindingId, ProjectId, ProviderRuntimeId};
+use kaleido_proto::ids::{CommandId, ProjectBindingId, ProjectId, ProviderRuntimeId};
 use kaleido_proto::ContractViolation;
 use thiserror::Error;
 
@@ -39,6 +39,7 @@ pub trait ProviderRuntimeSession {
     /// Sends a prompt whose body is already stored.
     fn submit_prompt(
         &mut self,
+        command_id: &CommandId,
         body: &ContentRef,
         content: &mut dyn ContentAccess,
     ) -> Result<Vec<StateEffect>, RuntimeSessionError>;

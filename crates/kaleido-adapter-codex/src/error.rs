@@ -46,6 +46,9 @@ pub enum CodexAdapterError {
     #[error("upstream referenced a {scope} this adapter never bound")]
     UnknownBinding { scope: &'static str },
 
+    #[error("runtime acceptance could not be tied to the current live session")]
+    ControlEvidenceUnavailable,
+
     #[error(transparent)]
     Content(#[from] ContentAccessError),
 

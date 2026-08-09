@@ -12,10 +12,11 @@ use kaleido_adapter_codex::transcript::Direction;
 use kaleido_adapter_codex::{CodexReducer, ReducerConfig, SurfacePurpose, TranscriptFrame};
 use kaleido_proto::attention::{AttentionState, AttentionSubject, JoinFailureReason, JoinState};
 use kaleido_proto::capability::{Capability, CapabilityState, EvidenceSource};
+use kaleido_proto::command::CommandOutcome;
 use kaleido_proto::effect::{DiagnosticCode, StateEffect};
 use kaleido_proto::error::ErrorCode;
 use kaleido_proto::host::{ConnectionFaultReason, ConnectionState, HostPlatform, LaunchSurface};
-use kaleido_proto::ids::ItemId;
+use kaleido_proto::ids::{CommandId, ItemId, ProviderBindingKind};
 use kaleido_proto::session::{LiveBinding, LiveUnboundReason, SessionStatus};
 use kaleido_proto::turn::{ItemBody, ItemStatus, MessagePhase, TurnOrigin, TurnStatus};
 use serde_json::Value;
@@ -202,6 +203,259 @@ fn observed_traffic_proves_the_live_binding_and_its_capability_evidence() {
     assert_eq!(
         live_observe.evidence.source,
         EvidenceSource::ObservedInTraffic
+    );
+    assert_eq!(
+        capabilities
+            .expect("live traffic publishes capabilities")
+            .state_of(&Capability::LiveControl),
+        CapabilityState::NotVerified,
+        "an observed response without a local command correlation is not control proof"
+    );
+    assert!(effects.iter().all(|effect| !matches!(
+        effect,
+        StateEffect::CommandAcknowledged {
+            ack: kaleido_proto::command::CommandAck {
+                outcome: CommandOutcome::AcceptedByRuntime { .. },
+                ..
+            }
+        } | StateEffect::SessionUpserted {
+            session: kaleido_proto::session::Session {
+                live_binding: LiveBinding::Controlling { .. },
+                ..
+            }
+        }
+    )));
+}
+
+#[test]
+fn a_correlated_live_turn_response_proves_control_in_store_safe_order() {
+    let transcript = load_transcript("01-simple-turn.jsonl");
+    let mut reducer = live_reducer();
+    let mut content = MemoryContent::default();
+    let mut effects = Vec::new();
+
+    // The first six frames are the real handshake. The seventh is the recorded
+    // client turn/start with request id 3; correlation is registered before it
+    // is ingested, just as the live runtime does before writing the request.
+    for frame in transcript.frames().iter().take(6) {
+        effects.extend(
+            reducer
+                .ingest_frame(frame, &mut content)
+                .expect("the recorded handshake must reduce"),
+        );
+    }
+    let command_id = CommandId::new("cmd_fixture_prompt");
+    assert!(reducer.register_local_turn_start(3, &command_id));
+    for frame in transcript.frames().iter().skip(6) {
+        effects.extend(
+            reducer
+                .ingest_frame(frame, &mut content)
+                .expect("the recorded turn must reduce"),
+        );
+    }
+
+    let capability_index = effects
+        .iter()
+        .position(|effect| {
+            matches!(
+                effect,
+                StateEffect::CapabilitiesUpdated { capabilities }
+                    if capabilities.state_of(&Capability::LiveControl)
+                        == CapabilityState::Supported
+            )
+        })
+        .expect("the matching response must prove live control");
+    let ack_index = effects
+        .iter()
+        .position(|effect| {
+            matches!(
+                effect,
+                StateEffect::CommandAcknowledged { ack }
+                    if ack.command_id == command_id
+                        && matches!(ack.outcome, CommandOutcome::AcceptedByRuntime { .. })
+            )
+        })
+        .expect("the matching response must acknowledge the command");
+    let controlling_index = effects
+        .iter()
+        .position(|effect| {
+            matches!(
+                effect,
+                StateEffect::SessionUpserted { session }
+                    if matches!(
+                        session.live_binding,
+                        LiveBinding::Controlling {
+                            evidence: kaleido_proto::capability::CapabilityEvidence {
+                                source: EvidenceSource::ObservedInTraffic,
+                                ..
+                            },
+                            ..
+                        }
+                    )
+            )
+        })
+        .expect("the matching response must promote the session");
+    assert!(
+        ack_index < capability_index && capability_index < controlling_index,
+        "runtime ack, live-control capability and controlling binding must be store-safe ordered"
+    );
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        StateEffect::CommandAcknowledged { ack }
+            if ack.command_id == command_id
+                && matches!(
+                    &ack.outcome,
+                    CommandOutcome::AcceptedByRuntime { binding_handle }
+                        if binding_handle.kind == ProviderBindingKind::RuntimeAcknowledgement
+                            && binding_handle.runtime_id == *reducer.runtime_id()
+                )
+    )));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        StateEffect::TurnUpserted { turn }
+            if matches!(
+                &turn.origin,
+                TurnOrigin::RemoteCommand { command_id: origin_command_id }
+                    if origin_command_id == &command_id
+            )
+    )));
+    assert!(
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                StateEffect::TurnUpserted { turn } => Some(&turn.origin),
+                _ => None,
+            })
+            .all(|origin| matches!(
+                origin,
+                TurnOrigin::RemoteCommand { command_id: origin_command_id }
+                    if origin_command_id == &command_id
+            )),
+        "later turn notifications must preserve the correlated command origin"
+    );
+    let capabilities = reducer.capability_probe().to_capabilities();
+    assert_eq!(
+        capabilities.state_of(&Capability::LiveControl),
+        CapabilityState::Supported
+    );
+    assert_eq!(
+        capabilities.state_of(&Capability::TurnSteer),
+        CapabilityState::NotVerified
+    );
+}
+
+#[test]
+fn an_outgoing_turn_without_its_response_never_proves_control() {
+    let transcript = load_transcript("01-simple-turn.jsonl");
+    let mut reducer = live_reducer();
+    let mut content = MemoryContent::default();
+
+    for frame in transcript.frames().iter().take(6) {
+        reducer
+            .ingest_frame(frame, &mut content)
+            .expect("the recorded handshake must reduce");
+    }
+    let command_id = CommandId::new("cmd_without_response");
+    assert!(reducer.register_local_turn_start(3, &command_id));
+    let effects = reducer
+        .ingest_frame(
+            transcript
+                .frames()
+                .get(6)
+                .expect("the recorded outgoing turn exists"),
+            &mut content,
+        )
+        .expect("the outgoing frame must reduce");
+
+    assert!(effects.iter().all(|effect| !matches!(
+        effect,
+        StateEffect::CommandAcknowledged { .. }
+            | StateEffect::SessionUpserted {
+                session: kaleido_proto::session::Session {
+                    live_binding: LiveBinding::Controlling { .. },
+                    ..
+                }
+            }
+    )));
+    assert_eq!(
+        reducer
+            .capability_probe()
+            .to_capabilities()
+            .state_of(&Capability::LiveControl),
+        CapabilityState::NotVerified
+    );
+}
+
+#[test]
+fn a_live_response_for_another_request_never_proves_control() {
+    let transcript = load_transcript("01-simple-turn.jsonl");
+    let mut reducer = live_reducer();
+    let mut content = MemoryContent::default();
+    let mut effects = Vec::new();
+
+    for frame in transcript.frames().iter().take(6) {
+        effects.extend(
+            reducer
+                .ingest_frame(frame, &mut content)
+                .expect("the recorded handshake must reduce"),
+        );
+    }
+    let command_id = CommandId::new("cmd_wrong_request");
+    assert!(reducer.register_local_turn_start(99, &command_id));
+    for frame in transcript.frames().iter().skip(6) {
+        effects.extend(
+            reducer
+                .ingest_frame(frame, &mut content)
+                .expect("the recorded turn must reduce"),
+        );
+    }
+
+    assert!(effects.iter().all(|effect| !matches!(
+        effect,
+        StateEffect::CommandAcknowledged { .. }
+            | StateEffect::SessionUpserted {
+                session: kaleido_proto::session::Session {
+                    live_binding: LiveBinding::Controlling { .. },
+                    ..
+                }
+            }
+    )));
+    assert_eq!(
+        reducer
+            .capability_probe()
+            .to_capabilities()
+            .state_of(&Capability::LiveControl),
+        CapabilityState::NotVerified
+    );
+}
+
+#[test]
+fn replay_cannot_register_a_local_control_command() {
+    let transcript = load_transcript("01-simple-turn.jsonl");
+    let mut reducer = reducer();
+    let mut content = MemoryContent::default();
+    let command_id = CommandId::new("cmd_replayed_prompt");
+    assert!(!reducer.register_local_turn_start(3, &command_id));
+
+    let effects = reducer
+        .ingest(&transcript, &mut content)
+        .expect("the real recording must still replay");
+    assert!(effects.iter().all(|effect| !matches!(
+        effect,
+        StateEffect::CommandAcknowledged { .. }
+            | StateEffect::SessionUpserted {
+                session: kaleido_proto::session::Session {
+                    live_binding: LiveBinding::Controlling { .. },
+                    ..
+                }
+            }
+    )));
+    assert_eq!(
+        reducer
+            .capability_probe()
+            .to_capabilities()
+            .state_of(&Capability::LiveControl),
+        CapabilityState::NotVerified
     );
 }
 

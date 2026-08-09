@@ -18,7 +18,7 @@ use kaleido_proto::capability::{Capability, EvidenceSource};
 use kaleido_proto::content::{ContentAvailability, ContentKind, ContentRef, Sensitivity};
 use kaleido_proto::effect::StateEffect;
 use kaleido_proto::host::ConnectionFaultReason;
-use kaleido_proto::ids::ContentId;
+use kaleido_proto::ids::{CommandId, ContentId};
 use kaleido_proto::session::SessionStatus;
 
 #[derive(Debug, Default)]
@@ -107,6 +107,7 @@ impl ProviderRuntimeSession for StandInSession {
 
     fn submit_prompt(
         &mut self,
+        _command_id: &CommandId,
         _body: &ContentRef,
         _content: &mut dyn ContentAccess,
     ) -> Result<Vec<StateEffect>, RuntimeSessionError> {
@@ -177,8 +178,9 @@ fn a_session_can_be_driven_entirely_through_the_neutral_trait() {
 
     let effects = session.start(&start, &mut content).expect("start");
     assert_eq!(effects.len(), 1);
+    let command_id = CommandId::new("cmd_submit_prompt");
     assert!(session
-        .submit_prompt(&start.project_root_ref, &mut content)
+        .submit_prompt(&command_id, &start.project_root_ref, &mut content)
         .is_ok());
     assert!(session.drain_effects(&mut content).is_ok());
     assert!(!session.close().expect("close").is_empty());
@@ -206,9 +208,10 @@ fn a_lost_connection_is_reported_as_a_connection_fault() {
     let start = request(&mint, &mut content);
     session.start(&start, &mut content).expect("start");
     session.drop_connection();
+    let command_id = CommandId::new("cmd_submit_prompt");
 
     let error = session
-        .submit_prompt(&start.project_root_ref, &mut content)
+        .submit_prompt(&command_id, &start.project_root_ref, &mut content)
         .expect_err("a dead runtime must be reported");
     assert!(matches!(
         error,

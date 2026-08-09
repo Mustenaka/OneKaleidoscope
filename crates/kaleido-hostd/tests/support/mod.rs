@@ -207,6 +207,7 @@ impl ProviderRuntimeSession for FixtureRuntime {
 
     fn submit_prompt(
         &mut self,
+        command_id: &CommandId,
         body: &ContentRef,
         content: &mut dyn ContentAccess,
     ) -> Result<Vec<StateEffect>, RuntimeSessionError> {
@@ -215,7 +216,37 @@ impl ProviderRuntimeSession for FixtureRuntime {
         if content.load(body)?.is_empty() {
             return Err(protocol_violation());
         }
-        self.reduce_until(7, content)
+        let request_id = self
+            .wire_payloads
+            .get(self.next_frame)
+            .filter(|payload| {
+                payload.get("method").and_then(serde_json::Value::as_str) == Some("turn/start")
+            })
+            .and_then(|payload| payload.get("id"))
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(protocol_violation)?;
+        let response_end = self
+            .wire_payloads
+            .iter()
+            .enumerate()
+            .skip(self.next_frame + 1)
+            .find_map(|(index, payload)| {
+                (payload.get("id").and_then(serde_json::Value::as_i64) == Some(request_id)
+                    && payload.get("result").is_some())
+                .then_some(index + 1)
+            })
+            .ok_or_else(protocol_violation)?;
+        if !self
+            .reducer
+            .register_local_turn_start(request_id, command_id)
+        {
+            return Err(protocol_violation());
+        }
+        let reduced = self.reduce_until(response_end, content);
+        if reduced.is_err() {
+            self.reducer.cancel_local_turn_start(request_id);
+        }
+        reduced
     }
 
     fn respond_attention(
