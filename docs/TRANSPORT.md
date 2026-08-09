@@ -40,6 +40,19 @@ TRANSPORT 0.1 的 `max_frame_length` 固定为 65,545。双方必须先接受 `0
 上限不等或顺序错误均返回 `VersionMismatch`（若可安全编码）并关闭连接。任何业务 frame 在
 两次版本协商与设备认证完成前一律拒绝。R3 没有明文 fallback。
 
+R3 的资源上限固定为：全局最多 64 条 TCP/TLS 连接，其中同时处于 pre-auth 的最多 16 条、
+同一来源 IP 最多 4 条；认证后仍受每 DeviceId 2 条限制。TLS handshake 必须在 accept 后 5 秒
+内完成，两次 hello 各 5 秒，pair/challenge auth 整体 30 秒；每个 frame 的 prefix+body read 与
+每次 write 各 10 秒。认证连接 30 秒无业务时发送 ping，90 秒未收到任何合法 frame 则关闭。
+超出 pre-auth/global 限额或阶段 deadline 时，在尚不能安全编码错误的阶段直接关闭；已协商错误
+frame 且仍可写时返回 `RateLimited`。任何 timeout 都必须取消该连接的 pending request、未完成
+upload 与 subscription，不能让慢连接持有无界 task/buffer。
+
+Host TLS 私钥首次生成后持久保存：Unix 父目录 `0700`、key file `0600`；Windows DACL 只允许
+当前用户与 SYSTEM 且关闭继承。写入必须使用同目录临时文件、file fsync、原子 rename 与目录
+fsync（平台支持时）；私钥不得进入普通备份、日志或错误详情。文件缺失可首次生成，损坏/权限
+放宽必须 fail-loud，不能静默换 key；显式轮换会改变 SPKI pin，必须撤销旧 pairing 并重新配对。
+
 ## 2. Pairing bootstrap
 
 bootstrap 是一次性 QR/URI 载荷：
@@ -56,6 +69,23 @@ PairingBootstrap {
 
 endpoint 只允许 `host:port`，不得含用户名、query 或业务路径。secret 只在 bootstrap 明文中
 出现一次；host 只保存 SHA-256 digest，默认 5 分钟、原子单次消费。
+
+R3 的唯一 QR 文本编码是：
+
+```text
+onekaleidoscope://pair/v1?data=<base64url-no-pad(UTF-8 compact JSON)>
+```
+
+解码后的 JSON 最大 2,048 bytes，字段顺序固定为 `version`、`host_id`、`endpoint`、
+`host_public_key_pin`、`secret`、`expires_at_ms`；`version` 必须为整数 `1`，ID 直接编码为
+非空 String，`secret` 是恰好 32 bytes 的 base64url-no-pad（43 chars）。解析器拒绝未知/重复/
+缺失字段、`=` padding、非 canonical base64url、尾随数据和其他 scheme/host/path/query key。
+QR/URI 全文不得进入日志、剪贴板历史或普通 analytics。
+
+endpoint 的 grammar 固定为 DNS hostname/IPv4 后接 `:` 与十进制 `1..=65535` 端口，或
+`[IPv6-literal]:port`；IPv6 必须带方括号。禁止 userinfo、路径、query、fragment、空 host、
+前导 `+`、端口前导零、IPv6 zone ID 与非 ASCII hostname。连接成功后的 SPKI pin 才是 Host
+身份，endpoint 本身不参与授权。
 
 `host_public_key_pin` 的唯一合法编码是
 `sha256:` + `base64url-no-pad(SHA-256(DER SubjectPublicKeyInfo))`：前缀后恰好 43 个
@@ -79,6 +109,8 @@ PairResponse {
   host_id: HostId,
   transport_version: String,
   protocol_version: String,
+  connection_id: String,
+  session_expires_at_ms: i64,
 }
 ```
 
@@ -89,7 +121,8 @@ secret 错误、已过期、已使用或不存在，对 wire 一律只返回
 必须对收到的 secret 计算 SHA-256 后，与目录 digest 恒时比较。
 成功路径必须在返回 PairResponse 前，把 secret 单次消费与新 DeviceId/public key 目录记录作为
 同一持久事务提交并 fsync。PairResponse 发送后当前连接即认证为该 DeviceId，无需再走
-Challenge。host 内部可以分别记录安全计数，但日志不得包含 secret/digest。
+Challenge；`connection_id` 与 session expiry 遵循 §3。host 内部可以分别记录安全计数，
+但日志不得包含 secret/digest。
 
 ## 3. 重连认证
 
@@ -102,7 +135,8 @@ AuthAccepted      { request_id, connection_id: String, expires_at_ms }
 
 `challenge_id` 恰好 16 random bytes；`nonce` 恰好 32 random bytes。challenge 默认 30 秒
 到期、单次使用，成功或任一失败后立即从可用集合移除。`connection_id` 是 host 分配的非空
-opaque canonical ID；短期 session credential 只存在于内存，不写磁盘。
+opaque canonical ID；短期 session credential 只存在于内存，不写磁盘。PairResponse 与
+AuthAccepted 的 session lifetime 固定为 15 分钟。
 
 TLS channel binding 固定为 TLS exporter：label
 `EXPORTER-OneKaleidoscope-R3-DeviceAuth`、无 context、输出 32 bytes。签名 transcript 是以下
@@ -125,6 +159,16 @@ i64be(expires_at_ms)
 Keystore P-256 private key 对完整 transcript 做 ECDSA-SHA256，`signature_der` 必须是严格 DER；
 host 用目录中该 DeviceId 的 SPKI 验证。字段替换、TLS 连接变化、nonce/challenge 重放、错误
 key 与已吊销 DeviceId 都不得认证成功。
+
+ChallengeRequest 中未知或已吊销的 DeviceId、错误设备公钥/签名，对 pre-auth wire 一律返回
+`AuthenticationFailed` 并使用同一限速/外部时序；不得暴露设备目录。`ChallengeExpired` 与
+`ChallengeReplayed` 只可用于当前 TLS 连接上确实签发过的 challenge。`DeviceRevoked` 只用于
+已经认证的连接收到 durable-first 吊销通知。
+
+session 到达 `session_expires_at_ms` 后，host 必须先停止接收新业务 frame，终止未提交请求与
+subscription，发送 `AuthenticationFailed { retriable = true }`（若可安全写入），随后 TLS
+`close_notify` 并关闭；TRANSPORT 0.1 不支持连接内 re-auth。已经进入 canonical durable write
+path 的命令不回滚。客户端必须新建 TLS 连接并重新 challenge，不能延长旧 expiry。
 
 ## 4. Frame
 
@@ -188,7 +232,8 @@ TransportError
 ```
 
 `request_id` 和 `subscription_id` 必须非零，在一条连接的每个发送方向由请求方单调分配且不得复用；响应
-逐字回显 request ID，projection push 逐字回显 subscription ID。未知 control `kind`、响应 ID
+逐字回显 request ID，projection push 逐字回显 subscription ID。任一计数器到 `u64::MAX` 后，
+发送方必须在需要下一 ID 前正常关闭并新建连接；不得 wrap、归零或复用。未知 control `kind`、响应 ID
 错配、subscription ID 冲突或已 unsubscribe 后继续 push 都是 `MalformedFrame` 并关闭连接。
 
 ContentWrite 的 `ContentWriteRequest { content_kind, byte_len, digest }` 是 JSON 控制头；正文

@@ -861,6 +861,25 @@ fn device_command_request_cannot_claim_trusted_envelope_fields() {
         ..first.clone()
     };
     assert_ne!(first.dedupe_key(), second.dedupe_key());
+    let separator_collision_left = CommandEnvelope {
+        actor: Actor::Human {
+            device_id: DeviceId::new("a"),
+        },
+        idempotency_key: "b|c".to_owned(),
+        ..first.clone()
+    };
+    let separator_collision_right = CommandEnvelope {
+        actor: Actor::Human {
+            device_id: DeviceId::new("a|b"),
+        },
+        idempotency_key: "c".to_owned(),
+        ..first.clone()
+    };
+    assert_ne!(
+        separator_collision_left.dedupe_key(),
+        separator_collision_right.dedupe_key(),
+        "typed length prefixes must keep arbitrary UTF-8 actor IDs and keys injective"
+    );
     assert_eq!(
         CommandEnvelope {
             actor: Actor::Human {
@@ -1794,15 +1813,23 @@ fn projection_subscribe_decision_covers_resume_current_ahead_floor_and_overflow(
             head: 10
         })
     );
-    assert_eq!(
-        decide_projection_subscription(
-            &request(Some(Cursor { seq: u64::MAX })),
-            Cursor { seq: u64::MAX },
-            Cursor { seq: u64::MAX },
-            NOW
-        ),
-        Err(ContractViolation::CursorOverflow)
-    );
+    let overflow = decide_projection_subscription(
+        &request(Some(Cursor { seq: u64::MAX })),
+        Cursor { seq: u64::MAX },
+        Cursor { seq: u64::MAX },
+        NOW,
+    )
+    .expect("cursor overflow is a structured wire rejection");
+    assert!(matches!(
+        overflow.outcome,
+        ProjectionSubscribeOutcome::Rejected {
+            error: CanonicalError {
+                code: ErrorCode::CursorGap,
+                retriable: true,
+                ..
+            }
+        }
+    ));
 
     let mut cross_key = decide_projection_subscription(&request(None), floor, head, NOW)
         .expect("valid acknowledgement");
@@ -1842,6 +1869,19 @@ fn projection_subscribe_decision_covers_resume_current_ahead_floor_and_overflow(
         }
         .validate_for(&request(None)),
         Err(ContractViolation::ProjectionResumeWithoutCursor)
+    );
+    assert_eq!(
+        ProjectionSubscribeAck {
+            key: key.clone(),
+            outcome: ProjectionSubscribeOutcome::CurrentFollows {
+                current_cursor: Cursor { seq: 5 }
+            }
+        }
+        .validate_for(&request(Some(Cursor { seq: 10 }))),
+        Err(ContractViolation::ProjectionCurrentCursorNotAhead {
+            since: 10,
+            current: 5
+        })
     );
 }
 

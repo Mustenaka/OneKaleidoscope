@@ -627,7 +627,16 @@ impl ProjectionSubscribeAck {
                 }
             }
             ProjectionSubscribeOutcome::Rejected { error } => error.validate()?,
-            ProjectionSubscribeOutcome::CurrentFollows { .. } => {}
+            ProjectionSubscribeOutcome::CurrentFollows { current_cursor } => {
+                if let Some(since) = request.since {
+                    if current_cursor.seq <= since.seq {
+                        return Err(ContractViolation::ProjectionCurrentCursorNotAhead {
+                            since: since.seq,
+                            current: current_cursor.seq,
+                        });
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -665,16 +674,23 @@ pub fn decide_projection_subscription(
                 at_ms,
             },
         },
-        Some(since) => {
-            let next = since.next()?;
-            if next.seq < retained_floor.seq {
+        Some(since) => match since.next() {
+            Err(ContractViolation::CursorOverflow) => ProjectionSubscribeOutcome::Rejected {
+                error: CanonicalError {
+                    code: ErrorCode::CursorGap,
+                    retriable: true,
+                    detail_ref: None,
+                    at_ms,
+                },
+            },
+            Err(other) => return Err(other),
+            Ok(next) if next.seq < retained_floor.seq => {
                 ProjectionSubscribeOutcome::CurrentFollows {
                     current_cursor: current_head,
                 }
-            } else {
-                ProjectionSubscribeOutcome::Resumed { from_cursor: next }
             }
-        }
+            Ok(next) => ProjectionSubscribeOutcome::Resumed { from_cursor: next },
+        },
     };
 
     Ok(ProjectionSubscribeAck {

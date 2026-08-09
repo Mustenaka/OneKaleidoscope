@@ -1133,6 +1133,15 @@ Command =
 transport 目录元数据，不得进入 Actor、授权判断或幂等域。内部 Broker/Workflow 仍可直接
 构造受信 `CommandEnvelope`，但该入口不得暴露成 mobile business frame。
 
+实现若把幂等域编码成存储键，必须对 actor kind、ID 与 key 使用具备长度边界的无歧义编码；
+不得用裸分隔符拼接任意 UTF-8 字符串。请求摘要必须覆盖完整 `Command` 与 `ttl_ms`，不能只
+比较 key。
+
+本实现的 idempotency side table 使用带 `format_version = 2` 的 JSONL record，保存上述无歧义
+键的 SHA-256 与 canonical `CommandId`。v0.2 的无版本、裸空格分隔记录必须在 store load 时
+`MalformedRecord` fail-loud；不得因新旧键摘要不命中而把旧命令再次下发 runtime。T-107 在
+加入请求摘要/outbox 时只能继续显式升版或事务迁移，不能启发式接受未知格式。
+
 ### 6.1 确认
 
 ```

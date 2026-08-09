@@ -276,6 +276,11 @@ pub enum ContractViolation {
     #[error("projection resume cursor mismatch: expected {expected}, found {found}")]
     ProjectionResumeCursorMismatch { expected: u64, found: u64 },
 
+    #[error(
+        "projection current cursor must advance the requested cursor: since {since}, current {current}"
+    )]
+    ProjectionCurrentCursorNotAhead { since: u64, current: u64 },
+
     #[error("projection retention window is inverted: floor {floor}, head {head}")]
     InvalidProjectionCursorWindow { floor: u64, head: u64 },
 

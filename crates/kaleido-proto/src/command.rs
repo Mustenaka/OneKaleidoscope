@@ -200,11 +200,19 @@ impl CommandEnvelope {
     /// The idempotency scope key. Two envelopes sharing it are the same command.
     pub fn dedupe_key(&self) -> String {
         let actor = match &self.actor {
-            Actor::Human { device_id } => format!("human:{device_id}"),
-            Actor::Workflow { workflow_id } => format!("workflow:{workflow_id}"),
-            Actor::Broker => "broker".to_owned(),
+            Actor::Human { device_id } => {
+                format!("human:{}:{}", device_id.as_str().len(), device_id)
+            }
+            Actor::Workflow { workflow_id } => {
+                format!("workflow:{}:{}", workflow_id.as_str().len(), workflow_id)
+            }
+            Actor::Broker => "broker:0:".to_owned(),
         };
-        format!("{actor}|{}", self.idempotency_key)
+        format!(
+            "{actor}|key:{}:{}",
+            self.idempotency_key.len(),
+            self.idempotency_key
+        )
     }
 
     pub fn validate(&self) -> Result<(), ContractViolation> {

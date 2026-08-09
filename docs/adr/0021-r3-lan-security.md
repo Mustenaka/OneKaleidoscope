@@ -38,6 +38,10 @@ Host public-key pin、256-bit 随机 secret 与 expiry。
 
 手机必须先验证 Host pin，之后才发送 pairing secret，防止把 secret 交给中间人。
 
+QR 互操作编码固定为
+`onekaleidoscope://pair/v1?data=<base64url-no-pad(compact JSON)>`；JSON、endpoint grammar、
+大小和拒绝规则由 `TRANSPORT.md` §2 逐字定义，hostd 与 Android 不得各自发明扫码格式。
+
 Host pin 的 wire 形状固定为
 `sha256:` + `base64url-no-pad(SHA-256(DER SubjectPublicKeyInfo))`。它 pin 的是 TLS 证书里的
 SPKI，不是整张证书、证书链或主机名。客户端从握手证书提取 DER SPKI、计算 32-byte digest，
@@ -62,8 +66,10 @@ byte length + UTF-8 bytes。其后依次拼接 TLS exporter 32 bytes、challenge
 nonce 32 raw bytes、`expires_at_ms` 的 `i64` big-endian。任一变长字段超过 `u16::MAX`、ID
 为空或固定长度不符都在验签前拒绝。设备使用 P-256 ECDSA-SHA256，wire signature 为严格 DER。
 
-nonce/challenge 单次、短时；签名重放、错误 key、已吊销 DeviceId 均拒绝。认证成功后的
-短期 session credential 只在内存存在。
+nonce/challenge 单次、短时；签名重放、错误 key、已吊销 DeviceId 均拒绝。配对成功和
+challenge 成功都只授予 15 分钟内存 session；到期关闭业务与连接，0.1 不做连接内续期。
+未知/已吊销设备与错误 key 在 pre-auth wire 统一为 `AuthenticationFailed`；`DeviceRevoked`
+只通知已经认证且随后被 durable-first 吊销的连接，避免设备目录 oracle。
 
 吊销只允许本机 hostd 管理命令或受信本地 API 发起，不开放 LAN 自助入口。host 必须先原子
 持久化并 fsync `revoked_at_ms`，再向该 DeviceId 的连接发送 `DeviceRevoked`（若连接仍可安全
@@ -75,10 +81,13 @@ nonce/challenge 单次、短时；签名重放、错误 key、已吊销 DeviceId
 - JSON 控制正文最大 64 KiB；ContentWrite 单次正文最大 64 KiB；frame 另有 1-byte kind，
   content frame 另有 8-byte request ID；
 - 长度前缀在分配前 checked，零长、超限、截断和未知 frame kind fail-closed；
-- 每设备连接、订阅和并发请求有固定上限；
+- 全局、pre-auth、每来源 IP、每设备连接、订阅和并发请求都有固定上限与阶段 deadline；
 - 慢订阅者不能让 Broker 丢 projection，发生 lag 时以 CursorGap 断开；
 - 所有 request/response 有 correlation ID，但日志只记录安全的 canonical DeviceId、错误码、
   计数和时间，不记录 body、secret、签名或完整 endpoint/path。
+
+Host TLS 私钥必须 owner-only、原子持久化；损坏或权限放宽 fail-loud，不能静默换 key。精确
+数值、Unix/Windows 权限与 timeout 见 `TRANSPORT.md` §1。
 
 ### D-5 R4 复用边界
 

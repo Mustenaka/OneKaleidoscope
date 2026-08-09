@@ -23,6 +23,7 @@ use kaleido_proto::ids::{
 };
 use kaleido_proto::projection::{ProjectionKey, ProjectionPayload, PROJECTION_VERSION};
 use kaleido_proto::queue::{QueueEntry, QueueIntent, QueueState};
+use serde::{Deserialize, Serialize};
 
 use crate::content::{hex_digest, ContentStore};
 use crate::error::StateError;
@@ -34,8 +35,17 @@ use crate::state::CanonicalState;
 ///
 /// This is store bookkeeping rather than canonical state, so it is not a
 /// `LogRecord`. Only the digest of the `(actor, key)` pair is written, so a
-/// device label never lands on disk.
+/// device identifier never lands on disk.
 const IDEMPOTENCY_FILE: &str = "idempotency.jsonl";
+const IDEMPOTENCY_FORMAT_VERSION: u32 = 2;
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdempotencyRecord {
+    format_version: u32,
+    key_digest: String,
+    command_id: CommandId,
+}
 
 /// Where append timestamps come from.
 #[derive(Debug, Clone, Copy)]
@@ -584,7 +594,12 @@ impl CanonicalStore {
     fn record_idempotency(&mut self, key: &str, command_id: &CommandId) -> Result<(), StateError> {
         self.idempotency.insert(key.to_owned(), command_id.clone());
         let path = self.idempotency_path();
-        let line = format!("{key} {}\n", command_id.as_str());
+        let record = IdempotencyRecord {
+            format_version: IDEMPOTENCY_FORMAT_VERSION,
+            key_digest: key.to_owned(),
+            command_id: command_id.clone(),
+        };
+        let line = format!("{}\n", serde_json::to_string(&record)?);
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -610,14 +625,36 @@ impl CanonicalStore {
             if line.trim().is_empty() {
                 continue;
             }
-            let mut parts = line.splitn(2, ' ');
-            let (Some(key), Some(command_id)) = (parts.next(), parts.next()) else {
+            let record = serde_json::from_str::<IdempotencyRecord>(&line).map_err(|_| {
+                StateError::MalformedRecord {
+                    path: path.clone(),
+                    line: index + 1,
+                }
+            })?;
+            let digest_is_valid = record.key_digest.len() == 64
+                && record
+                    .key_digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
+            // #[allow(kaleido::version_branch)] reason: durable side-table format validation must reject incompatible on-disk records before replay
+            if record.format_version != IDEMPOTENCY_FORMAT_VERSION
+                || !digest_is_valid
+                || record.command_id.is_empty()
+            {
                 return Err(StateError::MalformedRecord {
                     path: path.clone(),
                     line: index + 1,
                 });
-            };
-            table.insert(key.to_owned(), CommandId::new(command_id));
+            }
+            if table
+                .insert(record.key_digest, record.command_id.clone())
+                .is_some_and(|existing| existing != record.command_id)
+            {
+                return Err(StateError::MalformedRecord {
+                    path: path.clone(),
+                    line: index + 1,
+                });
+            }
         }
         Ok(table)
     }
