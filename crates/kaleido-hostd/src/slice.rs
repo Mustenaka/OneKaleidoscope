@@ -493,7 +493,7 @@ fn answer_first_approval(
     if let Some(session_id) = &response.session_id {
         store.session_snapshot(session_id)?;
     }
-    let effects = runtime.respond_attention(&response, access)?;
+    let effects = runtime.respond_attention(&envelope.command_id, &response, access)?;
     apply_live_effects(store, &effects, evidence)?;
     Ok(true)
 }

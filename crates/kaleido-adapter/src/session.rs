@@ -44,9 +44,12 @@ pub trait ProviderRuntimeSession {
         content: &mut dyn ContentAccess,
     ) -> Result<Vec<StateEffect>, RuntimeSessionError>;
 
-    /// Answers an open approval or question.
+    /// Answers an open approval or question on behalf of a real broker
+    /// command. The command identifier lets an adapter distinguish this send
+    /// from an answer merely observed on a shared runtime.
     fn respond_attention(
         &mut self,
+        command_id: &CommandId,
         response: &AttentionResponse,
         content: &mut dyn ContentAccess,
     ) -> Result<Vec<StateEffect>, RuntimeSessionError>;

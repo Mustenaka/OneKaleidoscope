@@ -23,8 +23,9 @@ use kaleido_adapter::capability::CapabilityProbe;
 use kaleido_adapter::content::ContentAccess;
 use kaleido_adapter::IdentityMint;
 use kaleido_proto::attention::{
-    ApprovalRequest, AttentionItem, AttentionState, AttentionSubject, DecisionOption,
-    DecisionSemantics, JoinFailureReason, JoinState,
+    ApprovalRequest, AttentionAnswerEvidence, AttentionAnswerEvidenceSource, AttentionAnswerSource,
+    AttentionItem, AttentionState, AttentionSubject, DecisionOption, DecisionSemantics,
+    JoinFailureReason, JoinState,
 };
 use kaleido_proto::capability::{Capability, CapabilityEvidence, EvidenceSource};
 use kaleido_proto::command::{CommandAck, CommandOutcome};
@@ -90,6 +91,13 @@ struct PendingApproval {
     raw_item_id: String,
 }
 
+/// A broker command registered for one specific upstream approval reply.
+#[derive(Debug, Clone)]
+struct PendingLocalAnswer {
+    command_id: CommandId,
+    option_id: String,
+}
+
 /// Reduces Codex app-server frames to canonical state transitions.
 #[derive(Debug)]
 pub struct CodexReducer {
@@ -114,7 +122,8 @@ pub struct CodexReducer {
     attention: BTreeMap<AttentionId, AttentionItem>,
     attention_by_raw_item: BTreeMap<String, Vec<AttentionId>>,
     diagnostics: BTreeMap<String, DiagnosticRecord>,
-    suppressed_attention_upserts: BTreeSet<AttentionId>,
+    pending_local_answers: BTreeMap<AttentionId, PendingLocalAnswer>,
+    locally_answered_attention: BTreeSet<AttentionId>,
     probe: CapabilityProbe,
     published_capabilities: Vec<Capability>,
     exercised: BTreeSet<SurfacePurpose>,
@@ -152,7 +161,8 @@ impl CodexReducer {
             attention: BTreeMap::new(),
             attention_by_raw_item: BTreeMap::new(),
             diagnostics: BTreeMap::new(),
-            suppressed_attention_upserts: BTreeSet::new(),
+            pending_local_answers: BTreeMap::new(),
+            locally_answered_attention: BTreeSet::new(),
             probe,
             published_capabilities: Vec::new(),
             exercised: BTreeSet::new(),
@@ -200,6 +210,37 @@ impl CodexReducer {
             .find_map(|(request_id, pending)| {
                 (&pending.attention_id == attention_id).then_some(*request_id)
             })
+    }
+
+    /// Associates one outgoing wire reply with the real broker command that
+    /// caused it. Live traffic without this per-attention association is an
+    /// externally observed answer, not a local command echo.
+    pub fn register_local_attention_answer(
+        &mut self,
+        attention_id: &AttentionId,
+        command_id: &CommandId,
+        option_id: &str,
+    ) -> bool {
+        if command_id.is_empty()
+            || option_id.is_empty()
+            || self.approval_request_id(attention_id).is_none()
+            || self.pending_local_answers.contains_key(attention_id)
+        {
+            return false;
+        }
+        self.pending_local_answers.insert(
+            attention_id.clone(),
+            PendingLocalAnswer {
+                command_id: command_id.clone(),
+                option_id: option_id.to_owned(),
+            },
+        );
+        true
+    }
+
+    /// Rolls back an association when the corresponding wire send fails.
+    pub(crate) fn forget_local_attention_answer(&mut self, attention_id: &AttentionId) {
+        self.pending_local_answers.remove(attention_id);
     }
 
     pub fn capability_probe(&self) -> CapabilityProbe {
@@ -491,7 +532,7 @@ impl CodexReducer {
                 };
             }
             let updated = entry.clone();
-            if !self.suppressed_attention_upserts.contains(&attention_id) {
+            if !self.locally_answered_attention.contains(&attention_id) {
                 effects.push(StateEffect::AttentionUpserted { item: updated });
             }
             effects.push(self.record_diagnostic(
@@ -1366,34 +1407,58 @@ impl CodexReducer {
             });
         }
         let attention_id = pending.attention_id.clone();
+        let local_answer = self.pending_local_answers.remove(&attention_id);
+        if let Some(local_answer) = &local_answer {
+            if local_answer.option_id != decision {
+                return Err(CodexAdapterError::LocalAttentionAnswerMismatch);
+            }
+        }
+        let answer_source = match &local_answer {
+            Some(local_answer) => AttentionAnswerSource::LocalCommand {
+                command_id: local_answer.command_id.clone(),
+            },
+            None => AttentionAnswerSource::ObservedExternal {
+                evidence: AttentionAnswerEvidence {
+                    observer_host_id: self.host_id.clone(),
+                    observed_at_ms: at_ms,
+                    source: self.external_answer_evidence_source()?,
+                },
+            },
+        };
         let Some(entry) = self.attention.get_mut(&attention_id) else {
             return Ok(Vec::new());
         };
-        // A decision recorded in the transcript did not travel as a broker
-        // command, so the identifier stands for the observed decision itself.
-        let command_id = self
-            .mint
-            .command_id(&format!("{}|{decision}", pending.attention_id));
         entry.state = AttentionState::Answered {
             option_id: Some(decision),
             free_form_ref: None,
             decided_at_ms: at_ms,
-            command_id,
+            answer_source,
         };
         let updated = entry.clone();
         updated.validate()?;
         let _ = content;
         let _ = pending.raw_item_id;
-        if self.config.evidence == EvidenceSource::ObservedInTraffic {
-            // The store already answered this entry with the real local
-            // command ID before the wire reply was sent. The reducer still
-            // records and validates the observed response privately, but it
-            // must never overwrite that state with the replay-only synthetic
-            // command ID, now or during a later join refresh.
-            self.suppressed_attention_upserts.insert(attention_id);
+        if local_answer.is_some() {
+            // The store already recorded the real LocalCommand answer before
+            // this associated wire reply was sent. Keep reducing and
+            // validating it, but never publish a second answer or a later join
+            // refresh from the reducer's private copy.
+            self.locally_answered_attention.insert(attention_id);
             Ok(Vec::new())
         } else {
             Ok(vec![StateEffect::AttentionUpserted { item: updated }])
+        }
+    }
+
+    fn external_answer_evidence_source(
+        &self,
+    ) -> Result<AttentionAnswerEvidenceSource, CodexAdapterError> {
+        match self.config.evidence {
+            EvidenceSource::ObservedInTraffic => {
+                Ok(AttentionAnswerEvidenceSource::ObservedInTraffic)
+            }
+            EvidenceSource::RecordedFixture => Ok(AttentionAnswerEvidenceSource::RecordedFixture),
+            _ => Err(CodexAdapterError::InvalidExternalAnswerEvidence),
         }
     }
 
@@ -1456,7 +1521,7 @@ impl CodexReducer {
             }
             let updated = entry.clone();
             updated.validate()?;
-            if !self.suppressed_attention_upserts.contains(&attention_id) {
+            if !self.locally_answered_attention.contains(&attention_id) {
                 effects.push(StateEffect::AttentionUpserted { item: updated });
             }
         }

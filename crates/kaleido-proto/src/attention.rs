@@ -59,7 +59,7 @@ pub enum AttentionState {
         option_id: Option<String>,
         free_form_ref: Option<ContentRef>,
         decided_at_ms: i64,
-        command_id: CommandId,
+        answer_source: AttentionAnswerSource,
     },
     Expired {
         at_ms: i64,
@@ -70,6 +70,34 @@ pub enum AttentionState {
     Cancelled {
         at_ms: i64,
     },
+}
+
+/// Whether an answer came from an actual broker command or was observed from
+/// another client on the provider's structured protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AttentionAnswerSource {
+    LocalCommand { command_id: CommandId },
+    ObservedExternal { evidence: AttentionAnswerEvidence },
+}
+
+/// Auditable facts attached to an externally observed answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct AttentionAnswerEvidence {
+    pub observer_host_id: HostId,
+    pub observed_at_ms: i64,
+    pub source: AttentionAnswerEvidenceSource,
+}
+
+/// The only media that can prove one concrete external answer occurred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AttentionAnswerEvidenceSource {
+    ObservedInTraffic,
+    RecordedFixture,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -357,6 +385,7 @@ impl AttentionItem {
         if let AttentionState::Answered {
             option_id,
             free_form_ref,
+            answer_source,
             ..
         } = &self.state
         {
@@ -365,6 +394,25 @@ impl AttentionItem {
             }
             if let Some(free_form_ref) = free_form_ref {
                 validate_sensitive(free_form_ref, "attention_state.free_form_ref")?;
+            }
+            match answer_source {
+                AttentionAnswerSource::LocalCommand { command_id } => {
+                    if command_id.is_empty() {
+                        return Err(ContractViolation::EmptyIdentifier {
+                            field: "attention_state.answer_source.command_id",
+                        });
+                    }
+                }
+                AttentionAnswerSource::ObservedExternal { evidence } => {
+                    if evidence.observer_host_id.is_empty() {
+                        return Err(ContractViolation::EmptyIdentifier {
+                            field: "attention_state.answer_source.evidence.observer_host_id",
+                        });
+                    }
+                    if evidence.observer_host_id != self.host_id {
+                        return Err(ContractViolation::AttentionAnswerObserverHostMismatch);
+                    }
+                }
             }
         }
         Ok(())

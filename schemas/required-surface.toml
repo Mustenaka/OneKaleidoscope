@@ -7,7 +7,7 @@ schema_version = 1
 
 [[tools]]
 name = "codex"
-supported_range = "=0.146.0"
+supported_range = ">=0.146.0, <=0.147.0"
 
 [[tools]]
 name = "opencode"

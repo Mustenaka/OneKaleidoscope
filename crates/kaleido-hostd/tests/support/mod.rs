@@ -251,6 +251,7 @@ impl ProviderRuntimeSession for FixtureRuntime {
 
     fn respond_attention(
         &mut self,
+        command_id: &CommandId,
         response: &AttentionResponse,
         content: &mut dyn ContentAccess,
     ) -> Result<Vec<StateEffect>, RuntimeSessionError> {
@@ -261,6 +262,13 @@ impl ProviderRuntimeSession for FixtureRuntime {
             .and_then(serde_json::Value::as_str)
             .ok_or_else(protocol_violation)?;
         if response.option_id.as_deref() != Some(expected_decision) {
+            return Err(protocol_violation());
+        }
+        if !self.reducer.register_local_attention_answer(
+            &response.attention_id,
+            command_id,
+            expected_decision,
+        ) {
             return Err(protocol_violation());
         }
         self.reduce_next(content)

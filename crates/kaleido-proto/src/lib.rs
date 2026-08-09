@@ -1,7 +1,7 @@
 //! UACP contract types.
 //!
 //! This crate is the machine-readable form of `docs/PROTOCOL.md`. Every type
-//! here has a definition in that document, and every version 0.1 type in that
+//! here has a definition in that document, and every version 0.2 type in that
 //! document exists here. Changing this crate requires changing the document and
 //! recording an ADR first (`AGENTS.md` section 2.1).
 //!
@@ -56,12 +56,12 @@ uniffi::setup_scaffolding!();
 ///
 /// Peers must refuse a different major version rather than guess
 /// (`docs/PROTOCOL.md` section 1).
-pub const PROTOCOL_VERSION: &str = "0.1.0";
+pub const PROTOCOL_VERSION: &str = "0.2.0";
 
 /// Whether a peer's protocol version is compatible with this build.
 ///
 /// Pre-1.0 minor versions are compatibility boundaries. This build therefore
-/// accepts `0.1.x`, but rejects every other `0.x` line. Once the protocol
+/// accepts `0.2.x`, but rejects every other `0.x` line. Once the protocol
 /// reaches 1.0, normal same-major compatibility applies.
 pub fn version_is_compatible(peer_version: &str) -> bool {
     fn parse(version: &str) -> Option<(u64, u64, u64)> {
@@ -207,6 +207,9 @@ pub enum ContractViolation {
 
     #[error("approval join target belongs to another session or turn")]
     ApprovalJoinTargetMismatch,
+
+    #[error("externally observed attention answer names another observer host")]
+    AttentionAnswerObserverHostMismatch,
 
     #[error("a live binding requires the `{missing}` capability")]
     LiveBindingUnsupported { missing: &'static str },

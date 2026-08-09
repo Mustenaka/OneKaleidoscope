@@ -124,6 +124,7 @@ impl ProviderRuntimeSession for StandInSession {
 
     fn respond_attention(
         &mut self,
+        _command_id: &CommandId,
         _response: &AttentionResponse,
         _content: &mut dyn ContentAccess,
     ) -> Result<Vec<StateEffect>, RuntimeSessionError> {

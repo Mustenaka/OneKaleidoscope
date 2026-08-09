@@ -49,6 +49,12 @@ pub enum CodexAdapterError {
     #[error("runtime acceptance could not be tied to the current live session")]
     ControlEvidenceUnavailable,
 
+    #[error("a local attention answer did not match its registered command response")]
+    LocalAttentionAnswerMismatch,
+
+    #[error("the reducer evidence source cannot prove an external attention answer")]
+    InvalidExternalAnswerEvidence,
+
     #[error(transparent)]
     Content(#[from] ContentAccessError),
 

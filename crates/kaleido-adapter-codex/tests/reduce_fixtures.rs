@@ -1,16 +1,19 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 //! Reduction checks driven by the committed Codex recordings.
 //!
-//! Every input here is either a recorded frame or a recorded frame with one
-//! field removed or reordered. Nothing is invented: an "ideal" upstream message
-//! would test the test rather than the runtime.
+//! Every input here is either a recorded frame or a mechanically mutated or
+//! reordered recorded frame. Nothing is invented as an "ideal" success message:
+//! that would test the test rather than the runtime.
 
 mod support;
 
 use kaleido_adapter_codex::error::CodexAdapterError;
 use kaleido_adapter_codex::transcript::Direction;
 use kaleido_adapter_codex::{CodexReducer, ReducerConfig, SurfacePurpose, TranscriptFrame};
-use kaleido_proto::attention::{AttentionState, AttentionSubject, JoinFailureReason, JoinState};
+use kaleido_proto::attention::{
+    AttentionAnswerEvidenceSource, AttentionAnswerSource, AttentionState, AttentionSubject,
+    JoinFailureReason, JoinState,
+};
 use kaleido_proto::capability::{Capability, CapabilityState, EvidenceSource};
 use kaleido_proto::command::CommandOutcome;
 use kaleido_proto::effect::{DiagnosticCode, StateEffect};
@@ -387,6 +390,74 @@ fn an_outgoing_turn_without_its_response_never_proves_control() {
 }
 
 #[test]
+fn a_correlated_json_rpc_error_rejects_without_proving_control() {
+    let transcript = load_transcript("01-simple-turn.jsonl");
+    let mut reducer = live_reducer();
+    let mut content = MemoryContent::default();
+
+    for frame in transcript.frames().iter().take(6) {
+        reducer
+            .ingest_frame(frame, &mut content)
+            .expect("the recorded handshake must reduce");
+    }
+    let command_id = CommandId::new("cmd_rejected_prompt");
+    assert!(reducer.register_local_turn_start(3, &command_id));
+    reducer
+        .ingest_frame(
+            transcript
+                .frames()
+                .get(6)
+                .expect("the recorded outgoing turn exists"),
+            &mut content,
+        )
+        .expect("the recorded outgoing turn must reduce");
+
+    // Mechanically turn the real line-14 turn/start success response into the
+    // JSON-RPC error shape from the pinned upstream schema. The request id and
+    // direction remain the ones captured from the real app-server exchange.
+    let rejected = frame_with_json_rpc_error("01-simple-turn.jsonl", 14);
+    let effects = reducer
+        .ingest_frame(&rejected, &mut content)
+        .expect("a structured upstream rejection must reduce canonically");
+
+    assert_eq!(effects.len(), 1);
+    assert!(matches!(
+        effects.first(),
+        Some(StateEffect::CommandAcknowledged { ack })
+            if ack.command_id == command_id
+                && matches!(
+                    &ack.outcome,
+                    CommandOutcome::Rejected { error }
+                        if error.code == ErrorCode::UpstreamRejected
+                            && !error.retriable
+                            && error.detail_ref.is_none()
+                )
+    ));
+    assert!(effects.iter().all(|effect| !matches!(
+        effect,
+        StateEffect::CommandAcknowledged {
+            ack: kaleido_proto::command::CommandAck {
+                outcome: CommandOutcome::AcceptedByRuntime { .. },
+                ..
+            }
+        } | StateEffect::CapabilitiesUpdated { .. }
+            | StateEffect::SessionUpserted {
+                session: kaleido_proto::session::Session {
+                    live_binding: LiveBinding::Controlling { .. },
+                    ..
+                }
+            }
+    )));
+    assert_eq!(
+        reducer
+            .capability_probe()
+            .to_capabilities()
+            .state_of(&Capability::LiveControl),
+        CapabilityState::NotVerified
+    );
+}
+
+#[test]
 fn a_live_response_for_another_request_never_proves_control() {
     let transcript = load_transcript("01-simple-turn.jsonl");
     let mut reducer = live_reducer();
@@ -539,7 +610,16 @@ fn an_approved_file_change_completes_and_its_approval_is_answered() {
     assert_eq!(file_edit.1, ItemStatus::Completed);
 
     let attention = last_attention(&effects);
-    assert!(matches!(attention.state, AttentionState::Answered { .. }));
+    assert!(matches!(
+        &attention.state,
+        AttentionState::Answered {
+            answer_source: AttentionAnswerSource::ObservedExternal { evidence },
+            decided_at_ms,
+            ..
+        } if evidence.source == AttentionAnswerEvidenceSource::RecordedFixture
+            && evidence.observer_host_id == attention.host_id
+            && evidence.observed_at_ms == *decided_at_ms
+    ));
     match &attention.subject {
         AttentionSubject::Approval { request } => {
             assert!(matches!(request.join, JoinState::Joined { .. }));
@@ -591,15 +671,48 @@ fn a_declined_file_change_is_terminal_and_the_turn_still_completes() {
 
     let attention = last_attention(&effects);
     match &attention.state {
-        AttentionState::Answered { option_id, .. } => {
+        AttentionState::Answered {
+            option_id,
+            answer_source: AttentionAnswerSource::ObservedExternal { evidence },
+            decided_at_ms,
+            ..
+        } => {
             assert_eq!(option_id.as_deref(), Some("decline"));
+            assert_eq!(
+                evidence.source,
+                AttentionAnswerEvidenceSource::RecordedFixture
+            );
+            assert_eq!(evidence.observer_host_id, attention.host_id);
+            assert_eq!(evidence.observed_at_ms, *decided_at_ms);
         }
         other => panic!("expected an answered approval, found {other:?}"),
     }
 }
 
 #[test]
-fn a_live_outgoing_reply_never_overwrites_the_stores_real_answer() {
+fn a_live_unassociated_reply_is_an_externally_observed_answer() {
+    let transcript = load_transcript("03-permission-approve.jsonl");
+    let mut reducer = live_reducer();
+    let mut content = MemoryContent::default();
+    let effects = reducer
+        .ingest(&transcript, &mut content)
+        .expect("the live-shaped recording must reduce cleanly");
+
+    let attention = last_attention(&effects);
+    assert!(matches!(
+        &attention.state,
+        AttentionState::Answered {
+            answer_source: AttentionAnswerSource::ObservedExternal { evidence },
+            decided_at_ms,
+            ..
+        } if evidence.source == AttentionAnswerEvidenceSource::ObservedInTraffic
+            && evidence.observer_host_id == attention.host_id
+            && evidence.observed_at_ms == *decided_at_ms
+    ));
+}
+
+#[test]
+fn a_live_locally_associated_reply_never_overwrites_the_stores_real_answer() {
     // Reorder only frames from the real approval recording so the operation
     // arrives *after* the outgoing reply. This exercises the hidden overwrite
     // path where a later join refresh could otherwise republish the replay-only
@@ -632,6 +745,18 @@ fn a_live_outgoing_reply_never_overwrites_the_stores_real_answer() {
         )),
         "the live request itself must still open attention"
     );
+    let attention_id = approval_effects
+        .iter()
+        .find_map(|effect| match effect {
+            StateEffect::AttentionUpserted { item } => Some(item.id.clone()),
+            _ => None,
+        })
+        .expect("the approval has an attention identifier");
+    assert!(reducer.register_local_attention_answer(
+        &attention_id,
+        &CommandId::new("cmd_real_local_answer"),
+        "accept",
+    ));
 
     let reply_effects = reducer
         .ingest_frame(
@@ -643,7 +768,7 @@ fn a_live_outgoing_reply_never_overwrites_the_stores_real_answer() {
         reply_effects
             .iter()
             .all(|effect| !matches!(effect, StateEffect::AttentionUpserted { .. })),
-        "the reducer must not replace the store's real command ID"
+        "the reducer must not replace the store's LocalCommand answer"
     );
     assert!(
         reducer
@@ -955,6 +1080,38 @@ fn frame_with_replaced_field(
     *payload.pointer_mut(pointer).expect("pointer resolves") = replacement;
     let bytes = serde_json::to_vec(payload).expect("re-encode payload");
     TranscriptFrame::from_wire(direction, 0, &bytes).expect("frame is JSON")
+}
+
+fn frame_with_json_rpc_error(fixture: &str, line: usize) -> TranscriptFrame {
+    let raw = std::fs::read_to_string(fixture_path(fixture)).expect("read fixture");
+    let line = raw.lines().nth(line - 1).expect("fixture line exists");
+    let mut envelope = serde_json::from_str::<Value>(line).expect("fixture line is JSON");
+    assert_eq!(
+        envelope.get("dir").and_then(Value::as_str),
+        Some("s2c"),
+        "a client-request error response must come from the server"
+    );
+    let recorded_offset_ms = envelope
+        .get("ts_ms")
+        .and_then(Value::as_i64)
+        .expect("recorded envelope carries its relative timestamp");
+    let payload = envelope
+        .get_mut("payload")
+        .and_then(Value::as_object_mut)
+        .expect("recorded envelope carries an object payload");
+    payload
+        .remove("result")
+        .expect("the recorded frame is a success response");
+    payload.insert(
+        "error".to_owned(),
+        serde_json::json!({
+            "code": -32000,
+            "message": "mechanically injected upstream rejection"
+        }),
+    );
+    let bytes = serde_json::to_vec(payload).expect("re-encode payload");
+    TranscriptFrame::from_wire(Direction::ServerToClient, recorded_offset_ms, &bytes)
+        .expect("mutated response stays valid JSON")
 }
 
 #[test]

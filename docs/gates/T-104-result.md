@@ -78,8 +78,9 @@ durable log 抽取的合同字段；未记录 prompt、完整路径、canonical/
 
 自动化覆盖以下负路径：
 
-- fixture replay、无本地 correlation、仅发送 request、错 request ID、JSON-RPC error、response
-  前进程退出：均不产生 runtime ack、`LiveControl` 或 `Controlling`；
+- fixture replay、无本地 correlation、仅发送 request、错 request ID、JSON-RPC error（由
+  `a_correlated_json_rpc_error_rejects_without_proving_control` 覆盖）、response 前进程退出：
+  均不产生 runtime ack、`LiveControl` 或 `Controlling`；
 - 只有 `LiveObserve` 时，canonical store 拒绝 `Controlling`；
 - `TurnSteer` 保持 `NotVerified / Absent`，排队 steer 保持 `Pending`；
 - runtime ack 的 runtime、handle kind、Session、Turn 与 command correlation 任一不一致即拒绝；
@@ -92,7 +93,8 @@ durable log 抽取的合同字段；未记录 prompt、完整路径、canonical/
 3. 把 `CapabilitiesUpdated` 放到 runtime ack 之前，store-safe ordering 测试变红；
 4. 在 hostd response 前取消 correlation，真实纵切组合测试变红；
 5. 分别移除 command/Turn 唯一性、runtime 一致性、同 Session 控制证据、候选 runtime 引用和
-   Turn 身份稳定性守卫，对应 state 测试均变红。
+   Turn 身份稳定性守卫，对应 state 测试均变红；
+6. 反转 JSON-RPC error 分支判断，新回归测试因错误进入 `/result/turn/id` 成功路径而变红。
 
 所有变异均已恢复，最终工作树不处于变异态。
 
@@ -105,10 +107,10 @@ cargo xtask ci
 exit 0
 
 kaleido-adapter:       unit 6 passed; integration 4 passed
-kaleido-adapter-codex: unit 2; fixture 23; runtime 4; surface 6 passed
+kaleido-adapter-codex: unit 2; fixture 25; runtime 4; surface 6 passed
 kaleido-hostd:         slice 11; tracing 1 passed
-kaleido-state:         unit 7; store 18 passed
-kaleido-proto:         contract 36 passed
+kaleido-state:         unit 7; store 21 passed
+kaleido-proto:         contract 38 passed
 real fixtures:         5 fixtures / 220 records passed
 clippy:                -D warnings passed
 ```
