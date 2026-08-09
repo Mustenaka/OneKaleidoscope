@@ -318,6 +318,13 @@ EvidenceSource =
 必须为无 preview 的 Sensitive `ContentRef`；连接错误的自由文本原文不得塞进
 `UnavailableOnThisConnection`。
 
+`LiveControl` 是具体控制能力之上的已取得证据：只有当前 live connection 上、与本地
+`CommandEnvelope.command_id` 关联的状态改变命令产生
+`CommandOutcome::AcceptedByRuntime` 后，才能以 `ObservedInTraffic` 证明它。`AcceptedLocally`、
+`Enqueued`、transport 写入成功、provider 名称/版本、handshake 声明和 fixture replay 均不足以
+证明 `LiveControl`。`LiveControl::Supported` 不推出 `TurnPrompt`、`TurnSteer`、
+`InteractionApproval` 或其他具体能力为 Supported。
+
 ### 4.3 Session
 
 ```
@@ -372,9 +379,21 @@ LiveUnboundReason =
 - `Observing` 只允许在实际收到该 runtime 关于**这个** session 的实时报文后置位。
   `evidence.source` 必须是 `ObservedInTraffic`。能列出或恢复历史，永远不足以置
   `Observing`（R-P7、INV-2）。
-- `Controlling` 要求同时具备 `LiveObserve` 与 `LiveControl`。
+- `Controlling` 要求同时具备 `LiveObserve` 与 `LiveControl`，并且这个 Session 在当前
+  live binding 上已有至少一个本地状态改变命令得到 `AcceptedByRuntime`。同 runtime 的另一个
+  Session 不得借用该证据。`since_at_ms` 保留 live binding 建立时间，
+  `evidence.observed_at_ms` 是首次 runtime 接受控制的时间。
+- write path 不得仅凭两个 capability 接受 `Controlling`。当前 `SubmitPrompt` 纵切还必须能
+  回查到同一 Session、同一 runtime 的唯一 `TurnOrigin::RemoteCommand { command_id }` 和该
+  command 的 `AcceptedByRuntime`；另一个 Session 或 runtime 的证据不得借用。
 - `Observing` / `Controlling` 的 `runtime_id` 必须等于用于验证的
   `RuntimeCapabilities.runtime_id`。
+- `BrokerManaged`、`SharedRuntime` 与 `ExternalNative` 使用相同的控制证据门槛；ownership
+  不构成能力证据。Replay、仅观察、无本地 command correlation 或只有本地接受的路径不得进入
+  `Controlling`。
+- R3 客户端显示一个具体干预按钮时，必须同时检查 Session 仍为 live，以及该动作对应的具体
+  capability 为 `Supported`。`Controlling` 表示已取得的 Session 级控制证据，不是所有按钮的
+  总开关；特别地，它不得顺带提升 `TurnSteer`。
 - 读磁盘 transcript、扫描进程、猜窗口标题得到的信息，只能进入 `HistorySource`，
   **不得**进入 `LiveBinding`。
 - `SessionStatus::Queued` 的精确含义是：没有活动 turn，且输入队列中至少有一条
@@ -413,6 +432,9 @@ TurnOrigin =
   **不得**用上游「turn 结束」报文里的摘要列表替换它（§11 记录了该陷阱的一手证据）。
 - `Turn.error` 只在 `Failed` 时非空。被拒绝的审批不写入这里（R-P8）。
 - `AwaitingInteraction` 表示 turn 仍在进行，但当前被一个 `Open` 的 AttentionItem 挡住。
+- `RemoteCommand.command_id` 必须是触发这个 Turn 的真实 `CommandEnvelope.command_id`。对于
+  Codex `turn/start`，只有显式关联到该 command 的 response 才能设置这个 origin；replay 或
+  未关联流量不得反推成本地命令来源。
 
 ### 4.5 Item
 
@@ -1034,6 +1056,14 @@ CommandOutcome =
   「Agent 已收到」。
 - `AcceptedByRuntime` 必须携带 Broker `ProviderBindingHandle`；上游原始确认 ID 仍只在
   adapter 私有绑定存储。
+- `AcceptedByRuntime` 只能在 adapter 收到与本地 command 关联、足以证明 runtime 已接受的
+  结构化响应或通知后产生。发送 bytes 成功或 transport API 无错误返回不足以产生该 outcome。它是
+  `LiveControl` / `Controlling` 的唯一合格控制证据，见 §4.2 / §4.3。
+- `AcceptedByRuntime` 必须是同一 `command_id` 已有 `AcceptedLocally` 后的后续事实；没有该
+  前序事实或同一 command 的第二条 runtime acceptance，write path 必须拒绝且不得追加日志。
+- `AcceptedLocally` 只能由 Broker 的 `submit_command` 路径写入；adapter 或通用 effect ingestion
+  不得自行构造该 outcome。当前 `SubmitPrompt` 路径的 runtime ack 还必须关联唯一的
+  `RemoteCommand` Turn，且 Turn 的 Session runtime 与 acknowledgement handle 一致。
 - 相同 `(actor, idempotency_key)` 重复提交必须返回 `Duplicate` 并指向首次
   `command_id`，且不得对 runtime 重复下发。
 - 命令过期（`expires_at_ms` 已过）必须以 `ErrorCode::CommandExpired` 拒绝。
