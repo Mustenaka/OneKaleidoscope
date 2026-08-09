@@ -1,27 +1,27 @@
 # Upstream schema versions
 
-Fetched at: `2026-07-29T13:47:11Z`
+Fetched at: `2026-08-09T07:39:58Z`
 
 All versions and source revisions below are exact. The JSON files under
 `schemas/` are unmodified upstream snapshots.
 
 ## Codex app-server
 
-- CLI: `codex-cli 0.146.0`
-- npm package: `@openai/codex@0.146.0`
+- CLI: `codex-cli 0.147.0`
+- npm package: `@openai/codex@0.147.0`
 - Bundle mode: default/stable output without `--experimental`
-- JSON files: `275`
+- JSON files: `285`
 - Reproduction commands on Windows PowerShell:
 
 ```powershell
-npm.cmd install --global @openai/codex@0.146.0
+npm.cmd install --global @openai/codex@0.147.0
 codex.cmd app-server generate-json-schema --out schemas/codex
 ```
 
 - Reproduction commands on macOS/Linux:
 
 ```sh
-npm install --global @openai/codex@0.146.0
+npm install --global @openai/codex@0.147.0
 codex app-server generate-json-schema --out schemas/codex
 ```
 
