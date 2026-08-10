@@ -106,6 +106,8 @@ force-stop 精确 cursor 恢复与 durable revoke；结果见 [T-109-result.md](
 
 ## R4 — 自有 Ubuntu 远程连接
 
+状态：**active**，任务卡 [T-110](tasks/T-110.md)。
+
 产出：
 
 - rendezvous、P2P 连接信息交换；
