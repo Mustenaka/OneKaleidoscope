@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use kaleido_adapter_codex::CodexSandboxMode;
 use kaleido_hostd::error::HostdError;
 use kaleido_hostd::slice::{self, ApprovalDecision, ReplayRequest, RunRequest};
 use kaleido_hostd::{CodexLanConfig, CodexLanHost};
@@ -85,6 +86,7 @@ async fn run_lan(arguments: &[String]) -> Result<String, HostdError> {
         project_root: PathBuf::from(required(arguments, "--project-root")?),
         data_directory: PathBuf::from(required(arguments, "--data-dir")?),
         bind_address,
+        sandbox: CodexSandboxMode::WorkspaceWrite,
         request_timeout: Duration::from_secs(timeout_seconds),
     };
     let host = CodexLanHost::start(&config).map_err(|_| HostdError::Lan)?;

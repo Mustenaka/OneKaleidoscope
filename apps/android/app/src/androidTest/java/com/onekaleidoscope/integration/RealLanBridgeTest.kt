@@ -10,8 +10,10 @@ import com.onekaleidoscope.platform.AndroidCoreStorage
 import com.onekaleidoscope.platform.AndroidDeviceSigner
 import com.onekaleidoscope.platform.AndroidSecureCredentialVault
 import com.onekaleidoscope.ui.AppUiState
+import com.onekaleidoscope.ui.AttentionSubjectUi
 import com.onekaleidoscope.ui.ConnectionUiState
 import com.onekaleidoscope.ui.DataFreshness
+import com.onekaleidoscope.ui.DecisionToneUi
 import com.onekaleidoscope.ui.QueueIntentUi
 import com.onekaleidoscope.ui.SessionUi
 import com.onekaleidoscope.ui.UiAction
@@ -60,7 +62,11 @@ class RealLanBridgeTest {
 
         when (phase) {
             PHASE_WRONG_PIN -> rejectWrongPin(requirePairingUri(arguments))
-            PHASE_SEED -> pairRenderAndSubmit(requirePairingUri(arguments))
+            PHASE_SEED -> pairRenderAndSubmit(
+                requirePairingUri(arguments),
+                arguments.getString(ARG_REQUIRE_ATTENTION)?.toBooleanStrictOrNull() == true,
+            )
+            PHASE_BACKGROUND -> resumeAfterExternalBackground()
             PHASE_RESUME -> resumeAfterExternalForceStop()
             PHASE_REVOKED -> rejectRevokedCredential()
             else -> throw AssertionError("unknown lanPhase=$phase")
@@ -86,7 +92,7 @@ class RealLanBridgeTest {
         }
     }
 
-    private fun pairRenderAndSubmit(pairingUri: String) {
+    private fun pairRenderAndSubmit(pairingUri: String, requireAttention: Boolean) {
         assertNull(
             "seed phase requires the harness to clear app data first",
             AndroidSecureCredentialVault(context).loadPairedHost(),
@@ -140,7 +146,14 @@ class RealLanBridgeTest {
                     it.queue.value?.sessionId == session.id
             }
 
-            val prompt = "T-108 Android product-path command ${System.currentTimeMillis()}"
+            val prompt = if (requireAttention) {
+                "Use the file-editing tool to replace the complete contents of editable.txt " +
+                    "with exactly KALEIDO PHYSICAL APPROVAL PROBE. Do not run a shell command, " +
+                    "do not create or touch any other file, and do not access any path outside " +
+                    "the current project."
+            } else {
+                "T-108 Android product-path command ${System.currentTimeMillis()}"
+            }
             val previousMessageId = reselected.message?.id
             repository.dispatch(UiAction.UpdateDraft(prompt))
             val actionState = awaitState(repository, "draft update") { it.draft == prompt }
@@ -166,6 +179,12 @@ class RealLanBridgeTest {
                 "command was not accepted on the real repository path: ${commandState.message?.text}",
                 commandState.message?.text in ACCEPTED_COMMAND_MESSAGES,
             )
+            val attentionOutcome = if (requireAttention) {
+                respondToRealApproval(repository)
+                "-attention-declined"
+            } else {
+                ""
+            }
 
             val stableProjectIds = requireNotNull(commandState.projects.value).map { it.id }
             val stableSessionIds = selectedSessions(commandState).map { it.id }
@@ -186,10 +205,66 @@ class RealLanBridgeTest {
 
             val evidence = readStoredEvidence()
             reportEvidence(
-                outcome = "seed-seven-projections-$commandKind",
+                outcome = "seed-seven-projections-$commandKind$attentionOutcome",
                 deviceId = evidence.deviceId,
                 cursor = evidence.cursor,
             )
+        } finally {
+            repository.close()
+        }
+    }
+
+    private fun respondToRealApproval(repository: MobileRepository) {
+        val attentionState = awaitState(repository, "real runtime approval") { state ->
+            state.attention.value.orEmpty().any { item -> item.responseAvailability.enabled }
+        }
+        val attention = requireNotNull(
+            attentionState.attention.value.orEmpty().firstOrNull { it.responseAvailability.enabled },
+        )
+        val approval = attention.subject as? AttentionSubjectUi.Approval
+            ?: throw AssertionError("physical gate expected a real approval, not another attention kind")
+        val decline = approval.options.firstOrNull { it.tone == DecisionToneUi.Destructive }
+            ?: throw AssertionError("real approval exposes no destructive decline option")
+        val previousMessageId = attentionState.message?.id
+        repository.dispatch(UiAction.RespondAttention(attention.id, decline.id, null))
+        val acknowledged = awaitState(repository, "approval response acknowledgement") { state ->
+            state.message?.id != null &&
+                state.message.id != previousMessageId &&
+                state.message.text in ACCEPTED_COMMAND_MESSAGES
+        }
+        assertTrue(acknowledged.message?.text in ACCEPTED_COMMAND_MESSAGES)
+        awaitState(repository, "answered approval leaves the inbox") { state ->
+            state.attention.value.orEmpty().none { it.id == attention.id }
+        }
+    }
+
+    private fun resumeAfterExternalBackground() {
+        val repository = MobileRepository(context)
+        try {
+            val initial = awaitState(repository, "background credential and project cache") { state ->
+                !state.projects.value.isNullOrEmpty() &&
+                    (state.connection is ConnectionUiState.Live ||
+                        state.connection is ConnectionUiState.Offline)
+            }
+            if (initial.connection is ConnectionUiState.Offline) {
+                repository.dispatch(UiAction.RetryConnection)
+            }
+            val projectState = awaitState(repository, "background credential reconnect") { state ->
+                state.connection is ConnectionUiState.Live && !state.projects.value.isNullOrEmpty()
+            }
+            val project = requireNotNull(projectState.projects.value).first()
+            repository.dispatch(UiAction.SelectProject(project.id))
+            val sessionState = awaitState(repository, "background SessionIndex") {
+                selectedSessions(it).isNotEmpty()
+            }
+            val session = selectedSessions(sessionState).first()
+            repository.dispatch(UiAction.SelectSession(session.id))
+            val live = awaitState(repository, "seven live projections after OEM background") {
+                allProjectionPanelsHaveFreshness(it, DataFreshness.Live)
+            }
+            assertSevenProjectionState(live, DataFreshness.Live)
+            val evidence = readStoredEvidence()
+            reportEvidence("oem-background-resumed", evidence.deviceId, evidence.cursor)
         } finally {
             repository.close()
         }
@@ -222,6 +297,7 @@ class RealLanBridgeTest {
             assertSevenProjectionState(cached, DataFreshness.CachedOffline)
             assertFalse(cached.promptAction.enabled)
             assertFalse(cached.enqueueNewTurnAction.enabled)
+            val resumeFrom = readStoredEvidence()
 
             val stableProjects = requireNotNull(cached.projects.value).map { it.id }
             val stableSessions = selectedSessions(cached).map { it.id }
@@ -238,7 +314,12 @@ class RealLanBridgeTest {
             assertEquals(stableSessions.distinct(), stableSessions)
             assertSevenProjectionState(live, DataFreshness.Live)
             val evidence = readStoredEvidence()
-            reportEvidence("force-stop-cache-cursor-resumed", evidence.deviceId, evidence.cursor)
+            reportEvidence(
+                "force-stop-cache-cursor-resumed",
+                evidence.deviceId,
+                evidence.cursor,
+                resumeFrom.cursor,
+            )
         } finally {
             repository.close()
         }
@@ -346,13 +427,19 @@ class RealLanBridgeTest {
         }
     }
 
-    private fun reportEvidence(outcome: String, deviceId: String?, cursor: String?) {
+    private fun reportEvidence(
+        outcome: String,
+        deviceId: String?,
+        cursor: String?,
+        resumeFromCursor: String? = null,
+    ) {
         instrumentation.sendStatus(
             STATUS_EVIDENCE,
             Bundle().apply {
                 putString("onekaleidoscope.outcome", outcome)
                 putString("onekaleidoscope.deviceId", deviceId)
                 putString("onekaleidoscope.cursor", cursor)
+                putString("onekaleidoscope.resumeFromCursor", resumeFromCursor)
                 putString("onekaleidoscope.externalForceStopRequired", "true")
             },
         )
@@ -398,12 +485,14 @@ class RealLanBridgeTest {
     companion object {
         private const val ARG_PHASE = "lanPhase"
         private const val ARG_PAIRING_URI = "pairingUri"
+        private const val ARG_REQUIRE_ATTENTION = "requireAttention"
         private const val PHASE_WRONG_PIN = "wrong-pin"
         private const val PHASE_SEED = "seed"
+        private const val PHASE_BACKGROUND = "background"
         private const val PHASE_RESUME = "resume"
         private const val PHASE_REVOKED = "revoked"
         private const val PAIR_URI_PREFIX = "onekaleidoscope://pair/v1?data="
-        private const val DEVICE_LABEL = "T-108 API 35 emulator"
+        private const val DEVICE_LABEL = "T-108 Android acceptance"
         private const val PIN_BYTES = 32
         private const val STATUS_EVIDENCE = 108
         private const val STATE_TIMEOUT_MS = 45_000L
