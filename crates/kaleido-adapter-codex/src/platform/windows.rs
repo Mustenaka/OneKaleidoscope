@@ -2,7 +2,7 @@ use std::io;
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub(super) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub(super) fn configure(command: &mut Command) {
     command.creation_flags(CREATE_NO_WINDOW);

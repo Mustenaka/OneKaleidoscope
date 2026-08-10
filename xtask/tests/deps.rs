@@ -96,7 +96,7 @@ fn repository_rules_declare_the_complete_eleven_crate_matrix() {
             .get("kaleido-relay")
             .expect("relay rule must exist")
             .may_depend_on,
-        Vec::<String>::new()
+        vec!["kaleido-transport".to_owned()]
     );
     assert_eq!(
         rules

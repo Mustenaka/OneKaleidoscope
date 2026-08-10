@@ -1,0 +1,32 @@
+[Unit]
+Description=OneKaleidoscope self-hosted rendezvous and ciphertext relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=onekaleidoscope-relay
+Group=onekaleidoscope-relay
+UMask=0077
+EnvironmentFile=/etc/onekaleidoscope/relay.env
+ExecStart=/usr/local/lib/onekaleidoscope/kaleido-relay
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_INET AF_INET6
+ReadWritePaths=/var/lib/onekaleidoscope-relay
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

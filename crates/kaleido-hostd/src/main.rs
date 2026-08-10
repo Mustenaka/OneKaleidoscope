@@ -19,8 +19,8 @@ use std::time::Duration;
 use kaleido_adapter_codex::CodexSandboxMode;
 use kaleido_hostd::error::HostdError;
 use kaleido_hostd::slice::{self, ApprovalDecision, ReplayRequest, RunRequest};
-use kaleido_hostd::{CodexLanConfig, CodexLanHost};
-use kaleido_proto::ids::SessionId;
+use kaleido_hostd::{CodexLanConfig, CodexLanHost, CodexRemoteConfig};
+use kaleido_proto::ids::{DeviceId, SessionId};
 use kaleido_state::ProjectionName;
 
 const USAGE: &str = "\
@@ -32,6 +32,10 @@ kaleido-hostd slice run    --executable <codex.exe> --project-root <dir>
 kaleido-hostd slice show   --log-dir <dir> --projection <name> [--session <id>]
 kaleido-hostd lan run      --executable <codex.exe> --project-root <dir>
                            --data-dir <dir> --bind <lan-ip:port>
+                           [--remote-service <host:port>
+                            --remote-service-pin <sha256:base64url>
+                            --remote-relay <https://self-hosted-relay>
+                            [--remote-device-id <already-paired-device>]]
                            [--serve-secs <positive>] [--timeout-secs 30]
 
 projections: project-index, session-index, transcript, live-activity, input-queue,
@@ -89,10 +93,38 @@ async fn run_lan(arguments: &[String]) -> Result<String, HostdError> {
         sandbox: CodexSandboxMode::WorkspaceWrite,
         request_timeout: Duration::from_secs(timeout_seconds),
     };
-    let host = CodexLanHost::start(&config).map_err(|_| HostdError::Lan)?;
+    let remote_service = optional(arguments, "--remote-service");
+    let remote_pin = optional(arguments, "--remote-service-pin");
+    let remote_relay = optional(arguments, "--remote-relay");
+    let remote_device = optional(arguments, "--remote-device-id");
+    let host = match (remote_service, remote_pin, remote_relay) {
+        (Some(service_endpoint), Some(service_public_key_pin), Some(relay_url)) => {
+            CodexLanHost::start_remote_controlled(
+                &config,
+                &CodexRemoteConfig {
+                    service_endpoint,
+                    service_public_key_pin,
+                    relay_url,
+                },
+            )
+        }
+        (None, None, None) if remote_device.is_none() => CodexLanHost::start(&config),
+        _ => {
+            return Err(HostdError::usage(
+                "remote mode requires --remote-service, --remote-service-pin and --remote-relay together; --remote-device-id is valid only in remote mode",
+            ));
+        }
+    }
+    .map_err(|_| HostdError::Lan)?;
     // This is an operator-requested one-time credential. It deliberately
     // bypasses tracing and is never retained in the returned summary.
     println!("{}", host.pairing_uri());
+    if let Some(device_id) = remote_device {
+        let remote_pairing = host
+            .issue_remote_pairing_uri(&DeviceId::new(device_id))
+            .map_err(|_| HostdError::Lan)?;
+        println!("{}", remote_pairing.as_str());
+    }
     let session_id = host.session_id().clone();
     if let Some(serve_seconds) = serve_seconds {
         host.run_for(Duration::from_secs(serve_seconds));

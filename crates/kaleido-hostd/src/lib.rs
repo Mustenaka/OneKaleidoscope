@@ -12,6 +12,8 @@ pub mod error;
 mod gateway;
 pub mod lan;
 mod platform;
+pub mod privacy;
+pub mod remote_control;
 pub mod runtime;
 pub mod server;
 pub mod slice;
@@ -19,7 +21,7 @@ pub mod slice;
 pub use broker::{Broker, BrokerError, BrokerSubscription, SubscriptionEvent};
 pub use content::StoreContentAccess;
 pub use error::HostdError;
-pub use lan::{CodexLanConfig, CodexLanError, CodexLanHost};
+pub use lan::{CodexLanConfig, CodexLanError, CodexLanHost, CodexRemoteConfig};
 pub use runtime::{
     ReadyRecoveryOutcome, RuntimeDispatchReport, RuntimeSupervisor, RuntimeSupervisorError,
 };

@@ -117,7 +117,11 @@ private fun ConnectionCard(connection: ConnectionUiState, onAction: (UiAction) -
         ConnectionUiState.Initializing -> Triple("正在初始化", "正在打开安全凭据与离线缓存。", StatusTone.Neutral)
         ConnectionUiState.Unpaired -> Triple("未连接", "先添加一台电脑。", StatusTone.Neutral)
         is ConnectionUiState.Pairing -> Triple("正在配对", connection.stage, StatusTone.Warning)
-        is ConnectionUiState.Connecting -> Triple("正在连接 ${connection.hostName}", "正在建立已认证的局域网连接。", StatusTone.Warning)
+        is ConnectionUiState.Connecting -> Triple(
+            "正在连接 ${connection.hostName}",
+            "正在建立端到端认证连接；尚未发布在线路径。",
+            StatusTone.Warning,
+        )
         is ConnectionUiState.Live -> Triple("已连接 ${connection.hostName}", connection.endpointLabel, StatusTone.Positive)
         is ConnectionUiState.Offline -> Triple("离线", connection.reason, StatusTone.Warning)
         is ConnectionUiState.Revoked -> Triple("设备已被吊销", connection.reason, StatusTone.Error)
@@ -306,5 +310,5 @@ private fun reachabilityLabel(reachability: ReachabilityUi): String = when (reac
     ReachabilityUi.Offline -> "离线"
     ReachabilityUi.LanDirect -> "局域网直连"
     ReachabilityUi.PeerToPeer -> "点对点"
-    ReachabilityUi.Relayed -> "中继"
+    ReachabilityUi.Relayed -> "自有中继"
 }

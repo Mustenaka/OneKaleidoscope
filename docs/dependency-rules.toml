@@ -96,7 +96,7 @@ may_depend_on = [
 may_depend_on = ["kaleido-proto", "kaleido-core", "kaleido-transport"]
 
 [crates."kaleido-relay"]
-may_depend_on = []
+may_depend_on = ["kaleido-transport"]
 
 [antipatterns.a1]
 forbidden_dependencies = [

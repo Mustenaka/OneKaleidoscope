@@ -7,9 +7,68 @@ use std::sync::Arc;
 
 use kaleido_proto::ids::{DeviceId, HostId};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 const CREDENTIAL_FILE: &str = "paired-host.json";
-const SECURE_CREDENTIAL_FORMAT_VERSION: u32 = 1;
+const SECURE_CREDENTIAL_FORMAT_VERSION: u32 = 2;
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteAccess {
+    pub route_id: String,
+    pub route_hint: String,
+    pub device_slot_id: String,
+    pub access_token: String,
+    pub host_endpoint_id: String,
+    pub relay_url: String,
+    pub service_endpoint: String,
+    pub service_public_key_pin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_push: Option<PendingPushOperation>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PendingPushOperation {
+    Replace {
+        operation_id: String,
+        opaque_address: String,
+        registered_at_ms: i64,
+        expires_at_ms: i64,
+    },
+    Delete {
+        operation_id: String,
+    },
+}
+
+impl std::fmt::Debug for PendingPushOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Replace { .. } => "PendingPushOperation::Replace([redacted])",
+            Self::Delete { .. } => "PendingPushOperation::Delete([redacted])",
+        })
+    }
+}
+
+impl Drop for PendingPushOperation {
+    fn drop(&mut self) {
+        if let Self::Replace { opaque_address, .. } = self {
+            opaque_address.zeroize();
+        }
+    }
+}
+
+impl std::fmt::Debug for RemoteAccess {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RemoteAccess([redacted])")
+    }
+}
+
+impl Drop for RemoteAccess {
+    fn drop(&mut self) {
+        self.access_token.zeroize();
+    }
+}
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -18,6 +77,8 @@ pub struct PairedHost {
     pub device_id: DeviceId,
     pub endpoint: String,
     pub host_public_key_pin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteAccess>,
 }
 
 /// The only paired-host identity mobile UI needs to construct host-scoped
@@ -46,6 +107,7 @@ impl std::fmt::Debug for PairedHost {
             .field("device_id", &self.device_id)
             .field("endpoint", &"[redacted]")
             .field("host_public_key_pin", &"[redacted]")
+            .field("remote", &self.remote.as_ref().map(|_| "[configured]"))
             .finish()
     }
 }
@@ -132,7 +194,11 @@ impl CredentialStore {
                 let envelope = serde_json::from_slice::<SecureCredentialEnvelope>(&bytes)
                     .map_err(|_| CredentialError::Malformed)?;
                 // #[allow(kaleido::version_branch)] reason: secure credential storage must reject incompatible durable records and never selects a product capability
-                if envelope.format_version != SECURE_CREDENTIAL_FORMAT_VERSION {
+                if !matches!(
+                    envelope.format_version,
+                    1 | SECURE_CREDENTIAL_FORMAT_VERSION
+                ) || (envelope.format_version == 1 && envelope.paired_host.remote.is_some())
+                {
                     return Err(CredentialError::Malformed);
                 }
                 validate(&envelope.paired_host)?;
@@ -219,6 +285,47 @@ fn validate(host: &PairedHost) -> Result<(), CredentialError> {
     if host.host_id.is_empty() || host.device_id.is_empty() {
         return Err(CredentialError::Malformed);
     }
+    if let Some(remote) = &host.remote {
+        kaleido_transport::remote::validate_remote_bootstrap(
+            &kaleido_transport::remote::RemotePairingBootstrap {
+                route_id: remote.route_id.clone(),
+                route_hint: remote.route_hint.clone(),
+                device_slot_id: remote.device_slot_id.clone(),
+                access_token: remote.access_token.clone(),
+                host_endpoint_id: remote.host_endpoint_id.clone(),
+                relay_url: remote.relay_url.clone(),
+                service_endpoint: remote.service_endpoint.clone(),
+                service_public_key_pin: remote.service_public_key_pin.clone(),
+                expires_at_ms: 0,
+            },
+        )
+        .map_err(|_| CredentialError::Malformed)?;
+        if let Some(pending) = &remote.pending_push {
+            match pending {
+                PendingPushOperation::Replace {
+                    operation_id,
+                    opaque_address,
+                    registered_at_ms,
+                    expires_at_ms,
+                } => {
+                    kaleido_transport::remote::validate_random_id(operation_id)
+                        .map_err(|_| CredentialError::Malformed)?;
+                    kaleido_transport::remote::PushAddress {
+                        provider: kaleido_transport::remote::PushProvider::FcmFid,
+                        opaque_address: opaque_address.clone(),
+                        registered_at_ms: *registered_at_ms,
+                        expires_at_ms: *expires_at_ms,
+                    }
+                    .validate()
+                    .map_err(|_| CredentialError::Malformed)?;
+                }
+                PendingPushOperation::Delete { operation_id } => {
+                    kaleido_transport::remote::validate_random_id(operation_id)
+                        .map_err(|_| CredentialError::Malformed)?;
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -257,6 +364,7 @@ mod tests {
             device_id: DeviceId::new(device),
             endpoint: "127.0.0.1:7443".to_owned(),
             host_public_key_pin: format!("sha256:{}", "A".repeat(43)),
+            remote: None,
         }
     }
 
@@ -303,7 +411,7 @@ mod tests {
         assert_eq!(
             json.get("format_version")
                 .and_then(serde_json::Value::as_u64),
-            Some(1)
+            Some(2)
         );
         assert_eq!(store.load().expect("secure load"), Some(host));
     }
@@ -315,6 +423,56 @@ mod tests {
             Some(br#"{"format_version":0,"paired_host":{}}"#.to_vec());
         let store = CredentialStore::secure(vault);
 
+        assert!(matches!(store.load(), Err(CredentialError::Malformed)));
+    }
+
+    #[test]
+    fn secure_vault_migrates_lan_only_v1_but_rejects_remote_data_in_v1() {
+        let vault = Arc::new(MemoryVault::default());
+        let host = paired_host("host-old", "device-old");
+        let old = serde_json::json!({"format_version": 1, "paired_host": host});
+        *vault.bytes.lock().expect("vault lock") =
+            Some(serde_json::to_vec(&old).expect("old envelope"));
+        let store = CredentialStore::secure(vault.clone());
+        let loaded = store.load().expect("v1 migrates").expect("paired host");
+        assert!(loaded.remote.is_none());
+        store.store(&loaded).expect("migration rewrite");
+        let rewritten: serde_json::Value = serde_json::from_slice(
+            vault
+                .bytes
+                .lock()
+                .expect("vault lock")
+                .as_ref()
+                .expect("rewritten bytes"),
+        )
+        .expect("rewritten envelope");
+        assert_eq!(
+            rewritten
+                .get("format_version")
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+
+        let mut smuggled = old;
+        smuggled
+            .get_mut("paired_host")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("paired host object")
+            .insert(
+                "remote".to_owned(),
+                serde_json::json!({
+                    "route_id": "AQEBAQEBAQEBAQEBAQEBAQ",
+                    "route_hint": "AgICAgICAgICAgICAgICAg",
+                    "device_slot_id": "AwMDAwMDAwMDAwMDAwMDAw",
+                    "access_token": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ",
+                    "host_endpoint_id": "endpoint123",
+                    "relay_url": "https://relay.example.test",
+                    "service_endpoint": "service.example.test:443",
+                    "service_public_key_pin": "sha256:BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU"
+                }),
+            );
+        *vault.bytes.lock().expect("vault lock") =
+            Some(serde_json::to_vec(&smuggled).expect("smuggled envelope"));
         assert!(matches!(store.load(), Err(CredentialError::Malformed)));
     }
 }

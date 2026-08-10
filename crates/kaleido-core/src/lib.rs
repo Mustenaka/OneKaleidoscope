@@ -12,15 +12,21 @@ use kaleido_proto::effect::StateEffect;
 use kaleido_proto::error::CanonicalError;
 use kaleido_proto::projection::ProjectionEnvelope;
 
+#[cfg(target_os = "android")]
+mod android_jni;
 pub mod cache;
 pub mod connection;
 pub mod credential;
 pub mod mobile;
 pub mod product;
+mod remote_push;
 pub mod signer;
 
 pub use credential::{PairedHostInfo, SecureCredentialVault, SecureCredentialVaultError};
-pub use mobile::{MobileClient, MobileClientError, ProjectionCallback, ProjectionSubscription};
+pub use mobile::{
+    ConnectionStatusCallback, MobileClient, MobileClientError, MobileConnectionPath,
+    MobileConnectionStatus, ProjectionCallback, ProjectionSubscription,
+};
 pub use product::{
     MobileActionAvailability, MobileActionBlocker, MobileSessionAction, MobileTextContent,
 };

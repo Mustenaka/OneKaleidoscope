@@ -248,7 +248,7 @@ private fun connectionLabel(connection: ConnectionUiState): String = when (conne
     ConnectionUiState.Unpaired -> "未配对"
     is ConnectionUiState.Pairing -> "正在配对"
     is ConnectionUiState.Connecting -> "正在连接"
-    is ConnectionUiState.Live -> "局域网已连接"
+    is ConnectionUiState.Live -> "已连接：${connection.endpointLabel}"
     is ConnectionUiState.Offline -> "离线缓存"
     is ConnectionUiState.Revoked -> "设备已吊销"
     is ConnectionUiState.Error -> "连接错误"

@@ -5,3 +5,7 @@
 local.properties
 captures/
 *.iml
+
+# Firebase project identity is injected by the real Android/FCM gate.
+app/google-services.json
+app/src/*/google-services.json

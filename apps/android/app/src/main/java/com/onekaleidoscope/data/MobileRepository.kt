@@ -4,6 +4,7 @@ import android.content.Context
 import com.onekaleidoscope.platform.AndroidCoreStorage
 import com.onekaleidoscope.platform.AndroidDeviceSigner
 import com.onekaleidoscope.platform.AndroidSecureCredentialVault
+import com.onekaleidoscope.push.PushAddressState
 import com.onekaleidoscope.ui.ActionAvailability
 import com.onekaleidoscope.ui.AppUiState
 import com.onekaleidoscope.ui.ConnectionUiState
@@ -20,6 +21,7 @@ import java.io.Closeable
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -28,8 +30,10 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import uniffi.kaleido_core.ConnectionStatusCallback
 import uniffi.kaleido_core.MobileClient
 import uniffi.kaleido_core.MobileClientException
+import uniffi.kaleido_core.MobileConnectionStatus
 import uniffi.kaleido_core.MobileSessionAction
 import uniffi.kaleido_core.ProjectionCallback
 import uniffi.kaleido_core.ProjectionSubscription
@@ -63,7 +67,10 @@ import uniffi.kaleido_proto.TranscriptView
  * Kotlin never validates cursors or reconstructs canonical state; the extra cursor comparison only
  * prevents a stale UI callback from replacing a newer, already core-validated full projection.
  */
-internal class MobileRepository(context: Context) : Closeable {
+internal class MobileRepository(
+    context: Context,
+    private val onRemoteConfigured: () -> Unit = {},
+) : Closeable {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
     private val closing = AtomicBoolean(false)
     private val messageIds = AtomicLong(1)
@@ -71,6 +78,7 @@ internal class MobileRepository(context: Context) : Closeable {
     private var client: MobileClient? = null
     private var connected = false
     private var workerStarted = false
+    private var statusCallbackInstalled = false
     private var nextSubscriptionGeneration = 1L
 
     private val subscriptions = mutableMapOf<ProjectionKey, ActiveSubscription>()
@@ -117,6 +125,90 @@ internal class MobileRepository(context: Context) : Closeable {
         scope.launch { handleAction(action) }
     }
 
+    /**
+     * Narrow Android lifecycle signal. Rust still selects, authenticates and validates the route;
+     * Kotlin only restarts the existing core-owned connection after the OS changes reachability.
+     */
+    internal fun requestRemoteRecovery(trigger: RemoteRecoveryTrigger) {
+        if (closing.get()) return
+        scope.launch { recoverRemoteConnection(trigger) }
+    }
+
+    internal suspend fun synchronizePushAddress(state: PushAddressState): PushSyncOutcome {
+        if (closing.get()) return PushSyncOutcome.Pending
+        val completion = CompletableDeferred<PushSyncOutcome>()
+        scope.launch { completion.complete(synchronizePushAddressNow(state)) }
+        return completion.await()
+    }
+
+    private fun synchronizePushAddressNow(state: PushAddressState): PushSyncOutcome {
+        val active = client ?: return PushSyncOutcome.Pending
+        val remoteConfigured = try {
+            active.remoteIsConfigured()
+        } catch (_: RuntimeException) {
+            false
+        }
+        if (!remoteConfigured) return PushSyncOutcome.Deferred
+        return PushAddressSynchronizer.synchronize(state, object : PushAddressCorePort {
+            override fun deleteAddress(): Boolean =
+                remotePushCall { active.deletePushAddress() }
+
+            override fun replaceAddress(
+                fid: String,
+                observedAtMs: Long,
+                expiresAtMs: Long,
+            ): Boolean = remotePushCall {
+                active.replacePushAddress(fid, observedAtMs, expiresAtMs)
+            }
+
+            override fun flushOutbox(): Boolean =
+                remotePushCall { active.flushRemotePushOutbox() }
+        })
+    }
+
+    private fun remotePushCall(call: () -> Unit): Boolean = try {
+        call()
+        true
+    } catch (_: MobileClientException) {
+        false
+    } catch (_: RuntimeException) {
+        false
+    }
+
+    private fun recoverRemoteConnection(trigger: RemoteRecoveryTrigger) {
+        val active = client ?: return
+        val hostId = try {
+            active.pairedHostInfo()?.hostId?.value
+        } catch (_: MobileClientException) {
+            null
+        } catch (_: RuntimeException) {
+            null
+        } ?: return
+        if (workerStarted && trigger is RemoteRecoveryTrigger.NetworkChanged) {
+            try {
+                active.networkEpochChanged(trigger.epoch.toULong())
+                connected = false
+                markOffline("网络已切换，正在安全恢复")
+                mutableState.update {
+                    it.copy(connection = ConnectionUiState.Connecting(hostLabel(hostId)))
+                }
+            } catch (_: MobileClientException) {
+                connected = false
+                closeSubscriptions(sendUnsubscribe = false)
+                markOffline("网络切换恢复失败")
+            } catch (_: RuntimeException) {
+                connected = false
+                closeSubscriptions(sendUnsubscribe = false)
+                markOffline("网络切换恢复失败")
+            }
+            return
+        } else if (workerStarted) {
+            reconcileSubscriptions()
+            return
+        }
+        connectNow(active, hostId)
+    }
+
     private fun initialize(context: Context) {
         val opened = try {
             MobileClient.newWithSecureVault(
@@ -150,6 +242,7 @@ internal class MobileRepository(context: Context) : Closeable {
             mutableState.value = AppUiState(connection = ConnectionUiState.Unpaired)
             return
         }
+        installConnectionStatusCallback(opened)
         val hostId = paired.hostId.value
         mutableState.update {
             it.copy(
@@ -199,10 +292,15 @@ internal class MobileRepository(context: Context) : Closeable {
             showMessage("配对内容不能为空")
             return
         }
+        if (payload.startsWith(REMOTE_PAIR_URI_PREFIX)) {
+            configureRemote(active, payload)
+            return
+        }
         mutableState.update { it.copy(connection = ConnectionUiState.Pairing("验证 PC 身份")) }
         try {
             active.pair(payload, "OneKaleidoscope Android")
             val paired = active.pairedHostInfo() ?: throw IllegalStateException("missing paired host")
+            installConnectionStatusCallback(active)
             mutableState.update { it.copy(selectedHostId = paired.hostId.value) }
             workerStarted = false
             connectNow(active, paired.hostId.value)
@@ -212,6 +310,28 @@ internal class MobileRepository(context: Context) : Closeable {
             }
         } catch (_: RuntimeException) {
             mutableState.update { it.copy(connection = ConnectionUiState.Error("配对失败", true)) }
+        }
+    }
+
+    private fun configureRemote(active: MobileClient, payload: String) {
+        val hostId = runCatching { active.pairedHostInfo()?.hostId?.value }.getOrNull()
+        if (hostId == null) {
+            showMessage("请先完成 PC 身份配对，再启用公网路径")
+            return
+        }
+        if (workerStarted) disconnect()
+        mutableState.update { it.copy(connection = ConnectionUiState.Pairing("验证自有远程服务配置")) }
+        try {
+            active.configureRemote(payload)
+            onRemoteConfigured()
+            showMessage("公网路径配置已安全保存；连接后才会显示真实路径")
+            connectNow(active, hostId)
+        } catch (_: MobileClientException) {
+            mutableState.update {
+                it.copy(connection = ConnectionUiState.Error("公网配置无效、已过期或身份不匹配", true))
+            }
+        } catch (_: RuntimeException) {
+            mutableState.update { it.copy(connection = ConnectionUiState.Error("无法保存公网配置", true)) }
         }
     }
 
@@ -238,17 +358,12 @@ internal class MobileRepository(context: Context) : Closeable {
         try {
             if (workerStarted) active.reconnect() else active.connect()
             workerStarted = true
-            connected = true
-            mutableState.update {
-                it.copy(
-                    connection = ConnectionUiState.Live(hostLabel(hostId), "TLS 1.3 · LAN"),
-                    selectedHostId = hostId,
-                )
-            }
-            reconcileSubscriptions()
+            connected = false
+            mutableState.update { it.copy(selectedHostId = hostId) }
             // A successful transport connection is not projection freshness evidence. Each panel
             // remains cached until its own CurrentFollows/Resumed callback is reduced below.
             renderAllSelected()
+            disableAllActions("正在等待端到端认证路径")
         } catch (_: MobileClientException.Authentication) {
             connected = false
             workerStarted = false
@@ -260,6 +375,47 @@ internal class MobileRepository(context: Context) : Closeable {
             markOffline("无法连接 PC")
         } catch (_: RuntimeException) {
             markOffline("无法连接 PC")
+        }
+    }
+
+    private fun installConnectionStatusCallback(active: MobileClient) {
+        if (statusCallbackInstalled) return
+        active.setConnectionStatusCallback(object : ConnectionStatusCallback {
+            override fun onStatus(status: MobileConnectionStatus) {
+                enqueueCallback { applyConnectionStatus(status) }
+            }
+        })
+        statusCallbackInstalled = true
+    }
+
+    private fun applyConnectionStatus(status: MobileConnectionStatus) {
+        val hostId = mutableState.value.selectedHostId ?: return
+        when (val presentation = ConnectionStatusPresenter.present(status)) {
+            is ConnectionStatusPresentation.Offline -> {
+                connected = false
+                markOffline(presentation.reason)
+            }
+            ConnectionStatusPresentation.Connecting -> {
+                connected = false
+                markOffline("正在恢复安全连接")
+                mutableState.update {
+                    it.copy(connection = ConnectionUiState.Connecting(hostLabel(hostId)))
+                }
+            }
+            is ConnectionStatusPresentation.Online -> {
+                // A callback already queued when the user disconnects must not resurrect the UI.
+                if (!workerStarted) return
+                connected = true
+                mutableState.update {
+                    it.copy(
+                        connection = ConnectionUiState.Live(
+                            hostName = hostLabel(hostId),
+                            endpointLabel = presentation.endpointLabel,
+                        ),
+                    )
+                }
+                reconcileSubscriptions()
+            }
         }
     }
 
@@ -902,6 +1058,8 @@ internal class MobileRepository(context: Context) : Closeable {
             val active = client
             runCatching { active?.disconnect() }
             workerStarted = false
+            runCatching { active?.clearConnectionStatusCallback() }
+            statusCallbackInstalled = false
             runCatching { active?.destroy() }
             client = null
             ephemeralText.clear()
@@ -917,6 +1075,13 @@ internal class MobileRepository(context: Context) : Closeable {
         is LiveBinding.Blocked, is LiveBinding.NotBound, null -> null
     }
 }
+
+internal sealed interface RemoteRecoveryTrigger {
+    data class NetworkChanged(val epoch: Long) : RemoteRecoveryTrigger
+    data object PushWake : RemoteRecoveryTrigger
+}
+
+private const val REMOTE_PAIR_URI_PREFIX = "onekaleidoscope://remote/v1?data="
 
 private data class ActiveSubscription(
     val generation: Long,

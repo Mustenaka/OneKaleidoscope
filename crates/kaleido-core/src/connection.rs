@@ -16,6 +16,12 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConnection, StreamOwned};
 use zeroize::Zeroizing;
 
+#[path = "remote_tunnel.rs"]
+pub(crate) mod remote_tunnel;
+
+use remote_tunnel::RemoteTunnelStream;
+pub use remote_tunnel::SelectedRemotePath;
+
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_BUFFER_BYTES: usize = 8_192;
 
@@ -33,8 +39,38 @@ pub enum ConnectionError {
     Closed,
 }
 
+enum WireSocket {
+    Tcp(TcpStream),
+    Remote(Box<RemoteTunnelStream>),
+}
+
+impl Read for WireSocket {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Tcp(socket) => socket.read(buffer),
+            Self::Remote(stream) => stream.read(buffer),
+        }
+    }
+}
+
+impl Write for WireSocket {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Tcp(socket) => socket.write(buffer),
+            Self::Remote(stream) => stream.write(buffer),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(socket) => socket.flush(),
+            Self::Remote(stream) => stream.flush(),
+        }
+    }
+}
+
 pub struct WireConnection {
-    stream: StreamOwned<ClientConnection, TcpStream>,
+    stream: StreamOwned<ClientConnection, WireSocket>,
     decoder: FrameDecoder,
     pending: VecDeque<Frame>,
 }
@@ -63,6 +99,21 @@ impl WireConnection {
             .set_read_timeout(Some(IO_TIMEOUT))
             .and_then(|()| socket.set_write_timeout(Some(IO_TIMEOUT)))
             .map_err(|_| ConnectionError::Io)?;
+        Self::from_socket(WireSocket::Tcp(socket), encoded_pin)
+    }
+
+    pub fn connect_remote(
+        host_endpoint_id: &str,
+        relay_url: &str,
+        relay_auth_token: &str,
+        encoded_pin: &str,
+    ) -> Result<Self, ConnectionError> {
+        let stream = RemoteTunnelStream::connect(host_endpoint_id, relay_url, relay_auth_token)
+            .map_err(|_| ConnectionError::Connect)?;
+        Self::from_socket(WireSocket::Remote(Box::new(stream)), encoded_pin)
+    }
+
+    fn from_socket(socket: WireSocket, encoded_pin: &str) -> Result<Self, ConnectionError> {
         let pin = SpkiPin::parse(encoded_pin).map_err(|_| ConnectionError::Security)?;
         let config = client_config(pin).map_err(|_| ConnectionError::Security)?;
         let server_name =
@@ -166,9 +217,30 @@ impl WireConnection {
     }
 
     pub fn set_poll_timeout(&self, timeout: Duration) -> Result<(), ConnectionError> {
-        self.stream
-            .sock
-            .set_read_timeout(Some(timeout))
-            .map_err(|_| ConnectionError::Io)
+        match &self.stream.sock {
+            WireSocket::Tcp(socket) => socket.set_read_timeout(Some(timeout)),
+            WireSocket::Remote(stream) => stream.set_read_timeout(Some(timeout)),
+        }
+        .map_err(|_| ConnectionError::Io)
+    }
+
+    pub fn selected_remote_path(&self) -> Result<Option<SelectedRemotePath>, ConnectionError> {
+        match &self.stream.sock {
+            WireSocket::Tcp(_) => Ok(None),
+            WireSocket::Remote(stream) => stream
+                .selected_path()
+                .map(Some)
+                .map_err(|_| ConnectionError::Connect),
+        }
+    }
+
+    pub fn notify_network_change(&self) -> Result<bool, ConnectionError> {
+        match &self.stream.sock {
+            WireSocket::Tcp(_) => Ok(false),
+            WireSocket::Remote(stream) => {
+                stream.notify_network_change();
+                Ok(true)
+            }
+        }
     }
 }
