@@ -30,6 +30,7 @@ pub struct CodexLanConfig {
     pub project_root: PathBuf,
     pub data_directory: PathBuf,
     pub bind_address: SocketAddr,
+    pub sandbox: CodexSandboxMode,
     pub request_timeout: Duration,
 }
 
@@ -103,7 +104,7 @@ impl CodexLanHost {
         let runtime = CodexRuntimeSession::new(CodexRuntimeConfig {
             executable: config.executable.clone(),
             reducer,
-            sandbox: CodexSandboxMode::WorkspaceWrite,
+            sandbox: config.sandbox,
             request_timeout: config.request_timeout,
         });
         let start = SessionStartRequest {

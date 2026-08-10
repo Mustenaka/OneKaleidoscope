@@ -1,7 +1,7 @@
 # CLAUDE.md — 项目主管工作合同
 
-> Claude Code 的身份是项目主管（Orchestrator & Reviewer）。
-> 当前状态：**R2 已完成；R3 已开工，[T-107](docs/tasks/T-107.md) active。**
+> 进入仓库的 Claude Code、Codex 与人类遵循同一执行角色；具体技术纪律见 [AGENTS.md](AGENTS.md)。
+> 当前状态：**R0～R3 已完成；下一里程碑是 R4 自有 Ubuntu 远程连接。**
 
 ## 1. 每次启动必须先读
 
@@ -37,18 +37,20 @@
 
 上游没有公开路径时，登记阻塞并保留失败验收格。不得隐藏、改名或降低需求来宣布完成。
 
-## 3. 当前工作：R3 Android 局域网纵切
+## 3. 当前工作：R3 已结清，准备 R4
 
 R0、R1、R2 已通过；仓库收敛、T-105 schema drift、T-103 Attention provenance 与
-T-104 LiveControl 均已结清。R3 固定拆成三个审核边界：
+T-104 LiveControl 均已结清。R3 最终由四个独立边界完成：
 
 1. [T-106](docs/tasks/T-106.md)：UACP 0.3 projection cursor、可信 mobile ingress、
    TRANSPORT 0.1；
 2. [T-107](docs/tasks/T-107.md)：hostd LAN broker、projection journal 与 Rust mobile core；
 3. [T-108](docs/tasks/T-108.md)：Android Compose 与断线/冷启恢复。
+4. [T-109](docs/tasks/T-109.md)：实体 arm64 Wi-Fi、硬件密钥、真实审批、OEM 后台、
+   force-stop cursor 恢复与吊销门禁。
 
-T-106 必须先完成合同、双端绑定与三平台 CI；不得在合同未闭合时先私设 socket 或 Kotlin
-状态机。T-107、T-108 也必须分开审核。
+T-106～T-109 均已通过。R4 尚未开卡；开卡前先审计 Ubuntu rendezvous/relay、跨公网
+E2EE、推送与活进程树终止的现有合同和实现缺口。
 
 仍携带的项目：
 
@@ -59,8 +61,8 @@ T-106 必须先完成合同、双端绑定与三平台 CI；不得在合同未�
 | D-B11 | OpenCode 实机与 schema 快照需在接入前重新对齐 | R5 |
 | D-B8 / P-2 | 见 [tasks/README](docs/tasks/README.md) | 不阻塞 |
 
-G-R1-1 虽已解除，但它只证明 UniFFI 能表达并编译 callback/object/async/throwing；
-线程调度、背压、进程被杀后的恢复必须由 T-107/T-108 取得真实证据。
+G-R1-1 已解除；线程调度、背压、进程被杀后的恢复也已由 T-107～T-109 取得 emulator
+与实体设备证据。
 
 `docs/PROTOCOL.md` 与 `crates/kaleido-proto` 现在是合同：修改必须先改协议、走 ADR，
 再改代码。协议从 canonical state、commands、projections 和 workflow 推导，
@@ -69,7 +71,7 @@ G-R1-1 虽已解除，但它只证明 UniFFI 能表达并编译 callback/object/
 
 T-001～T-013 已冻结，T-014 已撤销，T-101 已作废。不得重新下发、续写或从旧 M1 队列复制 prompt。
 
-## 4. 主管职责
+## 4. 统一执行职责
 
 ### 必须做
 
@@ -122,7 +124,8 @@ T-001～T-013 已冻结，T-014 已撤销，T-101 已作废。不得重新下发
 - proto、其他 provider、历史 fixture 等禁止范围
 ```
 
-实现方每次只接一张卡。外部原生表面研究与 Broker 管理会话实现必须拆卡，避免未知接口阻塞主线。
+任务必须保持可独立审核的边界；互不冲突的模块可以并行。外部原生表面研究与 Broker
+管理会话实现仍必须拆卡，避免未知接口阻塞主线。
 
 ## 6. 审核重点
 
@@ -150,26 +153,11 @@ T-001～T-013 已冻结，T-014 已撤销，T-101 已作废。不得重新下发
 复查触发条件：
 ```
 
-阻塞不自动等于停掉整个项目。主管应把独立纵切继续推进，同时让相应验收格保持未通过。
+阻塞不自动等于停掉整个项目。执行者应把独立纵切继续推进，同时让相应验收格保持未通过。
 
-## 8. 下一次主管输出
+## 8. 下一次输出
 
-按实现方的交付情况三选一：
-
-**下一步是开两张卡**（T-103 = P-1，T-104 = D-B1，或按当时编号）：
-
-- **P-1**：`AttentionState::Answered` 强制 `command_id`，但被观察到的外部应答没有本地命令。
-  现在 replay 路径铸了一个确定性 ID 顶上——canonical 状态里存在一个指不到任何命令的引用。
-  R3 之后手机会真的按它回查。先写 ADR，再改 proto。
-- **D-B1**：`Capability::LiveControl` 只出现在枚举列表里，没有任何代码路径会把它标记为
-  proven，因此 `LiveBinding::Controlling` 结构性不可达，手机会一直渲染成只读。
-  要么让命令被 runtime 接受时提升它，要么在协议里说清 `LiveControl` 与 `TurnPrompt`
-  的区别。先写 ADR，再改代码。
-
-**两张卡必须分开**——它们是不同的问题，合并会让审核失焦。
-
-**开卡前先提醒负责人收敛仓库**。T-102 四次阻塞的共同根因就是本地状态与已推送状态脱节；
-带着两个不完整的来源开下一张卡，同样的问题会继续复利。
-
-任何情况下都不要在当前活动卡之外自行扩大范围，也不要为了「看起来有进展」
-去动 `schemas/`、`tests/fixtures/` 或 `spikes/`。
+下一步为 R4 开独立任务卡。先做只读审计并明确：Ubuntu host 身份与部署、rendezvous、
+relay 密文路径、跨公网 E2EE、设备推送、网络切换、活进程树终止及隐私日志门禁。
+不得把 LAN TLS 直接称为公网 relay，也不得为推进 R4 擅改 `schemas/`、历史 fixture 或其他
+provider。仍需保留 R5 的 OpenCode D-B11、R7 的原生 CLI/GUI 六格和 R9 的路径规则边界。
