@@ -1,8 +1,8 @@
 # MILESTONES — 重新定基线后的实施顺序
 
-> 生效：2026-07-30（R1 主管评审后更新）
-> 原 M1 与 T-001～T-014 已冻结/撤销。R1 **有条件通过**（携带 UB-R1-S）；
-> [T-100](tasks/T-100.md) 已 active，R2 开工。平台顺序见
+> 生效：2026-08-10（R3 最终门禁后更新）
+> 原 M1 与 T-001～T-014 已冻结/撤销。R0～R3 已完成，R1 携带的 UB-R1-S 已由
+> [T-102](tasks/T-102.md) 解除；下一里程碑是 R4。平台顺序见
 > [ADR-0013](adr/0013-platform-track-order.md)：Windows + Android 先行。
 
 ## 总原则
@@ -24,15 +24,15 @@
 
 ## R1 — 合同定稿（项目主管负责）
 
-状态：**有条件通过（携带 UB-R1-S），2026-07-30 主管评审**。验收记录见
-[R1-result.md](gates/R1-result.md) §0。协议、proto、Kotlin 编译与 workspace 基线已恢复
-并经主管独立复跑与变异复验；Swift 绑定已生成，但当前 Windows/WSL 环境没有 Swift 编译器。
+状态：**已完成**。2026-07-30 的原始验收是有条件通过，历史记录见
+[R1-result.md](gates/R1-result.md) §0；其唯一携带项 UB-R1-S 已由
+[T-102](tasks/T-102.md) 在 `macos-latest` 上完成真实 Swift 编译和变异验证。
 
 按 [ADR-0013](adr/0013-platform-track-order.md) D-2，原「移动端双端编译」门禁拆为：
 
 - **R1-K**（Kotlin 编译）：通过；
-- **R1-S**（Swift 编译）：未通过，登记 **UB-R1-S**，**携带至 R8 作为硬前置**，
-  解除路径是 [T-102](tasks/T-102.md) 在已有 `macos-latest` CI job 上的真实编译。
+- **R1-S**（Swift 编译）：通过，由 [T-102](tasks/T-102.md) 在 `macos-latest`
+  CI 中结清；不再是 R8 的未解除前置。
 
 产出：
 
@@ -47,7 +47,7 @@
 - 合同能表达项目索引、历史、活动会话、队列、Attention Inbox、工作流 —— 通过；
 - 明确 queue 与 steer、history 与 live、decline 与 error —— 通过；
 - 用现有真实 fixture 验证至少两个 reducer 难点，但不要求补齐矩阵 —— 通过（三个）；
-- 移动端绑定对最小真实类型编译通过 —— Kotlin 通过；Swift 见 UB-R1-S。
+- 移动端绑定对最小真实类型编译通过 —— Kotlin 与 Swift 均通过。
 
 禁止：在 R1 前恢复 T-014 或创建 adapter 自有临时全局模型。
 
@@ -98,12 +98,15 @@ force-stop 精确 cursor 恢复与 durable revoke；结果见 [T-109-result.md](
 - 配对；
 - ProjectIndex、SessionIndex、Transcript、LiveActivity；
 - InputQueue、AttentionInbox；
-- approve/deny、question、prompt/steer/interrupt；
+- prompt 与真实 approve/deny；question、steer、interrupt 按 runtime capability 诚实呈现，
+  不支持的 steer 意图保持排队；
 - LAN 断线重连。
 
 门禁：用户离开 PC 后可以只用 Android 完成一次会话干预。
 
 ## R4 — 自有 Ubuntu 远程连接
+
+状态：**active**，任务卡 [T-110](tasks/T-110.md)。
 
 产出：
 
@@ -153,8 +156,8 @@ NAT 20 轮测试属于性能与容量数据，不再决定 relay 是否开发，
 
 ## R8 — iOS 对齐
 
-**入口前置：UB-R1-S 必须先解除**（[ADR-0013](adr/0013-platform-track-order.md) D-2、
-[T-102](tasks/T-102.md) §5.1）。R1 携带的 Swift 编译门禁在这里结清，不得跳过。
+入口前置 UB-R1-S 已由 [T-102](tasks/T-102.md) 解除；R8 不再等待 Swift 编译探针，
+但仍必须完成真实 iOS 产品 App 与设备门禁。
 
 在 Android 核心交互稳定后对齐 iOS：
 

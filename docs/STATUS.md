@@ -6,7 +6,8 @@
 
 ## 1. 当前结论
 
-**R0、R1、R2、R3 已完成；下一里程碑是 R4 自有 Ubuntu 远程连接。**
+**R0、R1、R2、R3 已完成；R4 自有 Ubuntu 远程连接已由
+[T-110](tasks/T-110.md) 开卡。**
 
 已经跑通并持久化验证的 PC 端纵切是：
 
@@ -74,13 +75,14 @@ approval decline、90 秒 OEM 后台、外部 force-stop cursor 恢复与 durabl
 | 3 | [T-108](tasks/T-108.md) | Android Compose 项目/会话/实时/队列/Attention、冷启与断线恢复 |
 | 4 | [T-109](tasks/T-109.md) | 实体 arm64 Wi-Fi、硬件密钥、真实审批、OEM 后台、force-stop 与吊销最终门禁 |
 
-下一步进入 R4：Ubuntu rendezvous/relay、跨公网 E2EE、推送与活进程树终止。
+当前活动任务是 [T-110](tasks/T-110.md)：Ubuntu rendezvous/P2P/relay、跨公网 E2EE、
+Android FCM、网络切换与活进程树终止。
 
 ## 5. 尚未完成的后续里程碑
 
 | 里程碑 | 内容 |
 |---|---|
-| R4 | Ubuntu rendezvous/relay、跨公网 E2EE、推送、活进程树终止 |
+| R4 / [T-110](tasks/T-110.md) | Ubuntu rendezvous/relay、跨公网 E2EE、推送、活进程树终止 |
 | R5 | OpenCode、Claude Broker 管理会话；先结清 OpenCode D-B11 |
 | R6 | 跨 Agent workflow 执行器与手机 WorkflowBoard |
 | R7 | 三家 CLI/GUI 六格真实验收 |
@@ -91,9 +93,9 @@ approval decline、90 秒 OEM 后台、外部 force-stop cursor 恢复与 durabl
 
 | ID | 内容 | 结清点 |
 |---|---|---|
-| D-B2 | 活进程树终止尚无真实存活子树测试 | R4 |
+| D-B2 | 活进程树终止尚无真实存活子树测试 | T-110 |
 | D-B6 / D-B7 | Unix 反斜杠与 macOS `/var` 符号链接路径规则 | R9 |
-| D-B8 | `<HOME>` / `<SANDBOX>` 脱敏标签精度 | R4 |
+| D-B8 | `<HOME>` / `<SANDBOX>` 脱敏标签精度 | T-110 |
 | D-B11 | OpenCode 实机与快照版本对齐 | R5 |
 | P-2 | Codex approval 没有真实过期时间 | UI 必须诚实显示无过期时间 |
 
