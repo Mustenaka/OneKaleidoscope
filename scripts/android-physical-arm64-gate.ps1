@@ -294,7 +294,10 @@ try {
     if ($hostProcess -and -not $hostProcess.HasExited) {
         $hostProcess.StandardInput.WriteLine('stop')
         $hostProcess.StandardInput.Flush()
-        if (-not $hostProcess.WaitForExit(30000)) { $hostProcess.Kill($true) }
+        if (-not $hostProcess.WaitForExit(30000)) {
+            & taskkill.exe /PID $hostProcess.Id /T /F *> $null
+            [void]$hostProcess.WaitForExit(30000)
+        }
     }
     Pop-Location
 }
