@@ -112,6 +112,39 @@ class OneKaleidoscopeUiTest {
     }
 
     @Test
+    fun questionSetRendersEveryPromptAndSubmitsKeyedAnswersTogether() {
+        val actions = CopyOnWriteArrayList<UiAction>()
+        compose.setContent {
+            OneKaleidoscopeApp(
+                state = verticalSliceState().copy(
+                    attention = PanelState(listOf(questionSetAttention())),
+                ),
+                onAction = actions::add,
+            )
+        }
+
+        compose.onNode(hasText("待处理") and hasClickAction()).performClick()
+        compose.onNodeWithText("处理").performClick()
+        compose.onNodeWithText("选择语言").assertIsDisplayed()
+        compose.onNodeWithText("要包含哪些").assertIsDisplayed()
+        compose.onNodeWithText("Rust").performClick()
+        compose.onNodeWithText("测试").performClick()
+        compose.onNodeWithText("本题自定义回答").performTextInput("覆盖率说明")
+        compose.onNodeWithText("提交全部回答").performClick()
+
+        assertEquals(
+            UiAction.RespondQuestion(
+                ATTENTION_ID,
+                listOf(
+                    QuestionAnswerDraftUi("language", listOf("rust"), null),
+                    QuestionAnswerDraftUi("details", listOf("tests"), "覆盖率说明"),
+                ),
+            ),
+            actions.filterIsInstance<UiAction.RespondQuestion>().single(),
+        )
+    }
+
+    @Test
     fun approvalOptionIsForwardedVerbatimRatherThanReinterpretedByUi() {
         val actions = CopyOnWriteArrayList<UiAction>()
         val approval = AttentionUi(
@@ -196,6 +229,38 @@ class OneKaleidoscopeUiTest {
                 DecisionOptionUi("stop", "停止并等待", DecisionToneUi.Neutral),
             ),
             freeFormAllowed = freeFormAllowed,
+        ),
+        expiresLabel = null,
+        responseAvailability = ActionAvailability.Enabled,
+    )
+
+    private fun questionSetAttention() = AttentionUi(
+        id = ATTENTION_ID,
+        projectName = "OneKaleidoscope",
+        sessionTitle = "R3 Android",
+        subject = AttentionSubjectUi.Question(
+            questions = listOf(
+                QuestionPromptUi(
+                    key = "language",
+                    prompt = "选择语言",
+                    options = listOf(
+                        DecisionOptionUi("rust", "Rust", DecisionToneUi.Positive),
+                        DecisionOptionUi("python", "Python", DecisionToneUi.Neutral),
+                    ),
+                    multiSelect = false,
+                    freeFormAllowed = false,
+                ),
+                QuestionPromptUi(
+                    key = "details",
+                    prompt = "要包含哪些",
+                    options = listOf(
+                        DecisionOptionUi("tests", "测试", DecisionToneUi.Neutral),
+                        DecisionOptionUi("docs", "文档", DecisionToneUi.Neutral),
+                    ),
+                    multiSelect = true,
+                    freeFormAllowed = true,
+                ),
+            ),
         ),
         expiresLabel = null,
         responseAvailability = ActionAvailability.Enabled,

@@ -1,6 +1,6 @@
 # Upstream schema versions
 
-Fetched at: `2026-08-09T07:39:58Z`
+Fetched at: `2026-08-10T09:57:20Z`
 
 All versions and source revisions below are exact. The JSON files under
 `schemas/` are unmodified upstream snapshots.
@@ -27,14 +27,14 @@ codex app-server generate-json-schema --out schemas/codex
 
 ## OpenCode
 
-- CLI: `1.18.8`
-- npm package: `opencode-ai@1.18.8`
+- CLI: `1.18.16`
+- npm package: `opencode-ai@1.18.16`
 - OpenAPI document: `3.1.0`
 - JSON files: `1`
 - Reproduction commands on Windows PowerShell, using two terminals:
 
 ```powershell
-npm.cmd install --global opencode-ai@1.18.8
+npm.cmd install --global opencode-ai@1.18.16
 opencode.cmd serve --pure --hostname 127.0.0.1 --port 4096 --log-level ERROR
 ```
 
@@ -46,7 +46,7 @@ curl.exe --fail --silent --show-error --noproxy "*" --header "Accept: applicatio
 - Reproduction commands on macOS/Linux, using two terminals:
 
 ```sh
-npm install --global opencode-ai@1.18.8
+npm install --global opencode-ai@1.18.16
 opencode serve --pure --hostname 127.0.0.1 --port 4096 --log-level ERROR
 ```
 

@@ -1,7 +1,7 @@
 //! UACP contract types.
 //!
 //! This crate is the machine-readable form of `docs/PROTOCOL.md`. Every type
-//! here has a definition in that document, and every version 0.3 type in that
+//! here has a definition in that document, and every version 0.5 type in that
 //! document exists here. Changing this crate requires changing the document and
 //! recording an ADR first (`AGENTS.md` section 2.1).
 //!
@@ -56,12 +56,12 @@ uniffi::setup_scaffolding!();
 ///
 /// Peers must refuse a different major version rather than guess
 /// (`docs/PROTOCOL.md` section 1).
-pub const PROTOCOL_VERSION: &str = "0.3.0";
+pub const PROTOCOL_VERSION: &str = "0.5.0";
 
 /// Whether a peer's protocol version is compatible with this build.
 ///
 /// Pre-1.0 minor versions are compatibility boundaries. This build therefore
-/// accepts `0.3.x`, but rejects every other `0.x` line. Once the protocol
+/// accepts `0.5.x`, but rejects every other `0.x` line. Once the protocol
 /// reaches 1.0, normal same-major compatibility applies.
 pub fn version_is_compatible(peer_version: &str) -> bool {
     fn parse(version: &str) -> Option<(u64, u64, u64)> {
@@ -215,6 +215,51 @@ pub enum ContractViolation {
 
     #[error("an interactive request repeats decision option `{option_id}`")]
     DuplicateDecisionOption { option_id: String },
+
+    #[error("a question request must contain at least one question")]
+    QuestionSetEmpty,
+
+    #[error("a question request repeats question key `{question_key}`")]
+    DuplicateQuestionKey { question_key: String },
+
+    #[error("a question response must contain one answer for every question")]
+    QuestionAnswersRequired,
+
+    #[error("question answers are not valid for this attention subject")]
+    QuestionAnswersUnexpected,
+
+    #[error("question answers cannot use top-level option or free-form fields")]
+    QuestionTopLevelDecision,
+
+    #[error("a question answer contains no option or free-form content")]
+    QuestionAnswerEmpty,
+
+    #[error("a question response repeats an answer key")]
+    QuestionAnswerDuplicateKey,
+
+    #[error("a question answer repeats an option id")]
+    QuestionAnswerDuplicateOption,
+
+    #[error("a question answer names an unknown question key")]
+    QuestionAnswerUnknownKey,
+
+    #[error("a question answer names an unknown option")]
+    QuestionAnswerUnknownOption,
+
+    #[error("a single-select question has more than one option")]
+    QuestionAnswerTooManyOptions,
+
+    #[error("a question response omits an answer")]
+    QuestionAnswerMissing,
+
+    #[error("free-form content is not allowed for this question")]
+    FreeFormNotAllowed,
+
+    #[error("question free-form content is invalid")]
+    InvalidFreeForm,
+
+    #[error("a response names an unknown option")]
+    UnknownOption,
 
     #[error("an attention response contains neither an option nor free-form content")]
     AttentionDecisionMissing,

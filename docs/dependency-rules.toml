@@ -71,6 +71,9 @@ may_depend_on = ["kaleido-proto", "kaleido-adapter"]
 [crates."kaleido-adapter-opencode"]
 may_depend_on = ["kaleido-proto", "kaleido-adapter"]
 
+[crates."kaleido-adapter-claude"]
+may_depend_on = ["kaleido-proto", "kaleido-adapter"]
+
 [crates."kaleido-transport"]
 may_depend_on = ["kaleido-proto"]
 

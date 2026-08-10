@@ -316,7 +316,7 @@ fn a_correlated_live_turn_response_proves_control_in_store_safe_order() {
             if ack.command_id == command_id
                 && matches!(
                     &ack.outcome,
-                    CommandOutcome::AcceptedByRuntime { binding_handle }
+                    CommandOutcome::AcceptedByRuntime { binding_handle, .. }
                         if binding_handle.kind == ProviderBindingKind::RuntimeAcknowledgement
                             && binding_handle.runtime_id == *reducer.runtime_id()
                 )
@@ -720,7 +720,7 @@ fn a_live_unassociated_reply_is_an_externally_observed_answer() {
 }
 
 #[test]
-fn a_live_locally_associated_reply_never_overwrites_the_stores_real_answer() {
+fn a_live_locally_associated_reply_publishes_the_real_answer_once() {
     // Reorder only frames from the real approval recording so the operation
     // arrives *after* the outgoing reply. This exercises the hidden overwrite
     // path where a later join refresh could otherwise republish the replay-only
@@ -773,10 +773,19 @@ fn a_live_locally_associated_reply_never_overwrites_the_stores_real_answer() {
         )
         .expect("the recorded outgoing reply must decode and validate");
     assert!(
-        reply_effects
-            .iter()
-            .all(|effect| !matches!(effect, StateEffect::AttentionUpserted { .. })),
-        "the reducer must not replace the store's LocalCommand answer"
+        reply_effects.iter().any(|effect| matches!(
+            effect,
+            StateEffect::AttentionUpserted {
+                item: kaleido_proto::attention::AttentionItem {
+                    state: AttentionState::Answered {
+                        answer_source: AttentionAnswerSource::LocalCommand { command_id },
+                        ..
+                    },
+                    ..
+                }
+            } if command_id.as_str() == "cmd_real_local_answer"
+        )),
+        "the structured reply must publish the exact LocalCommand answer"
     );
     assert!(
         reducer

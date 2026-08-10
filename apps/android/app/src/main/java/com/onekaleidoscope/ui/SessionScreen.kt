@@ -253,6 +253,22 @@ private fun QueueEntryCard(entry: QueueEntryUi) {
 internal fun PromptComposer(state: AppUiState, onAction: (UiAction) -> Unit, modifier: Modifier = Modifier) {
     Surface(modifier.fillMaxWidth(), tonalElevation = 3.dp, shadowElevation = 3.dp) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                AvailabilityButton(
+                    label = "恢复历史会话",
+                    availability = state.resumeAction,
+                    onClick = { onAction(UiAction.ResumeSession) },
+                    modifier = Modifier.weight(1f),
+                    prominent = false,
+                )
+                AvailabilityButton(
+                    label = "中断当前回合",
+                    availability = state.interruptAction,
+                    onClick = { onAction(UiAction.InterruptTurn) },
+                    modifier = Modifier.weight(1f),
+                    prominent = false,
+                )
+            }
             OutlinedTextField(
                 value = state.draft,
                 onValueChange = { onAction(UiAction.UpdateDraft(it)) },

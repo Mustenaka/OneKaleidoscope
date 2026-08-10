@@ -36,7 +36,7 @@ pub struct DiagnosticProjectionEnvelope {
     pub payload: ProjectionPayload,
 }
 
-/// The eight product read-model classes exposed by the v0.3 projection
+/// The eight product read-model classes exposed by the v0.4 projection
 /// contract. Presence in this list does not imply that a provider invents an
 /// instance; for example, Codex has no WorkflowBoard until canonical workflow
 /// state actually exists.

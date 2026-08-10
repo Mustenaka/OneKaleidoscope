@@ -14,8 +14,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use kaleido_proto::attention::{
     AttentionAnswerSource, AttentionItem, AttentionState, ReplyRejection,
 };
+use kaleido_proto::capability::Capability;
 use kaleido_proto::command::{
     Actor, Command, CommandAck, CommandEnvelope, CommandOutcome, DeviceCommandRequest,
+    RuntimeAcceptanceKind,
 };
 use kaleido_proto::content::{
     ContentKind, ContentReadRequest, ContentReadResponse, ContentRef, ContentWriteRequest,
@@ -47,6 +49,13 @@ use crate::state::CanonicalState;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateCommit {
     pub records: Vec<LogRecord>,
+    pub projections: Vec<ProjectionEnvelope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueDeliveryClaim {
+    pub entry: QueueEntry,
+    pub command_id: CommandId,
     pub projections: Vec<ProjectionEnvelope>,
 }
 
@@ -269,10 +278,12 @@ impl CanonicalStore {
                     AttentionState::Answered {
                         option_id,
                         free_form_ref,
+                        question_answers,
                         decided_at_ms,
                         answer_source: AttentionAnswerSource::LocalCommand { command_id },
                     } if option_id == &response.option_id
                         && free_form_ref == &response.free_form_ref
+                        && question_answers == &response.question_answers
                         && *decided_at_ms == recovery.envelope.issued_at_ms
                         && command_id == &recovery.envelope.command_id
                 ) {
@@ -432,7 +443,11 @@ impl CanonicalStore {
             admission_ack.clone(),
         )?;
         let checkpoint = self.projections.checkpoint();
-        let actual_ack = if device_route_uses_submit(&envelope.body) {
+        let actual_ack = if device_route_uses_submit(&envelope.body)
+            && matches!(
+                admission_ack.outcome,
+                CommandOutcome::AcceptedLocally { .. } | CommandOutcome::Enqueued { .. }
+            ) {
             match self.submit_command(envelope, now_ms) {
                 Ok(ack) => ack,
                 Err(error) => {
@@ -498,7 +513,10 @@ impl CanonicalStore {
             })?;
         if !matches!(
             pending.envelope.body,
-            Command::SubmitPrompt { .. } | Command::RespondAttention { .. }
+            Command::SubmitPrompt { .. }
+                | Command::RespondAttention { .. }
+                | Command::InterruptTurn { .. }
+                | Command::ResumeSession { .. }
         ) {
             return Err(StateError::DeviceCommandMismatch {
                 detail: "only a concrete R3 runtime route can be rejected during recovery",
@@ -568,15 +586,94 @@ impl CanonicalStore {
                 StateEffect::CommandAcknowledged { ack } if ack.command_id != command_id
             )
         });
-        let valid_terminal = match claimed.body {
-            Command::SubmitPrompt { .. } => {
-                matching_terminal_ack_count == 1 && !has_invalid_matching_ack && !has_foreign_ack
+        let terminal_outcome = effects.iter().find_map(|effect| match effect {
+            StateEffect::CommandAcknowledged { ack } if ack.command_id == command_id => {
+                Some(&ack.outcome)
             }
-            // The approval adapter's successful structured response closes
-            // the route but is not protocol evidence for AcceptedByRuntime.
-            // The sole acknowledgement therefore remains AcceptedLocally.
-            Command::RespondAttention { .. } => {
-                matching_terminal_ack_count == 0 && !has_invalid_matching_ack && !has_foreign_ack
+            _ => None,
+        });
+        let common_terminal =
+            matching_terminal_ack_count == 1 && !has_invalid_matching_ack && !has_foreign_ack;
+        let valid_terminal = match &claimed.body {
+            Command::SubmitPrompt { session_id, .. } => {
+                common_terminal
+                    && match terminal_outcome {
+                        Some(CommandOutcome::AcceptedByRuntime {
+                            session_id: acknowledged_session,
+                            acceptance_kind: RuntimeAcceptanceKind::PromptTurn,
+                            ..
+                        }) if acknowledged_session == session_id => effects.iter().any(|effect| {
+                            matches!(
+                                effect,
+                                StateEffect::TurnUpserted { turn }
+                                    if &turn.session_id == session_id
+                                        && matches!(
+                                            &turn.origin,
+                                            kaleido_proto::turn::TurnOrigin::RemoteCommand {
+                                                command_id: turn_command
+                                            } if turn_command == &command_id
+                                        )
+                            )
+                        }),
+                        Some(CommandOutcome::Rejected { .. }) => true,
+                        _ => false,
+                    }
+            }
+            Command::InterruptTurn { session_id, .. } => {
+                common_terminal
+                    && (matches!(
+                        terminal_outcome,
+                            Some(CommandOutcome::AcceptedByRuntime {
+                                session_id: acknowledged_session,
+                                acceptance_kind: RuntimeAcceptanceKind::SessionControl,
+                                ..
+                        }) if acknowledged_session == session_id
+                    ) || matches!(terminal_outcome, Some(CommandOutcome::Rejected { .. })))
+            }
+            Command::ResumeSession { session_id } => {
+                matching_terminal_ack_count == 0
+                    && !has_invalid_matching_ack
+                    && !has_foreign_ack
+                    && effects.iter().any(|effect| {
+                        matches!(
+                            effect,
+                            StateEffect::SessionUpserted { session }
+                                if &session.id == session_id
+                                    && self.state.runtime_of(session).is_some()
+                        )
+                    })
+            }
+            // A structured provider result closes the route, but is not an
+            // AcceptedByRuntime command receipt. Require the exact Answered
+            // transition correlated to this local command instead.
+            Command::RespondAttention { response } => {
+                matching_terminal_ack_count == 0
+                    && !has_invalid_matching_ack
+                    && !has_foreign_ack
+                    && effects.iter().any(|effect| {
+                        matches!(
+                            effect,
+                            StateEffect::AttentionUpserted { item }
+                                if item.id == response.attention_id
+                                    && item.session_id == response.session_id
+                                    && matches!(
+                                        &item.state,
+                                        AttentionState::Answered {
+                                            option_id,
+                                            free_form_ref,
+                                            question_answers,
+                                            answer_source:
+                                                AttentionAnswerSource::LocalCommand {
+                                                    command_id: answered_command,
+                                                },
+                                            ..
+                                        } if option_id == &response.option_id
+                                            && free_form_ref == &response.free_form_ref
+                                            && question_answers == &response.question_answers
+                                            && answered_command == &command_id
+                                    )
+                        )
+                    })
             }
             _ => false,
         };
@@ -594,6 +691,142 @@ impl CanonicalStore {
 
     pub fn pending_dispatches(&self) -> Vec<PendingDispatch> {
         self.device_outbox.pending()
+    }
+
+    pub fn pending_queue_deliveries(&self) -> Vec<(QueueEntry, CommandId)> {
+        self.state
+            .sessions()
+            .filter(|session| session.active_turn_id.is_none())
+            .filter_map(|session| {
+                self.state.queue_of(&session.id).into_iter().find(|entry| {
+                    entry.intent == QueueIntent::NewTurn
+                        && matches!(entry.state, QueueState::Pending)
+                })
+            })
+            .filter_map(|entry| {
+                self.state
+                    .queue_command_id(&entry.id)
+                    .cloned()
+                    .map(|command_id| (entry.clone(), command_id))
+            })
+            .collect()
+    }
+
+    /// Durably moves a pending entry to Submitting before provider bytes can
+    /// leave the process. A crash afterwards is intentionally uncertain and
+    /// is never auto-replayed.
+    pub fn claim_queue_delivery(
+        &mut self,
+        entry_id: &QueueEntryId,
+        at_ms: i64,
+    ) -> Result<QueueDeliveryClaim, StateError> {
+        self.ensure_writable()?;
+        let mut entry = self
+            .state
+            .queue_entry(entry_id)
+            .filter(|entry| {
+                entry.intent == QueueIntent::NewTurn && matches!(entry.state, QueueState::Pending)
+            })
+            .cloned()
+            .ok_or(StateError::DeviceCommandMismatch {
+                detail: "queue entry is not a pending new-turn delivery",
+            })?;
+        let command_id = self
+            .state
+            .queue_command_id(entry_id)
+            .cloned()
+            .ok_or(StateError::CommandOutboxDiverged)?;
+        entry.state = QueueState::Submitting {
+            command_id: command_id.clone(),
+        };
+        entry.editable = false;
+        entry.updated_at_ms = at_ms;
+        let checkpoint = self.projections.checkpoint();
+        self.apply(&StateEffect::QueueEntryUpserted {
+            entry: entry.clone(),
+        })?;
+        Ok(QueueDeliveryClaim {
+            entry,
+            command_id,
+            projections: self.projections.changes_since(&checkpoint)?,
+        })
+    }
+
+    pub fn finish_queue_delivery(
+        &mut self,
+        entry_id: &QueueEntryId,
+        effects: &[StateEffect],
+    ) -> Result<Vec<ProjectionEnvelope>, StateError> {
+        self.ensure_writable()?;
+        let current =
+            self.state
+                .queue_entry(entry_id)
+                .cloned()
+                .ok_or(StateError::DeviceCommandMismatch {
+                    detail: "queue delivery has no canonical entry",
+                })?;
+        let QueueState::Submitting { command_id } = &current.state else {
+            return Err(StateError::DeviceCommandMismatch {
+                detail: "queue delivery was not durably claimed",
+            });
+        };
+        if effects
+            .iter()
+            .any(|effect| matches!(effect, StateEffect::CommandAcknowledged { .. }))
+        {
+            return Err(StateError::DeviceCommandMismatch {
+                detail: "queue delivery cannot fabricate a command acknowledgement",
+            });
+        }
+        let delivered = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                StateEffect::QueueEntryUpserted { entry } if &entry.id == entry_id => Some(entry),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let Some(delivered) = delivered.first().filter(|_| delivered.len() == 1) else {
+            return Err(StateError::DeviceCommandMismatch {
+                detail: "queue delivery requires one exact terminal entry",
+            });
+        };
+        if delivered.session_id != current.session_id
+            || delivered.intent != current.intent
+            || delivered.body != current.body
+            || delivered.created_at_ms != current.created_at_ms
+            || delivered.editable
+        {
+            return Err(StateError::DeviceCommandMismatch {
+                detail: "queue delivery changed immutable entry fields",
+            });
+        }
+        let QueueState::DeliveredAsNewTurn { turn_id, .. } = &delivered.state else {
+            return Err(StateError::DeviceCommandMismatch {
+                detail: "new-turn queue delivery lacks a structured terminal receipt",
+            });
+        };
+        let has_correlated_turn = effects.iter().any(|effect| {
+            matches!(
+                effect,
+                StateEffect::TurnUpserted { turn }
+                    if turn.id == *turn_id
+                        && turn.session_id == current.session_id
+                        && matches!(
+                            &turn.origin,
+                            kaleido_proto::turn::TurnOrigin::RemoteCommand {
+                                command_id: turn_command,
+                            } if turn_command == command_id
+                        )
+            )
+        });
+        if !has_correlated_turn {
+            return Err(StateError::DeviceCommandMismatch {
+                detail: "queue delivery has no correlated provider turn",
+            });
+        }
+        let checkpoint = self.projections.checkpoint();
+        self.apply_all(effects)?;
+        self.projections.changes_since(&checkpoint)
     }
 
     /// Claimed commands are intentionally surfaced as uncertain after restart;
@@ -941,28 +1174,79 @@ impl CanonicalStore {
                     }
                 }
                 Command::RespondAttention { response } => {
-                    match self.state.attention(&response.attention_id) {
-                        None => (
+                    if self
+                        .device_outbox
+                        .has_unfinished_attention(&response.attention_id)
+                    {
+                        (
+                            CommandOutcome::Rejected {
+                                error: canonical_error(
+                                    ErrorCode::ApprovalAlreadyAnswered,
+                                    false,
+                                    now_ms,
+                                ),
+                            },
+                            false,
+                        )
+                    } else {
+                        match self.state.attention(&response.attention_id) {
+                            None => (
+                                CommandOutcome::Rejected {
+                                    error: canonical_error(ErrorCode::NotFound, false, now_ms),
+                                },
+                                false,
+                            ),
+                            Some(entry) => match entry.check_reply(response, now_ms) {
+                                Ok(()) => {
+                                    (CommandOutcome::AcceptedLocally { note_ref: None }, true)
+                                }
+                                Err(rejection) => (
+                                    CommandOutcome::Rejected {
+                                        error: canonical_error(
+                                            reply_rejection_code(entry, rejection),
+                                            false,
+                                            now_ms,
+                                        ),
+                                    },
+                                    false,
+                                ),
+                            },
+                        }
+                    }
+                }
+                Command::InterruptTurn { session_id, .. } => {
+                    if self.state.session(session_id).is_some() {
+                        (CommandOutcome::AcceptedLocally { note_ref: None }, true)
+                    } else {
+                        (
                             CommandOutcome::Rejected {
                                 error: canonical_error(ErrorCode::NotFound, false, now_ms),
                             },
                             false,
-                        ),
-                        Some(entry) => match entry.check_reply(response, now_ms) {
-                            Ok(()) => (CommandOutcome::AcceptedLocally { note_ref: None }, true),
-                            Err(rejection) => (
-                                CommandOutcome::Rejected {
-                                    error: canonical_error(
-                                        reply_rejection_code(entry, rejection),
-                                        false,
-                                        now_ms,
-                                    ),
-                                },
-                                false,
-                            ),
-                        },
+                        )
                     }
                 }
+                Command::ResumeSession { session_id } => match self.state.session(session_id) {
+                    None => (
+                        CommandOutcome::Rejected {
+                            error: canonical_error(ErrorCode::NotFound, false, now_ms),
+                        },
+                        false,
+                    ),
+                    Some(session)
+                        if self.state.runtime_of(session).is_some_and(|runtime| {
+                            runtime.capabilities.permits(&Capability::HistoryResume)
+                        }) =>
+                    {
+                        (CommandOutcome::AcceptedLocally { note_ref: None }, true)
+                    }
+                    Some(_) => (
+                        CommandOutcome::Rejected {
+                            error: canonical_error(ErrorCode::CapabilityUnavailable, false, now_ms),
+                        },
+                        false,
+                    ),
+                },
                 Command::EnqueueInput { session_id, .. } => {
                     if self.state.session(session_id).is_some() {
                         (
@@ -1008,9 +1292,12 @@ impl CanonicalStore {
             Command::SubmitPrompt { body, .. }
             | Command::EnqueueInput { body, .. }
             | Command::EditQueueEntry { body, .. } => vec![body],
-            Command::RespondAttention { response } => {
-                response.free_form_ref.iter().collect::<Vec<_>>()
-            }
+            Command::RespondAttention { response } => response
+                .question_answers
+                .iter()
+                .filter_map(|answer| answer.free_form_ref.as_ref())
+                .chain(response.free_form_ref.iter())
+                .collect::<Vec<_>>(),
             Command::ReworkStep { reason_ref, .. } | Command::SkipStep { reason_ref, .. } => {
                 reason_ref.iter().collect::<Vec<_>>()
             }
@@ -1092,7 +1379,24 @@ impl CanonicalStore {
                 }
             }
             Command::RespondAttention { response } => {
-                self.decide_attention(&envelope.command_id, response, now_ms)
+                let Some(entry) = self.state.attention(&response.attention_id) else {
+                    return Ok(CommandOutcome::Rejected {
+                        error: canonical_error(ErrorCode::NotFound, false, now_ms),
+                    });
+                };
+                if let Err(rejection) = entry.check_reply(response, now_ms) {
+                    return Ok(CommandOutcome::Rejected {
+                        error: canonical_error(
+                            reply_rejection_code(entry, rejection),
+                            false,
+                            now_ms,
+                        ),
+                    });
+                }
+                // Admission proves only that the Broker durably owns the
+                // reply. The attention remains open until the adapter observes
+                // the provider's structured result.
+                Ok(CommandOutcome::AcceptedLocally { note_ref: None })
             }
             Command::EnqueueInput {
                 session_id,
@@ -1144,38 +1448,6 @@ impl CanonicalStore {
         };
         self.apply(&StateEffect::QueueEntryUpserted { entry })?;
         Ok(CommandOutcome::Enqueued { entry_id })
-    }
-
-    fn decide_attention(
-        &mut self,
-        command_id: &CommandId,
-        response: &kaleido_proto::attention::AttentionResponse,
-        now_ms: i64,
-    ) -> Result<CommandOutcome, StateError> {
-        let Some(entry) = self.state.attention(&response.attention_id).cloned() else {
-            return Ok(CommandOutcome::Rejected {
-                error: canonical_error(ErrorCode::NotFound, false, now_ms),
-            });
-        };
-        if let Err(rejection) = entry.check_reply(response, now_ms) {
-            let code = reply_rejection_code(&entry, rejection);
-            return Ok(CommandOutcome::Rejected {
-                error: canonical_error(code, false, now_ms),
-            });
-        }
-        let mut answered = entry;
-        answered.state = AttentionState::Answered {
-            option_id: response.option_id.clone(),
-            free_form_ref: response.free_form_ref.clone(),
-            decided_at_ms: now_ms,
-            answer_source: AttentionAnswerSource::LocalCommand {
-                command_id: command_id.clone(),
-            },
-        };
-        self.apply(&StateEffect::AttentionUpserted { item: answered })?;
-        // The broker has recorded the decision. Whether the runtime accepted it
-        // is a separate fact that arrives as upstream traffic.
-        Ok(CommandOutcome::AcceptedLocally { note_ref: None })
     }
 
     /// Stores a body and returns the reference canonical state will carry.
@@ -1448,7 +1720,17 @@ fn reply_rejection_code(entry: &AttentionItem, rejection: ReplyRejection) -> Err
         | ReplyRejection::UnknownOption
         | ReplyRejection::FreeFormNotAllowed
         | ReplyRejection::InvalidFreeForm
-        | ReplyRejection::DecisionMissing => ErrorCode::InvalidCommand,
+        | ReplyRejection::DecisionMissing
+        | ReplyRejection::QuestionAnswersRequired
+        | ReplyRejection::QuestionAnswersUnexpected
+        | ReplyRejection::QuestionTopLevelDecision
+        | ReplyRejection::QuestionAnswerEmpty
+        | ReplyRejection::QuestionAnswerDuplicateKey
+        | ReplyRejection::QuestionAnswerDuplicateOption
+        | ReplyRejection::QuestionAnswerUnknownKey
+        | ReplyRejection::QuestionAnswerUnknownOption
+        | ReplyRejection::QuestionAnswerTooManyOptions
+        | ReplyRejection::QuestionAnswerMissing => ErrorCode::InvalidCommand,
     }
 }
 

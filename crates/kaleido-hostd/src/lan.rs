@@ -7,14 +7,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use kaleido_adapter::SessionStartRequest;
+use kaleido_adapter::{ProviderRuntimeSession, SessionStartRequest};
 use kaleido_adapter_codex::{
     CodexRuntimeConfig, CodexRuntimeSession, CodexSandboxMode, ReducerConfig,
 };
 use kaleido_proto::capability::EvidenceSource;
 use kaleido_proto::content::{ContentKind, Sensitivity};
 use kaleido_proto::host::LaunchSurface;
-use kaleido_proto::ids::{DeviceId, SessionId};
+use kaleido_proto::ids::{DeviceId, ProjectBindingId, ProjectId, ProviderRuntimeId, SessionId};
 use kaleido_proto::turn::TurnOrigin;
 use kaleido_state::ClockSource;
 use kaleido_transport::bootstrap::encode_uri;
@@ -50,6 +50,203 @@ pub enum CodexLanError {
     Pairing,
 }
 
+/// Provider-neutral bootstrap data for one runtime worker. Provider-private
+/// session identifiers remain inside the boxed adapter.
+pub struct RuntimeBootstrap {
+    pub project_id: ProjectId,
+    pub project_binding_id: ProjectBindingId,
+    pub runtime_id: ProviderRuntimeId,
+    pub runtime: Box<dyn ProviderRuntimeSession + Send>,
+}
+
+impl std::fmt::Debug for RuntimeBootstrap {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeBootstrap")
+            .field("project_id", &self.project_id)
+            .field("project_binding_id", &self.project_binding_id)
+            .field("runtime_id", &self.runtime_id)
+            .field("runtime", &"[provider adapter]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeBootstrapContext {
+    pub identity_salt: String,
+    pub project_root: PathBuf,
+    pub host_platform: kaleido_proto::host::HostPlatform,
+}
+
+pub type RuntimeBootstrapFactory =
+    Box<dyn FnOnce(RuntimeBootstrapContext) -> Result<RuntimeBootstrap, CodexLanError> + Send>;
+
+pub struct StructuredLanConfig {
+    pub project_root: PathBuf,
+    pub data_directory: PathBuf,
+    pub bind_address: SocketAddr,
+    pub runtimes: Vec<RuntimeBootstrapFactory>,
+}
+
+impl std::fmt::Debug for StructuredLanConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StructuredLanConfig")
+            .field("project_root", &self.project_root)
+            .field("data_directory", &self.data_directory)
+            .field("bind_address", &self.bind_address)
+            .field("runtime_count", &self.runtimes.len())
+            .finish()
+    }
+}
+
+/// One LAN broker hosting any number of structured provider runtimes over the
+/// same durable store and projection journal.
+pub struct StructuredLanHost {
+    server: Option<LanServer>,
+    supervisor: Arc<RuntimeSupervisor>,
+    session_ids: Vec<SessionId>,
+    pairing_uri: String,
+}
+
+impl std::fmt::Debug for StructuredLanHost {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StructuredLanHost")
+            .field("session_ids", &self.session_ids)
+            .field("pairing_uri", &"[redacted]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl StructuredLanHost {
+    pub fn start(config: StructuredLanConfig) -> Result<Self, CodexLanError> {
+        if config.runtimes.is_empty() {
+            return Err(CodexLanError::Runtime);
+        }
+        let identity_salt = load_or_create_identity_salt(&config.data_directory)?;
+        let broker = Broker::load(
+            config.data_directory.join("canonical"),
+            ClockSource::System,
+            identity_salt.clone(),
+            "kaleido-host",
+        )
+        .map_err(|_| CodexLanError::Broker)?;
+        let canonical_root =
+            fs::canonicalize(&config.project_root).map_err(|_| CodexLanError::ProjectRoot)?;
+        let provider_root = crate::platform::provider_path(&canonical_root);
+        let root_text = provider_root.to_string_lossy();
+        let root_ref = broker
+            .content_store()
+            .store(
+                ContentKind::FilePath,
+                Sensitivity::Sensitive,
+                root_text.as_bytes(),
+            )
+            .map_err(|_| CodexLanError::Broker)?;
+        drop(root_text);
+        let supervisor = Arc::new(RuntimeSupervisor::new(broker.clone()));
+        let mut session_ids = Vec::with_capacity(config.runtimes.len());
+        let context = RuntimeBootstrapContext {
+            identity_salt,
+            project_root: provider_root,
+            host_platform: crate::platform::host_platform().ok_or(CodexLanError::Listener)?,
+        };
+        for factory in config.runtimes {
+            let bootstrap = factory(context.clone())?;
+            let start = SessionStartRequest {
+                project_id: bootstrap.project_id,
+                project_binding_id: bootstrap.project_binding_id,
+                runtime_id: bootstrap.runtime_id,
+                project_root_ref: root_ref.clone(),
+            };
+            match supervisor.start_runtime(start, bootstrap.runtime) {
+                Ok(session_id) => session_ids.push(session_id),
+                Err(_) => {
+                    for session_id in &session_ids {
+                        let _ = supervisor.stop_session(session_id);
+                    }
+                    return Err(CodexLanError::Runtime);
+                }
+            }
+        }
+        let recovered = supervisor.recover_all_ready();
+        if recovered.iter().any(|(_, result)| result.is_err()) {
+            for session_id in &session_ids {
+                let _ = supervisor.stop_session(session_id);
+            }
+            return Err(CodexLanError::Runtime);
+        }
+        let server = LanServer::bind(
+            config.bind_address,
+            &config.data_directory.join("security"),
+            broker,
+            Some(Arc::clone(&supervisor)),
+        )
+        .map_err(|_| CodexLanError::Listener)?;
+        let bootstrap = server
+            .issue_pairing(now_ms())
+            .map_err(|_| CodexLanError::Pairing)?;
+        let pairing_uri = encode_uri(&bootstrap).map_err(|_| CodexLanError::Pairing)?;
+        Ok(Self {
+            server: Some(server),
+            supervisor,
+            session_ids,
+            pairing_uri,
+        })
+    }
+
+    pub fn pairing_uri(&self) -> &str {
+        &self.pairing_uri
+    }
+
+    pub fn issue_pairing_uri(&self) -> Result<String, CodexLanError> {
+        let server = self.server.as_ref().ok_or(CodexLanError::Listener)?;
+        let bootstrap = server
+            .issue_pairing(now_ms())
+            .map_err(|_| CodexLanError::Pairing)?;
+        encode_uri(&bootstrap).map_err(|_| CodexLanError::Pairing)
+    }
+
+    pub fn revoke_device(&self, device_id: &DeviceId) -> Result<(), CodexLanError> {
+        self.server
+            .as_ref()
+            .ok_or(CodexLanError::Listener)?
+            .revoke_device(device_id, now_ms())
+            .map_err(|_| CodexLanError::Listener)
+    }
+
+    pub fn session_ids(&self) -> &[SessionId] {
+        &self.session_ids
+    }
+
+    pub fn run_for(&self, duration: Duration) {
+        let deadline = Instant::now().checked_add(duration);
+        while deadline.is_some_and(|deadline| Instant::now() < deadline) {
+            let _ = self.supervisor.pump_pending_queue();
+            self.supervisor.drain_all();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    pub fn shutdown(mut self) -> Result<(), CodexLanError> {
+        for session_id in &self.session_ids {
+            let _ = self.supervisor.stop_session(session_id);
+        }
+        if let Some(server) = self.server.take() {
+            server.shutdown().map_err(|_| CodexLanError::Listener)?;
+        }
+        self.pairing_uri.clear();
+        Ok(())
+    }
+}
+
+impl Drop for StructuredLanHost {
+    fn drop(&mut self) {
+        self.pairing_uri.clear();
+    }
+}
+
 pub struct CodexLanHost {
     server: Option<LanServer>,
     supervisor: Arc<RuntimeSupervisor>,
@@ -79,6 +276,7 @@ impl CodexLanHost {
         .map_err(|_| CodexLanError::Broker)?;
         let canonical_root =
             fs::canonicalize(&config.project_root).map_err(|_| CodexLanError::ProjectRoot)?;
+        let canonical_root = crate::platform::provider_path(&canonical_root);
         let root_text = canonical_root.to_string_lossy();
         let root_ref = broker
             .content_store()

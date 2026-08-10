@@ -36,7 +36,7 @@ import uniffi.kaleido_proto.ProjectionPayload
 class NativeUniFfiSmokeTest {
     @Test
     fun nativeLibraryExecutesCallbackAsyncAndErrorBridges() = runBlocking {
-        assertEquals("0.3.0", protocolVersion())
+        assertEquals("0.5.0", protocolVersion())
 
         val error = canonicalError()
         val projection = projectIndexProjection()

@@ -16,11 +16,25 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use kaleido_adapter_codex::CodexSandboxMode;
+use kaleido_adapter_claude::{
+    ClaudeRuntimeConfig, ClaudeRuntimeSession, ReducerConfig as ClaudeReducerConfig,
+};
+use kaleido_adapter_codex::{
+    CodexRuntimeConfig, CodexRuntimeSession, CodexSandboxMode, ReducerConfig as CodexReducerConfig,
+};
+use kaleido_adapter_opencode::{
+    OpenCodeClientConfig, OpenCodeRuntimeConfig, OpenCodeRuntimeSession,
+    ReducerConfig as OpenCodeReducerConfig,
+};
 use kaleido_hostd::error::HostdError;
 use kaleido_hostd::slice::{self, ApprovalDecision, ReplayRequest, RunRequest};
-use kaleido_hostd::{CodexLanConfig, CodexLanHost};
+use kaleido_hostd::{
+    RuntimeBootstrap, RuntimeBootstrapFactory, StructuredLanConfig, StructuredLanHost,
+};
+use kaleido_proto::capability::EvidenceSource;
+use kaleido_proto::host::LaunchSurface;
 use kaleido_proto::ids::SessionId;
+use kaleido_proto::turn::TurnOrigin;
 use kaleido_state::ProjectionName;
 
 const USAGE: &str = "\
@@ -30,8 +44,11 @@ kaleido-hostd slice run    --executable <codex.exe> --project-root <dir>
                            [--decide-first-approval accept|decline]
                            [--enqueue-steer <text>] [--timeout-secs 120]
 kaleido-hostd slice show   --log-dir <dir> --projection <name> [--session <id>]
-kaleido-hostd lan run      --executable <codex.exe> --project-root <dir>
+kaleido-hostd lan run      --providers <codex,opencode,claude> --project-root <dir>
                            --data-dir <dir> --bind <lan-ip:port>
+                           [--executable <codex.exe>] [--opencode-url <url>]
+                           [--node-executable <node>] [--claude-bridge <index.ts>]
+                           [--no-print-pairing]
                            [--serve-secs <positive>] [--timeout-secs 30]
 
 projections: project-index, session-index, transcript, live-activity, input-queue,
@@ -81,21 +98,124 @@ async fn run_lan(arguments: &[String]) -> Result<String, HostdError> {
     let bind_address = parse_bind(&required(arguments, "--bind")?)?;
     let serve_seconds = optional_positive_seconds(arguments, "--serve-secs")?;
     let timeout_seconds = positive_seconds(arguments, "--timeout-secs", 30)?;
-    let config = CodexLanConfig {
-        executable: PathBuf::from(required(arguments, "--executable")?),
+    let providers = optional(arguments, "--providers").unwrap_or_else(|| "codex".to_owned());
+    let provider_names = providers
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    if provider_names.is_empty() {
+        return Err(HostdError::usage("--providers must not be empty"));
+    }
+    let mut runtimes = Vec::<RuntimeBootstrapFactory>::new();
+    for provider in provider_names {
+        // #[allow(kaleido::agent_name_branch)] reason: this CLI composition root parses an explicit operator provider selection; product behavior remains capability-driven
+        match provider {
+            "codex" => {
+                let executable = PathBuf::from(required(arguments, "--executable")?);
+                runtimes.push(Box::new(move |context| {
+                    let reducer = CodexReducerConfig {
+                        host_display_name: "kaleido-host".to_owned(),
+                        host_platform: context.host_platform,
+                        project_display_name: "kaleido-project".to_owned(),
+                        identity_salt: context.identity_salt,
+                        evidence: EvidenceSource::ObservedInTraffic,
+                        launch_surface: LaunchSurface::BrokerLaunched,
+                        turn_origin: TurnOrigin::LocalSurface,
+                        base_at_ms: now_ms(),
+                        runtime_version_label: None,
+                    };
+                    let runtime = CodexRuntimeSession::new(CodexRuntimeConfig {
+                        executable,
+                        reducer,
+                        sandbox: CodexSandboxMode::WorkspaceWrite,
+                        request_timeout: Duration::from_secs(timeout_seconds),
+                    });
+                    Ok(bootstrap(runtime))
+                }));
+            }
+            "opencode" => {
+                let base_url = optional(arguments, "--opencode-url")
+                    .unwrap_or_else(|| "http://127.0.0.1:4096".to_owned());
+                runtimes.push(Box::new(move |context| {
+                    let directory = context.project_root.to_string_lossy().into_owned();
+                    let runtime = OpenCodeRuntimeSession::new(OpenCodeRuntimeConfig {
+                        client: OpenCodeClientConfig {
+                            base_url,
+                            project_directory: Some(directory.clone()),
+                            request_timeout: Duration::from_secs(timeout_seconds),
+                        },
+                        reducer: OpenCodeReducerConfig {
+                            host_display_name: "kaleido-host".to_owned(),
+                            host_platform: context.host_platform,
+                            project_display_name: "kaleido-project".to_owned(),
+                            project_directory: directory,
+                            identity_salt: context.identity_salt,
+                            evidence: EvidenceSource::ObservedInTraffic,
+                            base_at_ms: now_ms(),
+                            runtime_version_label: None,
+                        },
+                    })
+                    .map_err(|_| kaleido_hostd::CodexLanError::Runtime)?;
+                    Ok(bootstrap(runtime))
+                }));
+            }
+            "claude" => {
+                let node = PathBuf::from(required(arguments, "--node-executable")?);
+                let bridge = PathBuf::from(required(arguments, "--claude-bridge")?);
+                runtimes.push(Box::new(move |context| {
+                    let runtime = ClaudeRuntimeSession::new(ClaudeRuntimeConfig {
+                        node_executable: node,
+                        bridge_script: bridge,
+                        reducer: ClaudeReducerConfig {
+                            host_display_name: "kaleido-host".to_owned(),
+                            host_platform: context.host_platform,
+                            project_display_name: "kaleido-project".to_owned(),
+                            identity_salt: context.identity_salt,
+                            evidence: EvidenceSource::ObservedInTraffic,
+                            launch_surface: LaunchSurface::BrokerLaunched,
+                            turn_origin: TurnOrigin::LocalSurface,
+                            base_at_ms: now_ms(),
+                            runtime_version_label: None,
+                        },
+                        request_timeout: Duration::from_secs(timeout_seconds),
+                        resume_session: None,
+                    });
+                    Ok(bootstrap(runtime))
+                }));
+            }
+            _ => {
+                return Err(HostdError::usage(
+                    "--providers accepts only codex, opencode and claude",
+                ));
+            }
+        }
+    }
+    let config = StructuredLanConfig {
         project_root: PathBuf::from(required(arguments, "--project-root")?),
         data_directory: PathBuf::from(required(arguments, "--data-dir")?),
         bind_address,
-        sandbox: CodexSandboxMode::WorkspaceWrite,
-        request_timeout: Duration::from_secs(timeout_seconds),
+        runtimes,
     };
-    let host = CodexLanHost::start(&config).map_err(|_| HostdError::Lan)?;
+    // Blocking provider clients (notably reqwest's OpenCode client) own a
+    // private Tokio runtime and must be constructed outside this async task.
+    // Keeping the whole bootstrap in `spawn_blocking` also makes rollback drop
+    // adapters on the same valid blocking boundary.
+    let host = tokio::task::spawn_blocking(move || StructuredLanHost::start(config))
+        .await
+        .map_err(|_| HostdError::Lan)?
+        .map_err(|_| HostdError::Lan)?;
     // This is an operator-requested one-time credential. It deliberately
     // bypasses tracing and is never retained in the returned summary.
-    println!("{}", host.pairing_uri());
-    let session_id = host.session_id().clone();
+    if !arguments
+        .iter()
+        .any(|argument| argument == "--no-print-pairing")
+    {
+        println!("{}", host.pairing_uri());
+    }
+    let session_ids = host.session_ids().to_vec();
     if let Some(serve_seconds) = serve_seconds {
-        host.run_for(Duration::from_secs(serve_seconds));
+        tokio::task::block_in_place(|| host.run_for(Duration::from_secs(serve_seconds)));
     } else {
         let stop = tokio::signal::ctrl_c();
         tokio::pin!(stop);
@@ -106,13 +226,67 @@ async fn run_lan(arguments: &[String]) -> Result<String, HostdError> {
                     break;
                 }
                 () = tokio::time::sleep(Duration::from_millis(50)) => {
-                    host.run_for(Duration::from_millis(1));
+                    tokio::task::block_in_place(|| host.run_for(Duration::from_millis(1)));
                 }
             }
         }
     }
-    host.shutdown().map_err(|_| HostdError::Lan)?;
-    Ok(format!("LAN session {session_id} stopped cleanly"))
+    tokio::task::block_in_place(move || host.shutdown()).map_err(|_| HostdError::Lan)?;
+    Ok(format!(
+        "LAN sessions {} stopped cleanly",
+        session_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    ))
+}
+
+fn bootstrap<T>(runtime: T) -> RuntimeBootstrap
+where
+    T: kaleido_adapter::ProviderRuntimeSession + Send + 'static,
+    T: RuntimeIdentity,
+{
+    RuntimeBootstrap {
+        project_id: runtime.project_id().clone(),
+        project_binding_id: runtime.project_binding_id().clone(),
+        runtime_id: runtime.runtime_id().clone(),
+        runtime: Box::new(runtime),
+    }
+}
+
+trait RuntimeIdentity {
+    fn project_id(&self) -> &kaleido_proto::ids::ProjectId;
+    fn project_binding_id(&self) -> &kaleido_proto::ids::ProjectBindingId;
+    fn runtime_id(&self) -> &kaleido_proto::ids::ProviderRuntimeId;
+}
+
+macro_rules! runtime_identity {
+    ($runtime:ty) => {
+        impl RuntimeIdentity for $runtime {
+            fn project_id(&self) -> &kaleido_proto::ids::ProjectId {
+                self.project_id()
+            }
+            fn project_binding_id(&self) -> &kaleido_proto::ids::ProjectBindingId {
+                self.project_binding_id()
+            }
+            fn runtime_id(&self) -> &kaleido_proto::ids::ProviderRuntimeId {
+                self.runtime_id()
+            }
+        }
+    };
+}
+
+runtime_identity!(CodexRuntimeSession);
+runtime_identity!(OpenCodeRuntimeSession);
+runtime_identity!(ClaudeRuntimeSession);
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
 }
 
 fn parse_bind(value: &str) -> Result<std::net::SocketAddr, HostdError> {

@@ -32,6 +32,13 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
 
+      - name: Set up Node.js 22 for Claude SDK sidecar
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: crates/kaleido-adapter-claude/bridge/package-lock.json
+
       - name: Set up JDK 22 for Kotlin probe
         if: matrix.os == 'ubuntu-latest'
         uses: actions/setup-java@v5

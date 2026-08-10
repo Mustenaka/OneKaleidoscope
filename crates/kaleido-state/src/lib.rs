@@ -33,4 +33,4 @@ pub use log::StreamLog;
 pub use projection::{DiagnosticProjectionEnvelope, ProjectionName};
 pub use projection_journal::{ProjectionJournal, ProjectionReplay};
 pub use state::CanonicalState;
-pub use store::{CanonicalStore, ClockSource, StateCommit};
+pub use store::{CanonicalStore, ClockSource, QueueDeliveryClaim, StateCommit};

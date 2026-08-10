@@ -15,6 +15,7 @@ import com.onekaleidoscope.ui.ProjectUi
 import com.onekaleidoscope.ui.QueueEntryUi
 import com.onekaleidoscope.ui.QueueIntentUi
 import com.onekaleidoscope.ui.QueueStateUi
+import com.onekaleidoscope.ui.QuestionPromptUi
 import com.onekaleidoscope.ui.ReachabilityUi
 import com.onekaleidoscope.ui.RuntimeCapabilitiesUi
 import com.onekaleidoscope.ui.SessionSectionsUi
@@ -99,6 +100,16 @@ internal object ProjectionMapper {
         }
     }
 
+    fun projectBindingRuntimeIds(view: ProjectIndexView): Map<String, String> = buildMap {
+        view.groups.forEach { group ->
+            group.projects.forEach { project ->
+                project.bindings.forEach { binding ->
+                    put(binding.bindingId.value, binding.runtimeId.value)
+                }
+            }
+        }
+    }
+
     fun sessions(view: SessionIndexView): Pair<SessionSectionsUi, Map<String, SessionSummary>> {
         val all = view.active + view.history + view.archived
         val byId = all.associateBy { it.sessionId.value }
@@ -125,6 +136,7 @@ internal object ProjectionMapper {
         },
         ownershipLabel = when (value.ownership) {
             OwnershipMode.BROKER_MANAGED -> "Broker 管理"
+            OwnershipMode.PROVIDER_MANAGED -> "Provider SDK 管理"
             OwnershipMode.SHARED_RUNTIME -> "共享 Runtime"
             OwnershipMode.EXTERNAL_NATIVE -> "外部会话"
         },
@@ -276,9 +288,15 @@ internal object ProjectionMapper {
                 options = subject.request.options.map(::option),
             )
             is AttentionSubject.Question -> AttentionSubjectUi.Question(
-                prompt = readText(subject.request.promptRef).text,
-                options = subject.request.options.map(::option),
-                freeFormAllowed = subject.request.freeFormAllowed,
+                questions = subject.request.questions.map { question ->
+                    QuestionPromptUi(
+                        key = question.questionKey,
+                        prompt = readText(question.promptRef).text,
+                        options = question.options.map(::option),
+                        multiSelect = question.multiSelect,
+                        freeFormAllowed = question.freeFormAllowed,
+                    )
+                },
             )
             is AttentionSubject.WorkflowGate -> AttentionSubjectUi.Question(
                 prompt = readText(subject.request.promptRef).text,

@@ -28,7 +28,7 @@ use kaleido_proto::attention::{
     JoinFailureReason, JoinState,
 };
 use kaleido_proto::capability::{Capability, CapabilityEvidence, EvidenceSource};
-use kaleido_proto::command::{CommandAck, CommandOutcome};
+use kaleido_proto::command::{CommandAck, CommandOutcome, RuntimeAcceptanceKind};
 use kaleido_proto::content::{ContentKind, ContentRef, Sensitivity};
 use kaleido_proto::effect::{DiagnosticCode, DiagnosticRecord, StateEffect};
 use kaleido_proto::error::{CanonicalError, ErrorCode};
@@ -637,6 +637,8 @@ impl CodexReducer {
         };
 
         let outcome = CommandOutcome::AcceptedByRuntime {
+            session_id: controlling_session.id.clone(),
+            acceptance_kind: RuntimeAcceptanceKind::PromptTurn,
             binding_handle: self.mint.binding_handle(
                 &self.runtime_id,
                 ProviderBindingKind::RuntimeAcknowledgement,
@@ -1434,6 +1436,7 @@ impl CodexReducer {
         entry.state = AttentionState::Answered {
             option_id: Some(decision),
             free_form_ref: None,
+            question_answers: Vec::new(),
             decided_at_ms: at_ms,
             answer_source,
         };
@@ -1442,15 +1445,12 @@ impl CodexReducer {
         let _ = content;
         let _ = pending.raw_item_id;
         if local_answer.is_some() {
-            // The store already recorded the real LocalCommand answer before
-            // this associated wire reply was sent. Keep reducing and
-            // validating it, but never publish a second answer or a later join
-            // refresh from the reducer's private copy.
+            // This structured provider reply is the first evidence that the
+            // locally requested answer actually took effect. Suppress later
+            // join-only refreshes, but publish this terminal answer once.
             self.locally_answered_attention.insert(attention_id);
-            Ok(Vec::new())
-        } else {
-            Ok(vec![StateEffect::AttentionUpserted { item: updated }])
         }
+        Ok(vec![StateEffect::AttentionUpserted { item: updated }])
     }
 
     fn external_answer_evidence_source(

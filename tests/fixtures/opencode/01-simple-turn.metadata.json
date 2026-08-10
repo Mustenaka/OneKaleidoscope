@@ -1,0 +1,9 @@
+{
+  "cleanup": "incomplete",
+  "unconfirmed_pids": [
+    50104
+  ],
+  "cleanup_errors": [
+    "could not confirm termination of descendants [50104] from spawned root PID 18076: descendant PID 50104: 拒绝访问。 (os error 5)"
+  ]
+}

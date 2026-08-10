@@ -6,8 +6,8 @@
 //! optimistically promoted.
 
 use kaleido_proto::capability::{
-    Capability, CapabilityEntry, CapabilityEvidence, CapabilityState, EvidenceSource,
-    RuntimeCapabilities,
+    Capability, CapabilityEntry, CapabilityEvidence, CapabilityState, CapabilityUnavailableReason,
+    EvidenceSource, RuntimeCapabilities,
 };
 use kaleido_proto::command::CommandOutcome;
 use kaleido_proto::ids::{ProviderBindingKind, ProviderRuntimeId};
@@ -45,6 +45,7 @@ pub struct CapabilityProbe {
     runtime_id: ProviderRuntimeId,
     observed_at_ms: i64,
     proven: Vec<Capability>,
+    overrides: Vec<(Capability, CapabilityState)>,
     evidence_source: EvidenceSource,
 }
 
@@ -59,15 +60,39 @@ impl CapabilityProbe {
             runtime_id,
             observed_at_ms,
             proven: Vec::new(),
+            overrides: Vec::new(),
             evidence_source,
         }
     }
 
     /// Records that traffic proved this capability on this connection.
     pub fn prove(&mut self, capability: Capability) {
+        self.overrides
+            .retain(|(candidate, _)| *candidate != capability);
         if !self.proven.contains(&capability) {
             self.proven.push(capability);
         }
+    }
+
+    /// Invalidates every prior observation on this connection. A reconnect
+    /// starts from NotVerified and must prove capabilities again.
+    pub fn mark_connection_unavailable(&mut self, reason: CapabilityUnavailableReason) {
+        self.proven.clear();
+        self.overrides = ALL_CAPABILITIES
+            .iter()
+            .map(|capability| {
+                (
+                    *capability,
+                    CapabilityState::UnavailableOnThisConnection { reason },
+                )
+            })
+            .collect();
+    }
+
+    pub fn reset_connection(&mut self, at_ms: i64) {
+        self.proven.clear();
+        self.overrides.clear();
+        self.advance_observation(at_ms);
     }
 
     pub fn is_proven(&self, capability: Capability) -> bool {
@@ -80,7 +105,7 @@ impl CapabilityProbe {
     /// Local acceptance, queueing and recorded fixtures are deliberately
     /// insufficient: they do not prove control on the current connection.
     pub fn observe_runtime_acceptance(&mut self, outcome: &CommandOutcome) -> bool {
-        let CommandOutcome::AcceptedByRuntime { binding_handle } = outcome else {
+        let CommandOutcome::AcceptedByRuntime { binding_handle, .. } = outcome else {
             return false;
         };
         if self.evidence_source != EvidenceSource::ObservedInTraffic
@@ -119,15 +144,21 @@ impl CapabilityProbe {
             .iter()
             .map(|capability| {
                 let proven = self.proven.contains(capability);
+                let overridden = self
+                    .overrides
+                    .iter()
+                    .find_map(|(candidate, state)| (candidate == capability).then_some(state));
                 CapabilityEntry {
                     capability: *capability,
-                    state: if proven {
+                    state: if let Some(state) = overridden {
+                        state.clone()
+                    } else if proven {
                         CapabilityState::Supported
                     } else {
                         CapabilityState::NotVerified
                     },
                     evidence: CapabilityEvidence {
-                        source: if proven {
+                        source: if proven || overridden.is_some() {
                             self.evidence_source
                         } else {
                             EvidenceSource::Absent
@@ -150,7 +181,7 @@ impl CapabilityProbe {
 mod tests {
     use super::*;
     use kaleido_proto::ids::{
-        ProviderBindingHandle, ProviderBindingId, ProviderBindingKind, QueueEntryId,
+        ProviderBindingHandle, ProviderBindingId, ProviderBindingKind, QueueEntryId, SessionId,
     };
 
     #[test]
@@ -201,6 +232,8 @@ mod tests {
     fn only_live_runtime_acceptance_proves_control() {
         let runtime_id = ProviderRuntimeId::new("rtm_0123456789abcdef");
         let runtime_accepted = CommandOutcome::AcceptedByRuntime {
+            session_id: SessionId::new("ses_runtime_accepted"),
+            acceptance_kind: kaleido_proto::command::RuntimeAcceptanceKind::PromptTurn,
             binding_handle: ProviderBindingHandle {
                 id: ProviderBindingId::new("bnd_0123456789abcdef"),
                 runtime_id: runtime_id.clone(),
@@ -221,6 +254,8 @@ mod tests {
         assert!(!live.is_proven(Capability::LiveControl));
 
         let wrong_runtime = CommandOutcome::AcceptedByRuntime {
+            session_id: SessionId::new("ses_wrong_runtime"),
+            acceptance_kind: kaleido_proto::command::RuntimeAcceptanceKind::PromptTurn,
             binding_handle: ProviderBindingHandle {
                 id: ProviderBindingId::new("bnd_wrong_runtime"),
                 runtime_id: ProviderRuntimeId::new("rtm_other_runtime"),
@@ -231,6 +266,8 @@ mod tests {
         assert!(!live.is_proven(Capability::LiveControl));
 
         let wrong_kind = CommandOutcome::AcceptedByRuntime {
+            session_id: SessionId::new("ses_wrong_kind"),
+            acceptance_kind: kaleido_proto::command::RuntimeAcceptanceKind::PromptTurn,
             binding_handle: ProviderBindingHandle {
                 id: ProviderBindingId::new("bnd_wrong_kind"),
                 runtime_id: runtime_id.clone(),
@@ -251,5 +288,28 @@ mod tests {
         );
         assert!(!replay.observe_runtime_acceptance(&runtime_accepted));
         assert!(!replay.is_proven(Capability::LiveControl));
+    }
+
+    #[test]
+    fn authentication_failure_revokes_prior_support_until_reproven() {
+        let mut probe = CapabilityProbe::new(
+            ProviderRuntimeId::new("rtm_auth_runtime"),
+            1_785_378_397_000,
+            EvidenceSource::ObservedInTraffic,
+        );
+        probe.prove(Capability::TurnPrompt);
+        probe.mark_connection_unavailable(CapabilityUnavailableReason::AuthenticationRequired);
+        assert!(!probe.is_proven(Capability::TurnPrompt));
+        assert_eq!(
+            probe.to_capabilities().state_of(&Capability::TurnPrompt),
+            CapabilityState::UnavailableOnThisConnection {
+                reason: CapabilityUnavailableReason::AuthenticationRequired,
+            }
+        );
+        probe.reset_connection(1_785_378_398_000);
+        assert_eq!(
+            probe.to_capabilities().state_of(&Capability::TurnPrompt),
+            CapabilityState::NotVerified
+        );
     }
 }

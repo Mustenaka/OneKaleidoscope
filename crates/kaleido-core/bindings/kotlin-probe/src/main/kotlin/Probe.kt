@@ -6,6 +6,7 @@ import uniffi.kaleido_core.ProjectionSubscriptionProbe
 import uniffi.kaleido_core.asyncBindingProbe
 import uniffi.kaleido_core.bindingProbe
 import uniffi.kaleido_core.fallibleBindingProbe
+import uniffi.kaleido_core.MobileQuestionAnswer
 import uniffi.kaleido_core.protocolVersion
 import uniffi.kaleido_proto.Actor
 import uniffi.kaleido_proto.CanonicalError
@@ -31,6 +32,8 @@ import uniffi.kaleido_proto.RuntimeCapabilityView
 import uniffi.kaleido_proto.SessionId
 import uniffi.kaleido_proto.StateEffect
 import uniffi.kaleido_proto.WorkflowId
+import uniffi.kaleido_proto.QuestionAnswer
+import uniffi.kaleido_proto.QuestionPrompt
 
 fun probeProtocolVersion(): String = protocolVersion()
 
@@ -133,6 +136,9 @@ fun probeMobileIngress(
 
 fun probeRuntimeCapabilityScope(view: RuntimeCapabilityView): String =
     "${view.hostId.value}:${view.runtimeId.value}"
+
+fun probeQuestionSet(prompt: QuestionPrompt, answer: QuestionAnswer, draft: MobileQuestionAnswer): String =
+    "${prompt.questionKey}:${answer.questionKey}:${draft.questionKey}:${answer.optionIds.joinToString(",")}"
 
 private fun consumeActor(actor: Actor): String =
     when (actor) {

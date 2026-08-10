@@ -432,7 +432,7 @@ mod tests {
             .accept_uacp_hello(
                 &ControlFrame::UacpHello {
                     request_id: 2,
-                    protocol_version: "0.3.0".to_owned(),
+                    protocol_version: "0.5.0".to_owned(),
                 },
                 0,
             )

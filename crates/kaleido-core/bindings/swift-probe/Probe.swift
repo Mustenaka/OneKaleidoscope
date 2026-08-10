@@ -121,6 +121,14 @@ func probeRuntimeCapabilityScope(view: RuntimeCapabilityView) -> String {
     "\(view.hostId.value):\(view.runtimeId.value)"
 }
 
+func probeQuestionSet(
+    prompt: QuestionPrompt,
+    answer: QuestionAnswer,
+    draft: MobileQuestionAnswer
+) -> String {
+    "\(prompt.questionKey):\(answer.questionKey):\(draft.questionKey):\(answer.optionIds.joined(separator: ","))"
+}
+
 private func consumeActor(_ actor: Actor) -> String {
     switch actor {
     case let .human(deviceId):

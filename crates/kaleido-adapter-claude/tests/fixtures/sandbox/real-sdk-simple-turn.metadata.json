@@ -1,0 +1,7 @@
+{
+  "capture": "real_provider",
+  "provider": "@anthropic-ai/claude-agent-sdk",
+  "provider_version": "0.3.226",
+  "expected_outcome": "authentication_failure",
+  "acceptance_eligible": false
+}

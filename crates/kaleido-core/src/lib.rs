@@ -22,7 +22,8 @@ pub mod signer;
 pub use credential::{PairedHostInfo, SecureCredentialVault, SecureCredentialVaultError};
 pub use mobile::{MobileClient, MobileClientError, ProjectionCallback, ProjectionSubscription};
 pub use product::{
-    MobileActionAvailability, MobileActionBlocker, MobileSessionAction, MobileTextContent,
+    MobileActionAvailability, MobileActionBlocker, MobileQuestionAnswer, MobileSessionAction,
+    MobileTextContent,
 };
 pub use signer::{DeviceSigner, DeviceSignerError};
 

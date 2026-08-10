@@ -30,6 +30,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import uniffi.kaleido_core.MobileClient
 import uniffi.kaleido_core.MobileClientException
+import uniffi.kaleido_core.MobileQuestionAnswer
 import uniffi.kaleido_core.MobileSessionAction
 import uniffi.kaleido_core.ProjectionCallback
 import uniffi.kaleido_core.ProjectionSubscription
@@ -55,6 +56,7 @@ import uniffi.kaleido_proto.SessionId
 import uniffi.kaleido_proto.SessionIndexView
 import uniffi.kaleido_proto.SessionSummary
 import uniffi.kaleido_proto.TranscriptView
+import uniffi.kaleido_proto.TurnId
 
 /**
  * Android lifecycle adapter around the Rust mobile core.
@@ -81,6 +83,7 @@ internal class MobileRepository(context: Context) : Closeable {
     private var projectIndexFreshness = DataFreshness.CachedOffline
     private val projectNames = mutableMapOf<String, String>()
     private val projectRuntimes = mutableMapOf<String, String>()
+    private val projectBindingRuntimes = mutableMapOf<String, String>()
     private val hostRuntimeIds = linkedSetOf<String>()
 
     private val sessionViews = mutableMapOf<String, SessionIndexView>()
@@ -182,11 +185,14 @@ internal class MobileRepository(context: Context) : Closeable {
             is UiAction.SelectRuntime -> selectRuntime(action.runtimeId)
             is UiAction.UpdateDraft -> mutableState.update { it.copy(draft = action.value) }
             UiAction.SubmitPrompt -> submitPrompt()
+            UiAction.ResumeSession -> resumeSession()
+            UiAction.InterruptTurn -> interruptTurn()
             is UiAction.EnqueueInput -> enqueue(action.intent)
             is UiAction.UpdateAttentionDraft -> mutableState.update {
                 it.copy(attentionDrafts = it.attentionDrafts + (action.attentionId to action.value))
             }
             is UiAction.RespondAttention -> respondAttention(action)
+            is UiAction.RespondQuestion -> respondQuestion(action)
             is UiAction.ForgetHost -> showMessage("请先在 hostd 撤销此设备；本版本不在本地静默遗忘凭据")
             UiAction.DismissMessage -> mutableState.update { it.copy(message = null) }
             UiAction.MessageAction, is UiAction.Navigate -> Unit
@@ -307,7 +313,9 @@ internal class MobileRepository(context: Context) : Closeable {
 
     private fun selectSession(sessionId: String) {
         val session = sessionsById[sessionId]
-        val runtimeId = liveRuntimeId(session?.liveBinding) ?: mutableState.value.selectedRuntimeId
+        val runtimeId = liveRuntimeId(session?.liveBinding)
+            ?: session?.projectBindingId?.value?.let(projectBindingRuntimes::get)
+            ?: mutableState.value.selectedRuntimeId
         mutableState.update {
             it.copy(
                 selectedSessionId = sessionId,
@@ -489,6 +497,10 @@ internal class MobileRepository(context: Context) : Closeable {
                 projects.forEach { projectNames[it.id] = it.displayName }
                 projectRuntimes.clear()
                 projectRuntimes.putAll(ProjectionMapper.projectRuntimeIds(payload.view))
+                projectBindingRuntimes.clear()
+                projectBindingRuntimes.putAll(
+                    ProjectionMapper.projectBindingRuntimeIds(payload.view),
+                )
                 hostRuntimeIds.clear()
                 hostRuntimeIds += payload.view.groups.flatMap { it.runtimeIds }.map { it.value }
                 renderProjectIndex()
@@ -631,6 +643,7 @@ internal class MobileRepository(context: Context) : Closeable {
         val mapped = attentionItems.map { item ->
             val session = item.sessionId?.value?.let(sessionsById::get)
             val runtimeId = liveRuntimeId(session?.liveBinding)
+                ?: session?.projectBindingId?.value?.let(projectBindingRuntimes::get)
             val capability = runtimeId?.let(capabilities::get)
             val slot = PendingActionSlot.Attention(item.id.value)
             val availability = when {
@@ -686,8 +699,10 @@ internal class MobileRepository(context: Context) : Closeable {
             return
         }
         val runtimeId = liveRuntimeId(session.liveBinding)
+            ?: projectBindingRuntimes[session.projectBindingId.value]
         val capability = runtimeId?.let(capabilities::get)
         val queue = queueViews[sessionId]
+        val live = liveViews[sessionId]
         mutableState.update {
             it.copy(
                 promptAction = if (runtimeId != null && capabilityFreshness[runtimeId] == DataFreshness.Live) {
@@ -714,6 +729,26 @@ internal class MobileRepository(context: Context) : Closeable {
                 } else {
                     ActionAvailability.disabled("等待实时队列投影确认")
                 },
+                resumeAction = if (runtimeId != null && capabilityFreshness[runtimeId] == DataFreshness.Live) {
+                    availabilityUnlessInFlight(
+                        PendingActionSlot.Resume,
+                        mobileSessionActionAvailability(session, queue, capability, MobileSessionAction.RESUME_SESSION),
+                    )
+                } else {
+                    ActionAvailability.disabled("等待运行时恢复能力投影确认")
+                },
+                interruptAction = if (
+                    live?.activeTurnId != null &&
+                    runtimeId != null &&
+                    capabilityFreshness[runtimeId] == DataFreshness.Live
+                ) {
+                    availabilityUnlessInFlight(
+                        PendingActionSlot.Interrupt,
+                        mobileSessionActionAvailability(session, queue, capability, MobileSessionAction.INTERRUPT_TURN),
+                    )
+                } else {
+                    ActionAvailability.disabled("当前没有可中断的活动回合")
+                },
             )
         }
     }
@@ -733,6 +768,8 @@ internal class MobileRepository(context: Context) : Closeable {
                 promptAction = ActionAvailability.disabled(reason),
                 enqueueNewTurnAction = ActionAvailability.disabled(reason),
                 enqueueSteerAction = ActionAvailability.disabled(reason),
+                resumeAction = ActionAvailability.disabled(reason),
+                interruptAction = ActionAvailability.disabled(reason),
             )
         }
         renderAttention()
@@ -750,6 +787,34 @@ internal class MobileRepository(context: Context) : Closeable {
             active.submitPromptText(SessionId(sessionId), text, key)
         }.onDefiniteSuccess {
             mutableState.update { state -> if (state.draft == text) state.copy(draft = "") else state }
+        }
+    }
+
+    private fun resumeSession() {
+        val active = client ?: return
+        val snapshot = mutableState.value
+        val sessionId = snapshot.selectedSessionId ?: return showMessage("请先选择会话")
+        if (!snapshot.resumeAction.enabled) {
+            return showMessage(snapshot.resumeAction.disabledReason ?: "当前会话不可恢复")
+        }
+        val signature = PendingActionSignature(PendingActionKind.Resume, sessionId, "", null)
+        performCommand(active, PendingActionSlot.Resume, signature) { key ->
+            active.resumeSession(SessionId(sessionId), key)
+        }
+    }
+
+    private fun interruptTurn() {
+        val active = client ?: return
+        val snapshot = mutableState.value
+        val sessionId = snapshot.selectedSessionId ?: return showMessage("请先选择会话")
+        val turnId = liveViews[sessionId]?.activeTurnId?.value
+            ?: return showMessage("当前没有可中断的活动回合")
+        if (!snapshot.interruptAction.enabled) {
+            return showMessage(snapshot.interruptAction.disabledReason ?: "当前回合不可中断")
+        }
+        val signature = PendingActionSignature(PendingActionKind.Interrupt, sessionId, "", turnId)
+        performCommand(active, PendingActionSlot.Interrupt, signature) { key ->
+            active.interruptTurn(SessionId(sessionId), TurnId(turnId), key)
         }
     }
 
@@ -798,6 +863,34 @@ internal class MobileRepository(context: Context) : Closeable {
             mutableState.update { state ->
                 state.copy(attentionDrafts = state.attentionDrafts - action.attentionId)
             }
+        }
+    }
+
+    private fun respondQuestion(action: UiAction.RespondQuestion) {
+        val active = client ?: return
+        val item = attentionItems.firstOrNull { it.id.value == action.attentionId }
+            ?: return showMessage("提醒已变化，请刷新")
+        val slot = PendingActionSlot.Attention(action.attentionId)
+        val signature = PendingActionSignature(
+            PendingActionKind.Attention,
+            action.attentionId,
+            action.answers.joinToString("|") { answer ->
+                "${answer.questionKey}:${answer.optionIds.joinToString(",")}:${answer.freeForm.orEmpty()}"
+            },
+            null,
+        )
+        performCommand(active, slot, signature, retainDefiniteSuccess = true) { key ->
+            active.respondQuestionText(
+                item,
+                action.answers.map { answer ->
+                    MobileQuestionAnswer(
+                        questionKey = answer.questionKey,
+                        optionIds = answer.optionIds,
+                        freeForm = answer.freeForm,
+                    )
+                },
+                key,
+            )
         }
     }
 
@@ -958,12 +1051,14 @@ internal class ProjectionCursorHighWater<K> {
     }
 }
 
-internal enum class PendingActionKind { Prompt, EnqueueNewTurn, EnqueueSteer, Attention }
+internal enum class PendingActionKind { Prompt, EnqueueNewTurn, EnqueueSteer, Resume, Interrupt, Attention }
 
 internal sealed interface PendingActionSlot {
     data object Prompt : PendingActionSlot
     data object EnqueueNewTurn : PendingActionSlot
     data object EnqueueSteer : PendingActionSlot
+    data object Resume : PendingActionSlot
+    data object Interrupt : PendingActionSlot
     data class Attention(val attentionId: String) : PendingActionSlot
 }
 

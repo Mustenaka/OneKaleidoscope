@@ -119,7 +119,7 @@ mod windows {
                 if ack.command_id == command_id
                     && matches!(
                         &ack.outcome,
-                        CommandOutcome::AcceptedByRuntime { binding_handle }
+                        CommandOutcome::AcceptedByRuntime { binding_handle, .. }
                             if binding_handle.kind
                                 == ProviderBindingKind::RuntimeAcknowledgement
                                 && binding_handle.runtime_id == *session.runtime_id()

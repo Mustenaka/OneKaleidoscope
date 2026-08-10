@@ -1,13 +1,17 @@
 //! Mobile product helpers that keep command, content and capability semantics in Rust.
 
-use kaleido_proto::attention::{AttentionItem, AttentionResponse, AttentionSubject};
+use std::collections::HashSet;
+
+use kaleido_proto::attention::{
+    AttentionItem, AttentionResponse, AttentionSubject, QuestionAnswer,
+};
 use kaleido_proto::capability::{Capability, CapabilityState};
 use kaleido_proto::command::{Command, CommandAck, DeviceCommandRequest};
 use kaleido_proto::content::{
     ContentKind, ContentReadRequest, ContentReadResponse, ContentRef, ContentUnavailableReason,
     ContentWriteRequest, ContentWriteResponse, MAX_CONTENT_READ_BYTES, MAX_CONTENT_WRITE_BYTES,
 };
-use kaleido_proto::ids::SessionId;
+use kaleido_proto::ids::{SessionId, TurnId};
 use kaleido_proto::projection::{InputQueueView, RuntimeCapabilityView, SessionSummary};
 use kaleido_proto::queue::QueueIntent;
 use kaleido_proto::session::LiveBinding;
@@ -24,6 +28,8 @@ pub enum MobileSessionAction {
     SubmitPrompt,
     EnqueueNewTurn,
     EnqueueSteer,
+    ResumeSession,
+    InterruptTurn,
 }
 
 /// Closed, provider-neutral reason a mobile action is unavailable.
@@ -54,6 +60,16 @@ pub enum MobileTextContent {
     TooLarge { byte_len: u64 },
 }
 
+/// Text entered for one canonical question. The broker uploads `free_form`
+/// and turns it into the shared `QuestionAnswer::free_form_ref` before the
+/// command is sent; UI code never constructs content references itself.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MobileQuestionAnswer {
+    pub question_key: String,
+    pub option_ids: Vec<String>,
+    pub free_form: Option<String>,
+}
+
 #[uniffi::export]
 pub fn mobile_session_action_availability(
     session: SessionSummary,
@@ -77,6 +93,22 @@ pub fn mobile_session_action_availability(
                 Some(_) => available(),
                 None => blocked(MobileActionBlocker::QueueUnavailable),
             }
+        }
+        MobileSessionAction::ResumeSession => {
+            let Some(capabilities) = capabilities else {
+                return blocked(MobileActionBlocker::RuntimeCapabilityMissing);
+            };
+            capability_availability(&capabilities, Capability::HistoryResume)
+        }
+        MobileSessionAction::InterruptTurn => {
+            let Some(runtime_id) = live_runtime_id(&session.live_binding) else {
+                return blocked(MobileActionBlocker::SessionNotLive);
+            };
+            let Some(capabilities) = capabilities.filter(|view| &view.runtime_id == runtime_id)
+            else {
+                return blocked(MobileActionBlocker::RuntimeCapabilityMissing);
+            };
+            capability_availability(&capabilities, Capability::TurnInterrupt)
         }
     }
 }
@@ -155,6 +187,29 @@ impl MobileClient {
         )
     }
 
+    pub fn resume_session(
+        &self,
+        session_id: SessionId,
+        idempotency_key: String,
+    ) -> Result<CommandAck, MobileClientError> {
+        self.submit_mobile_command(idempotency_key, Command::ResumeSession { session_id })
+    }
+
+    pub fn interrupt_turn(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+        idempotency_key: String,
+    ) -> Result<CommandAck, MobileClientError> {
+        self.submit_mobile_command(
+            idempotency_key,
+            Command::InterruptTurn {
+                session_id,
+                turn_id,
+            },
+        )
+    }
+
     pub fn respond_attention_text(
         &self,
         attention: AttentionItem,
@@ -162,6 +217,9 @@ impl MobileClient {
         free_form: Option<String>,
         idempotency_key: String,
     ) -> Result<CommandAck, MobileClientError> {
+        if matches!(&attention.subject, AttentionSubject::Question { .. }) {
+            return Err(MobileClientError::Contract);
+        }
         let request_key = attention
             .request_key()
             .ok_or(MobileClientError::Contract)?
@@ -176,7 +234,7 @@ impl MobileClient {
             }
         }
         let free_form_allowed = match &attention.subject {
-            AttentionSubject::Question { request } => request.free_form_allowed,
+            AttentionSubject::Question { .. } => false,
             AttentionSubject::WorkflowGate { request } => request.free_form_allowed,
             AttentionSubject::Approval { .. } | AttentionSubject::ConnectionFault { .. } => false,
         };
@@ -192,6 +250,89 @@ impl MobileClient {
             expected_expires_at_ms: attention.expires_at_ms,
             option_id,
             free_form_ref,
+            question_answers: Vec::new(),
+        };
+        response
+            .validate()
+            .map_err(|_| MobileClientError::Contract)?;
+        self.submit_mobile_command(idempotency_key, Command::RespondAttention { response })
+    }
+
+    /// Uploads every free-form body and submits a complete question set in one
+    /// broker command. Questions are keyed by the canonical `question_key`, so
+    /// this path is provider-neutral and cannot silently answer the wrong
+    /// prompt when a runtime reorders its questions.
+    pub fn respond_question_text(
+        &self,
+        attention: AttentionItem,
+        answers: Vec<MobileQuestionAnswer>,
+        idempotency_key: String,
+    ) -> Result<CommandAck, MobileClientError> {
+        let AttentionSubject::Question { request } = &attention.subject else {
+            return Err(MobileClientError::Contract);
+        };
+        if answers.len() != request.questions.len() {
+            return Err(MobileClientError::Contract);
+        }
+        let mut seen = HashSet::new();
+        let mut question_answers = Vec::with_capacity(answers.len());
+        for answer in answers {
+            if !seen.insert(answer.question_key.clone()) {
+                return Err(MobileClientError::Contract);
+            }
+            let question = request
+                .questions
+                .iter()
+                .find(|question| question.question_key == answer.question_key)
+                .ok_or(MobileClientError::Contract)?;
+            if answer.option_ids.is_empty() && answer.free_form.is_none() {
+                return Err(MobileClientError::Contract);
+            }
+            if answer
+                .free_form
+                .as_deref()
+                .is_some_and(|text| text.trim().is_empty())
+            {
+                return Err(MobileClientError::Contract);
+            }
+            if !question.multi_select && answer.option_ids.len() > 1 {
+                return Err(MobileClientError::Contract);
+            }
+            let mut option_ids = HashSet::new();
+            for option_id in &answer.option_ids {
+                if option_id.is_empty()
+                    || !option_ids.insert(option_id)
+                    || !question
+                        .options
+                        .iter()
+                        .any(|option| &option.option_id == option_id)
+                {
+                    return Err(MobileClientError::Contract);
+                }
+            }
+            let free_form_ref = match answer.free_form {
+                Some(text) if question.free_form_allowed => Some(self.upload_sensitive_text(text)?),
+                Some(_) => return Err(MobileClientError::Contract),
+                None => None,
+            };
+            question_answers.push(QuestionAnswer {
+                question_key: answer.question_key,
+                option_ids: answer.option_ids,
+                free_form_ref,
+            });
+        }
+        let request_key = attention
+            .request_key()
+            .ok_or(MobileClientError::Contract)?
+            .to_owned();
+        let response = AttentionResponse {
+            attention_id: attention.id,
+            session_id: attention.session_id,
+            request_key,
+            expected_expires_at_ms: attention.expires_at_ms,
+            option_id: None,
+            free_form_ref: None,
+            question_answers,
         };
         response
             .validate()
@@ -432,12 +573,19 @@ mod tests {
     }
 
     fn capabilities(state: CapabilityState) -> RuntimeCapabilityView {
+        capability_view(kaleido_proto::capability::Capability::TurnPrompt, state)
+    }
+
+    fn capability_view(
+        capability: kaleido_proto::capability::Capability,
+        state: CapabilityState,
+    ) -> RuntimeCapabilityView {
         RuntimeCapabilityView {
             host_id: kaleido_proto::ids::HostId::new("host-a"),
             runtime_id: ProviderRuntimeId::new("runtime-a"),
             negotiated_at_ms: 1,
             entries: vec![CapabilityEntry {
-                capability: kaleido_proto::capability::Capability::TurnPrompt,
+                capability,
                 state,
                 evidence: CapabilityEvidence {
                     source: EvidenceSource::ObservedInTraffic,
@@ -501,6 +649,45 @@ mod tests {
                 .enabled
             );
         }
+    }
+
+    #[test]
+    fn resume_and_interrupt_are_driven_by_their_exact_capabilities() {
+        let resume = mobile_session_action_availability(
+            session(false),
+            None,
+            Some(capability_view(
+                kaleido_proto::capability::Capability::HistoryResume,
+                CapabilityState::Supported,
+            )),
+            MobileSessionAction::ResumeSession,
+        );
+        assert!(resume.enabled);
+
+        let interrupt = mobile_session_action_availability(
+            session(true),
+            None,
+            Some(capability_view(
+                kaleido_proto::capability::Capability::TurnInterrupt,
+                CapabilityState::Supported,
+            )),
+            MobileSessionAction::InterruptTurn,
+        );
+        assert!(interrupt.enabled);
+
+        let offline_interrupt = mobile_session_action_availability(
+            session(false),
+            None,
+            Some(capability_view(
+                kaleido_proto::capability::Capability::TurnInterrupt,
+                CapabilityState::Supported,
+            )),
+            MobileSessionAction::InterruptTurn,
+        );
+        assert_eq!(
+            offline_interrupt.blocker,
+            Some(MobileActionBlocker::SessionNotLive)
+        );
     }
 
     #[test]

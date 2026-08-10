@@ -1,12 +1,16 @@
 # 任务索引
 
-> 生效：2026-08-09。进度真源是 [STATUS.md](../STATUS.md)。
+> 生效：2026-08-10。进度真源是 [STATUS.md](../STATUS.md)。
 
 ## 活动
 
 | 卡 | 范围 | 状态 |
 |---|---|---|
 | [T-110](T-110.md) | R4 自有 Ubuntu rendezvous/P2P/relay、跨公网 E2EE、FCM、网络切换、活进程树终止 | active |
+| [T-111](T-111.md) | R5 OpenCode REST/SSE、D-B11、生成类型、真实会话与恢复 | active；question fixture 通过，latest generated live 因 `/doc`/`/event` 漂移 blocked |
+| [T-112](T-112.md) | R5 Claude Agent SDK Broker、真实流式会话、permissions 与恢复 | active；真实 OAuth 失败，success 未验 |
+| [T-113](T-113.md) | R5 多 provider hostd/移动端集成、跨平台 CI 与实体 Android 总门禁 | active；依赖 T-111/T-112 |
+| [T-114](T-114.md) | UACP QuestionSet、多选/自由文本回答与 Android 共享交互 | completed；本地总门禁通过，不代表 R5 完成 |
 
 ## 已完成
 

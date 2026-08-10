@@ -66,7 +66,7 @@ fn violations(error: &DependencyCheckError) -> &[Violation] {
 }
 
 #[test]
-fn repository_rules_declare_the_complete_eleven_crate_matrix() {
+fn repository_rules_declare_the_complete_twelve_crate_matrix() {
     let rules = parse_rules(REPOSITORY_RULES).expect("repository rules must parse");
     let expected = BTreeSet::from([
         "kaleido-proto",
@@ -74,6 +74,7 @@ fn repository_rules_declare_the_complete_eleven_crate_matrix() {
         "kaleido-adapter",
         "kaleido-adapter-codex",
         "kaleido-adapter-acp",
+        "kaleido-adapter-claude",
         "kaleido-adapter-opencode",
         "kaleido-transport",
         "kaleido-core",
@@ -260,12 +261,13 @@ fn dependencies_of_every_cargo_kind_reach_the_proto_deny_check() {
 }
 
 #[test]
-fn hostd_wildcard_allows_all_three_concrete_adapters() {
+fn hostd_wildcard_allows_all_four_concrete_adapters() {
     let source = metadata(&[
         TestPackage::new("kaleido-hostd", "crates/kaleido-hostd/Cargo.toml").with_dependencies(
             vec![
                 dependency("kaleido-adapter-codex"),
                 dependency("kaleido-adapter-acp"),
+                dependency("kaleido-adapter-claude"),
                 dependency("kaleido-adapter-opencode"),
             ],
         ),
@@ -278,6 +280,10 @@ fn hostd_wildcard_allows_all_three_concrete_adapters() {
             "crates/kaleido-adapter-acp/Cargo.toml",
         ),
         TestPackage::new(
+            "kaleido-adapter-claude",
+            "crates/kaleido-adapter-claude/Cargo.toml",
+        ),
+        TestPackage::new(
             "kaleido-adapter-opencode",
             "crates/kaleido-adapter-opencode/Cargo.toml",
         ),
@@ -286,7 +292,7 @@ fn hostd_wildcard_allows_all_three_concrete_adapters() {
     let report =
         check_with_inputs(REPOSITORY_RULES, &source, &[]).expect("hostd composition must pass");
 
-    assert_eq!(report.internal_edges, 3);
+    assert_eq!(report.internal_edges, 4);
 }
 
 #[test]

@@ -337,7 +337,7 @@ mod tests {
         let device = DeviceId::new("device");
         let input = ChallengeTranscript {
             transport_version: "0.1.0",
-            protocol_version: "0.3.0",
+            protocol_version: "0.5.0",
             host_id: &host,
             device_id: &device,
             tls_exporter: &[1; 32],
@@ -348,7 +348,7 @@ mod tests {
         let transcript = build_transcript(&input).expect("transcript");
         assert_eq!(
             URL_SAFE_NO_PAD.encode(&transcript),
-            "T25lS2FsZWlkb3Njb3BlLkRldmljZUF1dGgudjEABTAuMS4wAAUwLjMuMAAEaG9zdAAGZGV2aWNlAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQECAgICAgICAgICAgICAgICAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMAAAAAAAAABA"
+            "T25lS2FsZWlkb3Njb3BlLkRldmljZUF1dGgudjEABTAuMS4wAAUwLjUuMAAEaG9zdAAGZGV2aWNlAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQECAgICAgICAgICAgICAgICAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMAAAAAAAAABA"
         );
 
         let key = SigningKey::random(&mut OsRng);
@@ -393,7 +393,7 @@ mod tests {
                 connection_scope: "conn-a",
                 request_id: 9,
                 transport_version: "0.1.0",
-                protocol_version: "0.3.0",
+                protocol_version: "0.5.0",
                 host_id: &host,
                 device_id: &device,
                 tls_exporter: &[4; 32],
@@ -402,7 +402,7 @@ mod tests {
             .expect("issue");
         let transcript = build_transcript(&ChallengeTranscript {
             transport_version: "0.1.0",
-            protocol_version: "0.3.0",
+            protocol_version: "0.5.0",
             host_id: &host,
             device_id: &device,
             tls_exporter: &[4; 32],
@@ -438,7 +438,7 @@ mod tests {
                 connection_scope: "conn-a",
                 request_id: 1,
                 transport_version: "0.1.0",
-                protocol_version: "0.3.0",
+                protocol_version: "0.5.0",
                 host_id: &host,
                 device_id: &device,
                 tls_exporter: &[0; 32],
@@ -470,7 +470,7 @@ mod tests {
                 connection_scope: "expired",
                 request_id: 1,
                 transport_version: "0.1.0",
-                protocol_version: "0.3.0",
+                protocol_version: "0.5.0",
                 host_id: &host,
                 device_id: &device,
                 tls_exporter: &[0; 32],
@@ -492,7 +492,7 @@ mod tests {
                 connection_scope: "revoked",
                 request_id: 2,
                 transport_version: "0.1.0",
-                protocol_version: "0.3.0",
+                protocol_version: "0.5.0",
                 host_id: &host,
                 device_id: &device,
                 tls_exporter: &[0; 32],
