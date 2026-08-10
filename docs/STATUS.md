@@ -80,9 +80,10 @@ Android FCM、网络切换与活进程树终止。
 
 截至 2026-08-10，T-110 的实现候选已闭合 ADR-0024、REMOTE_CONTROL 0.1、
 自有 iroh relay、复用 R3 pinned TLS 的公网数据面、FCM FID、逐 key cursor 恢复和
-三平台进程树终止代码；本地 `cargo xtask ci` 与 Android 双 ABI/JVM/lint/AAR 门禁通过。
-这不是 R4 完成声明：Ubuntu 三平台 CI、自有实例 ACME/FCM 运行及实体 arm64 Android
-蜂窝公网纵切尚未执行，真实门禁保持 [pending](gates/T-110-evidence.md)。
+三平台进程树终止代码；本地 `cargo xtask ci`、Android 双 ABI/JVM/lint/AAR，以及 GitHub
+Windows/Ubuntu/macOS matrix 与 Android CI 均通过。这不是 R4 完成声明：自有 Ubuntu
+实例的 DNS/ACME/FCM 运行及实体 arm64 Android 蜂窝公网纵切尚未执行，真实门禁保持
+[pending](gates/T-110-evidence.md)。
 
 ## 5. 尚未完成的后续里程碑
 
