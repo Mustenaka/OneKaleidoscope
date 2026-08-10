@@ -268,12 +268,10 @@ mod tests {
             .unwrap();
         drop(reopened);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(
-            Registry::open(RegistryConfig::durable(path.clone()))
-                .unwrap_err()
-                .code(),
-            RemoteErrorCode::UnsafeStorage
-        );
+        assert!(matches!(
+            Registry::open(RegistryConfig::durable(path.clone())).unwrap_err(),
+            RemoteError::UnsafeStorage
+        ));
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         fs::write(&path, b"not-json").unwrap();
         assert_eq!(
