@@ -1,163 +1,121 @@
-# CLAUDE.md — 项目主管工作合同
+# CLAUDE.md — OneKaleidoscope 工作方式
 
-> 进入仓库的 Claude Code、Codex 与人类遵循同一执行角色；具体技术纪律见 [AGENTS.md](AGENTS.md)。
-> 当前状态：**R0～R3 已完成；下一里程碑是 R4 自有 Ubuntu 远程连接。**
+> 生效：2026-08-10。本文**取代**此前的「主管规划 → 实现方执行 → 主管评审」两角色合同。
+> 三件事说清：做什么（§1）、现在到哪（§2）、怎么动手（§3）。
+> 约束只剩五条（§4）。其余一切都可以自己判断。
 
-## 1. 每次启动必须先读
+---
 
-按顺序全文阅读：
+## 1. 目标
 
-1. `docs/STATUS.md`
-2. `docs/REQUIREMENTS.md`
-3. `docs/PROTOCOL.md`
-4. `docs/adr/0009-session-broker.md`
-5. `docs/adr/0010-canonical-state-and-workflow.md`
-6. `docs/adr/0011-self-hosted-connectivity.md`
-7. `docs/adr/0012-provider-decode-strategy.md`
-8. `docs/adr/0013-platform-track-order.md`
-9. `docs/ARCHITECTURE.md`
-10. `docs/MILESTONES.md`
-11. `docs/gates/R1-result.md`（先读 §0 主管评审）
-12. `docs/tasks/README.md`
-13. `docs/PRIOR_ART.md`
-14. `AGENTS.md`
+**OneKaleidoscope 让用户离开电脑后，只用手机继续掌控 PC 上正在跑的 AI 编码 Agent。**
 
-旧任务卡、旧 KICKOFF、fixture README 和被取代 ADR 只能作历史证据，不能覆盖上述基线。
+三家（Claude Code / Codex / OpenCode）在 PC 本机项目里执行；PC 上的 `kaleido-hostd`
+通过各家**公开的结构化协议**拥有或连接会话，把状态归约成规范化状态，投影到手机；
+手机能看历史、看实时 turn，并且能真的干预——审批、回答、排队、steer、中断、重试。
+再往上，多个 Agent 组成「Claude 规划 → Codex 执行 → Claude 审核」的工作流，也从手机推进。
 
-## 2. 不得改变的产品结论
+v1 的最小可演示（这就是「完成」的定义）：
 
-- Claude Code / Codex / OpenCode 三家；
-- 每家 CLI 与原生 GUI；
-- 手机查看历史和活动会话并实时干预；
-- 项目、会话、状态、Agent tasks、用户队列、Attention Inbox 分层；
-- Claude 规划 → Codex 执行 → Claude 审核等跨 Agent 工作流；
-- 不走 PTY/TUI/ANSI/屏幕转发；
-- 自有 Ubuntu 协调/relay + E2EE；
-- 编辑器预览保留但不抢占当前主线。
+1. PC 上建一个 Claude 规划 → Codex 执行 → Claude 审核的真实工作流；
+2. 用户离开 PC，只用 Android 看各步骤和关联会话；
+3. 手机处理一次权限请求、一次问题、一次 steer 或排队消息、一次审核返工；
+4. 网络切换后恢复，状态、队列和等待项不丢不重；
+5. iOS 功能对齐；
+6. 六格（三家 × CLI/GUI）验收矩阵没有被隐藏或伪造。
 
-上游没有公开路径时，登记阻塞并保留失败验收格。不得隐藏、改名或降低需求来宣布完成。
+完整需求见 [REQUIREMENTS.md](docs/REQUIREMENTS.md)，它仍然是需求真源。
+**技术困难不降低需求**：做不到就记为未实现或上游阻塞，然后继续推进别的纵切。
 
-## 3. 当前工作：R3 已结清，准备 R4
+## 2. 现在到哪
 
-R0、R1、R2 已通过；仓库收敛、T-105 schema drift、T-103 Attention provenance 与
-T-104 LiveControl 均已结清。R3 最终由四个独立边界完成：
+看 [docs/STATUS.md](docs/STATUS.md)。它是唯一的进度真源；本文不重复进度，避免两处打架。
 
-1. [T-106](docs/tasks/T-106.md)：UACP 0.3 projection cursor、可信 mobile ingress、
-   TRANSPORT 0.1；
-2. [T-107](docs/tasks/T-107.md)：hostd LAN broker、projection journal 与 Rust mobile core；
-3. [T-108](docs/tasks/T-108.md)：Android Compose 与断线/冷启恢复。
-4. [T-109](docs/tasks/T-109.md)：实体 arm64 Wi-Fi、硬件密钥、真实审批、OEM 后台、
-   force-stop cursor 恢复与吊销门禁。
+## 3. 怎么动手 —— 默认直接写
 
-T-106～T-109 均已通过。R4 尚未开卡；开卡前先审计 Ubuntu rendezvous/relay、跨公网
-E2EE、推送与活进程树终止的现有合同和实现缺口。
+**你可以直接设计并实现。不需要先开卡，不需要等批准，不需要按顺序通读所有文档。**
 
-仍携带的项目：
+动手前只需要读：
 
-| ID | 内容 | 阻塞谁 |
-|---|---|---|
-| D-B2 | 活进程树终止无测试 | R4 |
-| D-B6 / D-B7 | 跨平台路径校验规则未定 | R9 |
-| D-B11 | OpenCode 实机与 schema 快照需在接入前重新对齐 | R5 |
-| D-B8 / P-2 | 见 [tasks/README](docs/tasks/README.md) | 不阻塞 |
+1. [docs/STATUS.md](docs/STATUS.md)，确认你在做的是不是当前该做的；
+2. 你要改的代码；
+3. **只有**当你要碰协议语义时，读 [docs/PROTOCOL.md](docs/PROTOCOL.md) 的相关章节。
 
-G-R1-1 已解除；线程调度、背压、进程被杀后的恢复也已由 T-107～T-109 取得 emulator
-与实体设备证据。
+然后：
 
-`docs/PROTOCOL.md` 与 `crates/kaleido-proto` 现在是合同：修改必须先改协议、走 ADR，
-再改代码。协议从 canonical state、commands、projections 和 workflow 推导，
-不得恢复固定 12 事件模型。现有 fixture 只用于验证 join、decline、
-敏感载荷等已观察语义。
+- **设计和实现是同一次工作。** 需要决策就自己决策，把理由写下来，和代码一起提交。
+- **一次提交可以同时改协议、proto、代码、测试、文档和 ADR。** 这是有意的，见 §5。
+- **任务记录从轻。** 一句话能说清的写进 [docs/tasks/README.md](docs/tasks/README.md) 的 backlog；
+  确实需要一页篇幅才能定义清楚的，才开 `docs/tasks/T-NNN.md`。
+- **不再写这些**：`T-NNN-codex-prompt.md`（转述任务卡的中间层）、
+  `gates/T-NNN-result.md`（自己审自己的评审文）、`T-NNN-unblock-reply*.md`（裁决往返）。
+  真实机器证据值得留档时，写一个 `docs/gates/T-NNN-evidence.md` 就够。
+- **发现顺手能修的缺陷就修**，不必先登记再排队。改动大到会让审阅失焦时，才拆成两次提交。
 
-T-001～T-013 已冻结，T-014 已撤销，T-101 已作废。不得重新下发、续写或从旧 M1 队列复制 prompt。
+历史文件（冻结的 T-001～T-014、旧 KICKOFF、被取代的 ADR、`gates/` 下的旧评审）
+**只作历史证据**，不能定义现在的范围，也不要续写。
 
-## 4. 统一执行职责
+## 4. 五条硬约束
 
-### 必须做
+这五条不是流程，是产品成立的前提。其余规则都可以自己判断，这五条不行。
 
-- 维护需求、协议、架构、里程碑和 ADR；
-- 把一个端到端纵切拆成边界清楚的任务；
-- 为每张任务卡定义输入、输出、DoD、错误路径、真实验收和禁止修改范围；
-- 审核 Codex 实现、测试真实性、安全和偏离；
-- 在人工门禁处停止并给出精确操作与证据要求；
-- 将 provider 公开接口缺口登记为阻塞，而不是要求实现方猜。
+1. **Agent 数据只来自结构化协议。** 禁止 PTY、伪终端、ANSI/TUI 解析、抓屏、OCR、
+   轮询 transcript 冒充实时。这是立项前提（OBJ-8），不是风格偏好。
+2. **不许伪造证据。** 具体指：写不会失败的测试；把没跑过的门禁标成通过；
+   把队列说成 steer；把历史说成实时；把「按 ID 回查得到空洞」说成能用。
+   做不到就写「未实现」并说清缺什么——**这从来不算失败**。
+3. **不泄漏。** 日志、推送、relay 里不出现业务明文、代码、diff、工具调用参数、
+   token、完整用户路径。服务器没有内容密钥。
+4. **能力按 runtime 探测，不按 provider 名字硬编码。** UI 只能按连接后拿到的
+   capability 渲染。
+5. **`cargo xtask ci` 绿了才算做完。** 见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
+   跨平台结论只能来自对应平台的真实运行，本机 Windows 通过不等于 macOS/Linux 通过。
 
-### 不得做
+## 5. 改协议怎么办 —— 一次提交，同时改
 
-- 不得让 Codex 在 proto 前创建临时全局合同；
-- 不得把完整 schema/codegen/fixture 矩阵设为产品开工前置；
-- 不得同时铺开三家 adapter 后才验证手机纵切；
-- 不得把历史恢复称为实时附着；
-- 不得把 wrapper 管理会话称为原生 GUI 已支持；
-- 不得用能力隐藏替代六格验收；
-- 不得以修复 spike/recorder 为名长期推迟产品纵切。
+`docs/PROTOCOL.md` 与 `crates/kaleido-proto` 是合同，但**合同的修改流程不再是审批流程**。
 
-## 5. 新任务卡格式
+需要改协议时：在**同一次提交**里改 PROTOCOL.md、`kaleido-proto`、依赖它的代码、测试，
+并写一个 ADR 说明为什么这么改、放弃了什么方案。ADR 是**决策记录**，不是申请单——
+没有「提议，待批准」这个状态，写完即生效，后续被推翻就再写一个取代它。
 
-新任务从 `docs/tasks/T-100.md` 开始：
+唯一要求是三者别脱节：协议文本、proto 类型、实际行为必须描述同一件事。
+发现它们已经脱节，就地修好，不用先登记。
 
-```markdown
-# T-100: <一个端到端纵切>
+## 6. 什么时候才停下来问
 
-## 前置合同
-- PROTOCOL.md 的具体章节
-- kaleido-proto 的具体类型
-- 相关 ADR 与真实 fixture
+只有这几类：
 
-## 用户可见结果
-- 手机/诊断客户端最终能观察或执行什么
+- 需要花钱、对外发布、动生产数据；
+- 产品范围本身要变（比如「不做 iOS 了」「放弃 OpenCode」）——这是负责人的决定；
+- 上游确实没有公开路径，任何实现都只能靠伪造（如逆向厂商私有 Remote Control）。
 
-## 产出
-- 明确文件范围
+除此之外：**选最合理的方案，把假设写下来，继续做。**
+遇到不确定，先把不依赖该答案的部分全部做完，再在提交说明里列出假设和影响。
 
-## Definition of Done
-- 成功路径
-- 至少一条错误/拒绝路径
-- 重启或重连路径
-- 对应 projection/command 的断言
-- fmt / clippy / tests
+上游阻塞不等于停项。登记它，保持对应验收格未通过，然后推进独立纵切。
 
-## 真实验收
-- provider 版本、启动表面、操作步骤、预期证据
+## 7. 交付什么
 
-## 边界
-- proto、其他 provider、历史 fixture 等禁止范围
-```
-
-任务必须保持可独立审核的边界；互不冲突的模块可以并行。外部原生表面研究与 Broker
-管理会话实现仍必须拆卡，避免未知接口阻塞主线。
-
-## 6. 审核重点
-
-按严重程度：
-
-1. 是否擅改 `kaleido-proto` 或协议语义；
-2. 是否出现 PTY/TUI/ANSI/屏幕/transcript 轮询冒充实时；
-3. 是否把 runtime capability 按 provider 名称硬编码；
-4. 是否把 queue 假装成 steer、历史假装成 live、decline 假装成 error；
-5. 测试改坏实现后是否真的变红；
-6. 日志、推送、relay 是否泄漏业务明文、token 或完整用户路径；
-7. 是否扩大到无关 schema、recorder、其他 provider 或编辑器功能。
-
-## 7. 阻塞报告格式
+提交说明里给出：
 
 ```text
-🛑 <任务/验收格> 阻塞
+T-105: 审查 Codex 0.147.0 必需面漂移
 
-目标：
-公开路径已验证：
-缺失的协议能力：
-不能采用的伪实现：
-对最终需求的影响：
-可继续推进的独立纵切：
-复查触发条件：
+- 58 处漂移按 required-surface entry 分组，结论见 docs/gates/T-105-evidence.md
+- 新增依赖：无
+
+验证：
+- cargo xtask ci exit 0
+- 破坏一条实际使用的 pointer → surface_drift 测试变红，恢复后全绿
+- 三平台 CI 全绿（run URL）
+
+假设/偏离：
+- <有就写，没有就写「无」>
+
+发现的问题：
+- <顺手发现但没在本次修的，一句话一条>
 ```
 
-阻塞不自动等于停掉整个项目。执行者应把独立纵切继续推进，同时让相应验收格保持未通过。
-
-## 8. 下一次输出
-
-下一步为 R4 开独立任务卡。先做只读审计并明确：Ubuntu host 身份与部署、rendezvous、
-relay 密文路径、跨公网 E2EE、设备推送、网络切换、活进程树终止及隐私日志门禁。
-不得把 LAN TLS 直接称为公网 relay，也不得为推进 R4 擅改 `schemas/`、历史 fixture 或其他
-provider。仍需保留 R5 的 OpenCode D-B11、R7 的原生 CLI/GUI 六格和 R9 的路径规则边界。
+四样：**做了什么、怎么验证的、哪里偏离了、发现了什么。**
+测试贴真实输出，不要只写「通过了」。

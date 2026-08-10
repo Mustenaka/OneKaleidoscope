@@ -229,9 +229,10 @@ kaleido-relay               independent ciphertext relay
 - 让服务器持有 provider 凭据、项目文件或业务明文；
 - 把“手机消息已排队”显示成“已 steer 到当前 turn”。
 
-## 11. 仍需协议定稿的内容
+## 11. 合同现状与后续扩展纪律
 
-项目主管必须在 `docs/PROTOCOL.md` 决定：
+R1～R3 所需的 canonical state、命令、投影、cursor、移动端 ingress 与 LAN transport
+已经在 `docs/PROTOCOL.md`、`docs/TRANSPORT.md` 和 `crates/kaleido-proto` 中定稿并实现：
 
 - 全部对象 ID、快照、cursor、命令确认和错误模型；
 - canonical state transition 与 projection 的边界；
@@ -242,4 +243,6 @@ kaleido-relay               independent ciphertext relay
 - 内容引用、脱敏和保留策略；
 - UniFFI 可表达性。
 
-这些问题解决前，没有产品实现任务卡处于活动状态。
+后续里程碑只能在需要新语义时扩展这些合同。特别是 R4 的公网 rendezvous、P2P、relay、
+push 与跨公网 E2EE 不能把 R3 的 LAN TLS 直接改名复用；实现必须先用 ADR 固定身份、
+密钥、路由、重放、限额和隐私边界，再在同一变更中同步合同、类型、代码与测试。
