@@ -244,7 +244,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("registry.json");
+        let private = directory.path().join("private");
+        let path = private.join("registry.json");
         let registry = Registry::open(RegistryConfig::durable(path.clone())).unwrap();
         let route = registry
             .create_route(
@@ -252,12 +253,28 @@ mod tests {
                 "https://relay.example.test/relay".to_owned(),
             )
             .unwrap();
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
+        assert_eq!(
+            fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         drop(registry);
         let reopened = Registry::open(RegistryConfig::durable(path.clone())).unwrap();
         reopened
             .grant_device(route.route_id, &route.admin_token)
             .unwrap();
+        drop(reopened);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            Registry::open(RegistryConfig::durable(path.clone()))
+                .unwrap_err()
+                .code(),
+            RemoteErrorCode::UnsafeStorage
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         fs::write(&path, b"not-json").unwrap();
         assert_eq!(
             Registry::open(RegistryConfig::durable(path))
