@@ -42,16 +42,18 @@ Android 验证使用本机已配置的 `<ANDROID_SDK>`；证据页不保存含�
 旧 R5 SHA 的 no-build-cache 命令包含 `:app:compileDebugKotlin`、
 `:app:compileDebugAndroidTestKotlin` 与 `:app:testDebugUnitTest`，结果 `BUILD SUCCESSFUL`。最新 R4/R5
 集成候选已再次执行相同受影响层，实际构建 `arm64-v8a` + `x86_64` Rust/UniFFI 后通过 Kotlin、
-androidTest source 与 JVM tests；冻结 SHA 的 clean Android 总门禁由 T-113 记录。
+androidTest source 与 JVM tests；`fc896be` 的 clean AAR/APK/lint/JVM 和 API 35 instrumentation
+也已通过。全量 instrumentation 为 18 completed / 0 failed，其中 2 个实体专用 gate 按设计 skipped；
+精确命令与边界由 T-113 记录。
 
 ## 3. 变异验证
 
 答案覆盖校验曾被故意破坏，focused 测试实际变红；恢复实现后相同测试全绿。该记录证明
 “恰好覆盖每题”的测试能失败，而不是只执行 happy path。
 
-最终 DoD 把这条变异与 `cargo xtask ci` 绑定。旧 R5 SHA 的第三次完整本地 `cargo xtask ci` 已 exit 0，依次
+最终 DoD 把这条变异与 `cargo xtask ci` 绑定。最新 R4/R5 集成候选的完整本地 `cargo xtask ci` 已 exit 0，依次
 通过 fmt、check-deps、lint-forbidden、clippy、Claude sidecar、workspace tests 与 fixtures verify，
-因此 T-114 合同卡已闭合；最新 R4/R5 集成候选仍需一次冻结 SHA 总门禁，不能沿用旧 SHA 结果。
+因此 T-114 合同卡在合并 R4 后仍闭合。
 
 ## 4. R5 仍未完成的外部门禁
 

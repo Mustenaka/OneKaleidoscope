@@ -54,12 +54,25 @@ test double，只证明宿主逻辑，不冒充 provider fixture 或实体运行
 最新 focused 结果：proto 44/44、core 42/42、hostd R5 9/9，四个受影响 Rust crate 的 all-target
 clippy `-D warnings` 通过。最新集成候选的 Android 增量命令包含 `:app:compileDebugKotlin`、
 `:app:compileDebugAndroidTestKotlin` 与 `:app:testDebugUnitTest`，结果 `BUILD SUCCESSFUL`，并实际构建
-`arm64-v8a` + `x86_64` Rust/UniFFI；冻结 SHA 的 clean AAR/APK/lint/instrumentation 尚待最终一次运行。
-`adb devices -l` 为空，因此没有实体设备运行证据，不能标实体门禁通过。
+`arm64-v8a` + `x86_64` Rust/UniFFI。
+
+稳定候选 `fc896be` 随后执行一次 clean Android 总门禁：
+
+```text
+clean :core-android:verifyCoreAndroidAar :app:assembleDebug
+:app:assembleDebugAndroidTest :app:testDebugUnitTest :app:lintDebug
+BUILD SUCCESSFUL; 157 actionable tasks
+arm64-v8a + x86_64 release Rust/UniFFI
+```
+
+本机 `Medium_Phone_API_35` AVD 的 native smoke 为 1/1；全量
+`:app:connectedDebugAndroidTest` 为 18 completed / 0 failed。`RealLanBridgeTest` 与
+`PhysicalDeviceSecurityGateTest` 两个实体专用测试按设计 skipped，没有计为通过。测试结束后 emulator
+已关闭，`adb devices` 为空；因此以上是 API 35 自动化证据，不是实体 arm64/provider 纵切证据。
 
 ## 3. 本地总门禁
 
-旧 R5 SHA 的第三次完整 `cargo xtask ci` exit 0，包含 fmt、check-deps、lint-forbidden、clippy、
+最新 R4/R5 集成候选的完整 `cargo xtask ci` exit 0，包含 fmt、check-deps、lint-forbidden、clippy、
 `claude-sidecar`、workspace test 与 fixtures verify。fixture summary：
 
 ```text
@@ -68,9 +81,16 @@ codex: 3, acp-claude: 1, opencode: 3,
 claude-sidecar: 1 file / 6 records, authentication-failure-only: 1
 ```
 
-`cargo xtask schema diff` exit 0：Codex `0.147.0`、OpenCode `1.18.16`、ACP schema `1.18.0`，
+隔离安装精确 Codex `0.147.0` 后，`cargo xtask schema diff` exit 0：Codex `0.147.0`、OpenCode `1.18.16`、ACP schema `1.18.0`，
 共 288 JSON files，required-surface 内外 0 drift。该静态结果不能发现 T-111 真实 `/event` 违反
 同版本 `/doc` 的 payload drift，也不能把 Claude authentication-failure-only 变成成功证据。
+
+首次 clean workspace test 编译遇到一次 Windows rustc `STATUS_STACK_BUFFER_OVERRUN`；同一候选树、
+同一 clean target 的 hostd all-targets 定向复跑全部通过，随后完整 `cargo xtask ci` 复跑 exit 0。
+该工具链瞬时失败没有被记成绿，也没有通过删除/放宽测试处理。schema diff 还发现并修复了两项
+门禁自身问题：taskkill 与精确后代句柄竞态不再把已退出后代误报为 AccessDenied，而真正未退出仍
+fail-closed；surface-history 以 tool/version/required-surface entry set 区分经审查的 surface 扩展，
+同版本同 entry set 摘要冲突仍硬失败。
 
 queue pump 每轮只取 Idle Session 的第一条 `NewTurn`：先 durable `Submitting`，只有 provider
 structured receipt 后才写 Turn + `DeliveredAsNewTurn`；崩溃后的 uncertain entry 不自动重发。
@@ -86,9 +106,9 @@ canonical pump 尚需最终真实 provider 重跑；Claude 本地 SDK input queu
 | 三家 streaming/history/waiting-human/reconnect | **未通过** | OpenCode 部分通过；Claude success 缺失 |
 | Resume / queue / steer / interrupt contract | **focused 实现/测试通过** | canonical Resume alias、NewTurn receipt delivery、Steer Pending；需真实 provider + Android 纵切 |
 | host/provider crash 与 mobile cursor resume | **未通过 R5 最终纵切** | R3 Codex LAN 历史证据不能自动覆盖新 provider |
-| `cargo xtask ci` | **旧 R5 SHA 本地通过** | 最新 R4/R5 集成候选待冻结 SHA 总门禁；不替代 exact-commit remote CI |
-| `cargo xtask schema diff` | **本地通过** | 288 JSON files、in/out surface 0 drift；OpenCode live contract drift 仍另行阻塞 |
-| Android compile/unit | **集成候选增量通过** | BUILD SUCCESSFUL；双 ABI/UniFFI；clean/lint/instrumentation 待冻结 SHA |
+| `cargo xtask ci` | **最新集成候选本地通过** | 全入口 exit 0；不替代 exact-commit remote CI |
+| `cargo xtask schema diff` | **最新集成候选本地通过** | 精确 Codex `0.147.0`；288 JSON files、in/out surface 0 drift；OpenCode live contract drift 仍另行阻塞 |
+| Android clean build/lint/API 35 | **`fc896be` 本地通过** | 双 ABI AAR/APK/JVM/lint；native smoke 1/1；全量 18 completed / 0 failed，2 physical-only skipped |
 | Windows/macOS/Linux CI + Android CI | **workflow 已接 Node 22/Claude sidecar gate；无 exact commit run** | 仍不能标绿 |
 | 实体 arm64 Android + 真实 Wi-Fi 三家纵切 | **未执行** | 禁止用 emulator/mock/`adb reverse` 替代 |
 | R4 合并后蜂窝/relay 重跑 | **外部验收 pending** | R4 实现已进 `main`；T-115 的实体蜂窝/relay 门禁仍独立 pending |

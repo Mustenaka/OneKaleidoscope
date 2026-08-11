@@ -153,8 +153,9 @@ NAT 20 轮测试属于性能与容量数据，不再决定 relay 是否开发，
 - StructuredLanHost 已让真实 OpenCode server 与 Claude provisional runtime 同驻并 clean
   shutdown；这不是三家真实会话纵切；
 - UACP `0.5.0` QuestionSet、scoped runtime ack、逐题单/多选/free-form、answer provenance
-  与共享 Android 交互已实现；历史 R5 SHA 的完整本地 `cargo xtask ci` 与静态 schema diff 已通过，
-  最新 R4/R5 集成候选已通过 scoped Rust 与 Android 双 ABI/UniFFI 增量门禁，T-114 合同保持完成；
+  与共享 Android 交互已实现；最新 R4/R5 集成候选的完整 `cargo xtask ci` 与精确支持版本 schema
+  diff 已通过；`fc896be` 的 Android 双 ABI clean AAR/APK/lint/JVM 与 API 35 instrumentation
+  18 completed / 0 failed，T-114 合同保持完成；
 
 仍未通过：Claude 成功 turn/非空 history read 与真实 permission/question/interrupt/resume、OpenCode
 `/doc`/`/event` 漂移解除与实时/恢复/其余真实动作矩阵、三家同驻、Windows/macOS/Linux + Android CI、R5 实体 arm64 Android 纵切，以及

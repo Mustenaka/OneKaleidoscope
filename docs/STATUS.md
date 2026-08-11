@@ -25,10 +25,11 @@ provider-neutral multi-runtime hostd 与 UACP `0.5.0` QuestionSet/scoped runtime
 真实 OpenCode `1.18.16` question fixture 已通过，但最新 generated product live probe 暴露同版本
 `/doc` 与 `/event` 的 timestamp 类型冲突及未声明 heartbeat，adapter fail-closed，实时/恢复与 D-B11
 仍被阻塞；Claude 只有真实 SDK `0.3.226` OAuth 失败 fixture，不能称为
-成功 turn 或真实 permission/question 验收。旧 R5 SHA 的完整本地 `cargo xtask ci` 与静态 schema
-diff 已通过；最新 R4/R5 集成候选已通过 scoped Rust lint/tests 和 Android 双 ABI/UniFFI 增量编译，
-仍待冻结 SHA 的干净总门禁与 exact-commit 跨平台 CI。`adb devices -l` 为空，实体 Android R5
-纵切仍 blocked。
+成功 turn 或真实 permission/question 验收。最新 R4/R5 集成候选的 `cargo xtask ci` 已完整通过；
+用隔离安装的精确 Codex `0.147.0` 跑 schema diff，288 个 JSON 文件面内/面外均 0 drift。Android
+双 ABI/UniFFI clean AAR/APK/lint/JVM 与 API 35 instrumentation 已在 `fc896be` 通过；全量设备测试
+18 completed / 0 failed，2 个实体专用门禁按设计 skipped。exact-commit 跨平台 CI 仍待 push，
+实体 Android R5 三 provider 纵切仍 blocked。
 
 R3 的三条旧前置已全部解除：
 
