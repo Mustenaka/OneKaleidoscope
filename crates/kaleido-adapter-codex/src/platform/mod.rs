@@ -41,6 +41,8 @@ pub(crate) fn attach_tree(child: &Child) -> io::Result<ProcessTree> {
 }
 
 pub(crate) fn terminate_tree(tree: &ProcessTree, child: &mut Child) -> io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let _ = tree;
     #[cfg(target_os = "linux")]
     return linux::terminate_tree(child);
     #[cfg(target_os = "macos")]
