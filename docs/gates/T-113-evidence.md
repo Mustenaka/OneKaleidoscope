@@ -1,6 +1,6 @@
 # T-113 multi-provider / mobile gate evidence
 
-> 状态：**active；composition bootstrap 通过，最终门禁未通过**
+> 状态：**active；Claude 实体 Android 纵切通过，三 Provider 最终门禁未通过**
 > 集成基线：`origin/main@b54a12638cd044b277747d5fbc22627ad2adb016`
 > 记录日期：2026-08-11
 
@@ -49,7 +49,8 @@ test double，只证明宿主逻辑，不冒充 provider fixture 或实体运行
 - Android Compose 复用同一个 Attention UI，逐题编辑并一次提交，不按 provider 名称分支；
 - Kotlin/Swift probe 已真实编译；
 - Android main/androidTest source 编译与 unit tests 已通过；
-- 当前没有 R5 实体 Android 运行，所以以上编译结果不能冒充设备纵切。
+- Claude 已完成 R5 实体 Android 运行；Codex/OpenCode 与三家同驻仍未完成，所以该单 Provider
+  结果不能冒充 R5 总门禁。
 
 最新 focused 结果：proto 44/44、core 42/42、hostd R5 9/9，四个受影响 Rust crate 的 all-target
 clippy `-D warnings` 通过。最新集成候选的 Android 增量命令包含 `:app:compileDebugKotlin`、
@@ -70,9 +71,43 @@ arm64-v8a + x86_64 release Rust/UniFFI
 `PhysicalDeviceSecurityGateTest` 两个实体专用测试按设计 skipped，没有计为通过。测试结束后 emulator
 已关闭，`adb devices` 为空；因此以上是 API 35 自动化证据，不是实体 arm64/provider 纵切证据。
 
+### Claude 实体 arm64 / Wi-Fi 纵切
+
+在代码候选 `c929a8575894dde389288cb2fc09666dcd5bef31` 上，复用此前一次完成的双 ABI Android
+构建与已安装 APK，没有 clean 或重复构建 Android。PC 启动真实 Claude SDK `0.3.226` sidecar，
+实体 arm64 Android 与 PC 位于同一 LAN；设备到 `192.168.31.139` 的实际 route 为 `wlan0`
+直连且无 `via`，`adb reverse --list` 为空。测试只通过一次性 TLS/SPKI pairing URI 连接 hostd。
+
+首轮 `seed` 的设备端结果：
+
+```text
+OK (1 test); Time: 13.686
+outcome=seed-seven-projections-enqueue-new-turn-attention-declined
+cursor=14
+```
+
+这条路径实际完成 ProjectIndex/SessionIndex/Transcript/LiveActivity/InputQueue/AttentionInbox/
+RuntimeCapability 七投影，向尚无上游 Session ID 的 Claude provisional Broker Session durable enqueue
+首个 `NewTurn`，收到结构化 `prompt_accepted` 后写入 Turn 与 `DeliveredAsNewTurn`。真实 Claude 随后
+发起文件工具 approval，Android 使用共享 Attention UI 选择 decline；测试文件保持原内容。
+
+随后由外部 `adb shell am force-stop com.onekaleidoscope` 杀死 App，再独立启动 `resume` phase：
+
+```text
+OK (1 test); Time: 2.237
+outcome=force-stop-cache-cursor-resumed
+resumeFromCursor=14; cursor=17
+```
+
+冷启后设备身份不变，七投影从 last-good cursor 恢复。host 侧最终 canonical 摘要为
+`InputQueue(writable=true, delivered_as_new_turn)`、`AttentionInbox(count=0)`、
+`SessionIndex(status=idle)`；host stderr 为空，测试 host 及子进程树按精确 PID 清理。
+该结果只关闭 Claude 的实体 LAN/mobile 子格，不关闭 OpenCode 漂移、三家同驻、provider crash 或
+R4 蜂窝/relay 门禁。
+
 ## 3. 本地总门禁
 
-最新 R4/R5 集成候选的完整 `cargo xtask ci` exit 0，包含 fmt、check-deps、lint-forbidden、clippy、
+父提交 `d39b5709716faecffbdc1ee6ca3a3bb7aa14c42b` 的完整 `cargo xtask ci` exit 0，包含 fmt、check-deps、lint-forbidden、clippy、
 `claude-sidecar`、workspace test 与 fixtures verify。fixture summary：
 
 ```text
@@ -97,6 +132,12 @@ structured receipt 后才写 Turn + `DeliveredAsNewTurn`；崩溃后的 uncertai
 Steer 与无 receipt 路径继续 `Pending`。OpenCode v2 queue admission 证明 `QueueWrite`，但新增
 canonical pump 尚需最终真实 provider 重跑；Claude 本地 SDK input queue 不自动证明 steer。
 
+`c929a85` 的 Claude provisional queue 修复没有再次执行昂贵的完整本地构建；按阶段化门禁只运行
+受影响的 Claude/state 全量测试与 Claude/state/hostd all-target Clippy，均通过，并由上述实体
+纵切验证最终产品路径。删除 project-binding runtime fallback 的实际变异使
+`a_provisional_broker_session_uses_its_project_binding_for_reachability` 变红为 `Offline`，恢复后通过。
+exact-commit 全量结果交由 PR CI，不能沿用父提交绿灯。
+
 ## 4. 总门禁
 
 | 门禁 | 状态 | 说明 |
@@ -104,13 +145,13 @@ canonical pump 尚需最终真实 provider 重跑；Claude 本地 SDK input queu
 | OpenCode + Claude dual runtime bootstrap | **通过（本地）** | 历史同驻命令 + Claude 独立真实 acceptance probe |
 | Codex + OpenCode + Claude 三家真实 Session 同驻 | **未通过** | OpenCode stable live contract drift；没有三家同一运行证据 |
 | 三家 streaming/history/waiting-human/reconnect | **未通过** | Claude 已通过；OpenCode stable live/reconnect 仍 fail-closed |
-| Resume / queue / steer / interrupt contract | **focused 实现/测试通过** | canonical Resume alias、NewTurn receipt delivery、Steer Pending；需真实 provider + Android 纵切 |
-| host/provider crash 与 mobile cursor resume | **未通过 R5 最终纵切** | R3 Codex LAN 历史证据不能自动覆盖新 provider |
-| `cargo xtask ci` | **最新集成候选本地通过** | 全入口 exit 0；不替代 exact-commit remote CI |
+| Resume / queue / steer / interrupt contract | **Claude 实体 queue/resume 通过；总格未通过** | Claude NewTurn receipt + Attention decline + App force-stop cursor resume 已验；Steer 仍不伪造 |
+| host/provider crash 与 mobile cursor resume | **Claude App 冷启通过；provider crash/总格未通过** | Claude cursor 14→17；R3 Codex 历史证据不能自动覆盖其余 provider |
+| `cargo xtask ci` | **父提交 `d39b570` 本地通过** | `c929a85` 仅定向回归/Clippy/实体纵切；exact-commit 全量等待 PR CI |
 | `cargo xtask schema diff` | **最新集成候选本地通过** | 精确 Codex `0.147.0`；288 JSON files、in/out surface 0 drift；OpenCode live contract drift 仍另行阻塞 |
 | Android clean build/lint/API 35 | **`fc896be` 本地通过** | 双 ABI AAR/APK/JVM/lint；native smoke 1/1；全量 18 completed / 0 failed，2 physical-only skipped |
-| Windows/macOS/Linux CI + Android CI | **workflow 已接 Node 22/Claude sidecar gate；无 exact commit run** | 仍不能标绿 |
-| 实体 arm64 Android + 真实 Wi-Fi 三家纵切 | **未执行** | 禁止用 emulator/mock/`adb reverse` 替代 |
+| Windows/macOS/Linux CI + Android CI | **workflow 已接 Node 22/Claude sidecar gate；`c929a85` exact run 待完成** | 仍不能标绿 |
+| 实体 arm64 Android + 真实 Wi-Fi 三家纵切 | **Claude 子格通过；Codex/OpenCode/同驻未通过** | 真机、真 Wi-Fi、真 Claude SDK；无 emulator/mock/`adb reverse` |
 | R4 合并后蜂窝/relay 重跑 | **外部验收 pending** | R4 实现已进 `main`；T-115 的实体蜂窝/relay 门禁仍独立 pending |
 
 ## 5. 已知本地实现阻塞

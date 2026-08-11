@@ -29,8 +29,10 @@ provider-neutral multi-runtime hostd 与 UACP `0.5.0` QuestionSet/scoped runtime
 permission allow/deny、QuestionSet、interrupt、resume、discovery 与非空 history。最新 R4/R5 集成候选的 `cargo xtask ci` 已完整通过；
 用隔离安装的精确 Codex `0.147.0` 跑 schema diff，288 个 JSON 文件面内/面外均 0 drift。Android
 双 ABI/UniFFI clean AAR/APK/lint/JVM 与 API 35 instrumentation 已在 `fc896be` 通过；全量设备测试
-18 completed / 0 failed，2 个实体专用门禁按设计 skipped。exact-commit 跨平台 CI 仍待 push，
-实体 Android R5 三 provider 纵切仍 blocked。
+18 completed / 0 failed，2 个实体专用门禁在模拟器阶段按设计 skipped。随后 `c929a85` 已在实体
+arm64 Android + 真实 Wi-Fi 上闭合 Claude provisional 首轮 NewTurn、真实审批 decline、七投影、
+断线重连与 force-stop 后 cursor 14→17 冷启恢复；没有使用 `adb reverse`。exact-commit 跨平台 CI
+仍待完成，Codex/OpenCode 与三 provider 同驻实体总格仍 blocked。
 
 R3 的三条旧前置已全部解除：
 
@@ -74,10 +76,10 @@ approval decline、90 秒 OEM 后台、外部 force-stop cursor 恢复与 durabl
 | `kaleido-state` | canonical state、内容寻址存储、八类 projection builder、持久 projection journal、device command outbox | projection journal 尚无物理 checkpoint/compaction |
 | `kaleido-adapter-codex` | 真实 Codex JSON-RPC 会话、流式输出、file-change approval、prompt runtime ack | 尚无真实 steer delivery |
 | `kaleido-adapter-opencode`（R5 integration） | OpenAPI 生成类型；REST discovery/history；SSE live；v2 prompt admission；permission/question/abort/reconnect 实现 | `1.18.16` fixture、REST/resume/queue receipt 有真实证据；latest live 因 `/doc` timestamp number 与 `/event` string 冲突及未声明 heartbeat fail-closed；SSE 恢复明确非无损 |
-| `kaleido-adapter-claude`（R5 integration） | 官方 SDK `0.3.226` typed sidecar；provisional Broker Session、`ProviderManaged` metadata discovery/resume、bounded history、stream、permission/QuestionSet、interrupt | 真实成功 fixture 与 live probe 已覆盖 allow/deny、QuestionSet、interrupt、新进程 resume、非空 history；移动端总纵切由 T-113 继续 |
-| `kaleido-hostd` | provider-neutral registry、canonical Resume alias、receipt-gated NewTurn queue pump、StructuredLanHost；R4 自托管 iroh presence/P2P/relay、durable remote revoke | OpenCode + Claude provisional 双 runtime 启停通过；三家真实会话同驻未验；自有 Ubuntu + 蜂窝实体机 release gate 仍 pending |
+| `kaleido-adapter-claude`（R5 integration） | 官方 SDK `0.3.226` typed sidecar；provisional Broker Session、`ProviderManaged` metadata discovery/resume、bounded history、stream、permission/QuestionSet、interrupt | 真实 fixture/live probe 与实体 Android 已覆盖首轮 queue、approval decline、force-stop resume；三 provider 总格由 T-113 继续 |
+| `kaleido-hostd` | provider-neutral registry、canonical Resume alias、receipt-gated NewTurn queue pump、StructuredLanHost；R4 自托管 iroh presence/P2P/relay、durable remote revoke | Claude provisional 首轮队列实体通过；OpenCode + Claude 双 runtime 启停通过；三家真实会话同驻未验 |
 | `kaleido-core` | 产品级 `MobileClient`、pair/connect/reconnect/subscribe/command/content、逐 key last-good cache、Resume/Interrupt action；R4 pinned control、custom relay、网络 epoch 与 durable FCM outbox | iOS 产品接入仍在 R8；公网实体恢复仍待 T-115 |
-| Android | 共享 Compose Project/Session/Transcript/Live/Queue/Attention/Capability 与 QuestionSet/Resume/Interrupt；R4 FCM FID、后台 WorkManager 与网络切换回调 | 蜂窝/真实 FCM/R5 三 provider 实体纵切均未验收 |
+| Android | 共享 Compose Project/Session/Transcript/Live/Queue/Attention/Capability 与 QuestionSet/Resume/Interrupt；R4 FCM FID、后台 WorkManager 与网络切换回调 | Claude 实体 Wi-Fi 子格通过；蜂窝/真实 FCM 与 R5 三 provider 总格未验收 |
 | iOS | Swift 绑定可生成并编译 | 尚无产品 App，归 R8 |
 
 因此当前已经交付并在实体 arm64 Android 上验证了 R3 Android LAN 纵切。公网 relay、
@@ -115,7 +117,7 @@ D-B11 → T-112 Claude SDK managed session → T-113 multi-runtime/移动端/跨
 | 里程碑 | 内容 |
 |---|---|
 | R4 release gate / [T-115](tasks/T-115.md) | 自有 Ubuntu、真实 FCM、蜂窝/实体 arm64 全纵切与零 canary 验收 |
-| R5 / [T-111～T-114](tasks/README.md) | active；Claude managed-session 已通过；OpenCode generated live/D-B11 被同版本合同漂移阻塞，三家同驻、跨平台与实体 Android 未验收 |
+| R5 / [T-111～T-114](tasks/README.md) | active；Claude managed-session 与实体 Android 子格已通过；OpenCode generated live/D-B11 被同版本合同漂移阻塞，三家同驻与 exact-commit CI 未验收 |
 | R6 | 跨 Agent workflow 执行器与手机 WorkflowBoard |
 | R7 | 三家 CLI/GUI 六格真实验收 |
 | R8 | iOS 产品对齐 |

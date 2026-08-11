@@ -1,13 +1,13 @@
 # 任务索引
 
-> 生效：2026-08-10。进度真源是 [STATUS.md](../STATUS.md)。
+> 生效：2026-08-11。进度真源是 [STATUS.md](../STATUS.md)。
 
 ## 活动
 
 | 卡 | 范围 | 状态 |
 |---|---|---|
 | [T-111](T-111.md) | R5 OpenCode REST/SSE、D-B11、生成类型、真实会话与恢复 | active；question fixture 通过，latest generated live 因 `/doc`/`/event` 漂移 blocked |
-| [T-113](T-113.md) | R5 多 provider hostd/移动端集成、跨平台 CI 与实体 Android 总门禁 | active；T-112 已完成，受 T-111 与最终总门禁阻塞 |
+| [T-113](T-113.md) | R5 多 provider hostd/移动端集成、跨平台 CI 与实体 Android 总门禁 | active；Claude 实体 Android 子格通过，受 T-111、三家同驻与 exact-commit CI 阻塞 |
 | [T-114](T-114.md) | UACP QuestionSet、多选/自由文本回答与 Android 共享交互 | completed；本地总门禁通过，不代表 R5 完成 |
 | [T-115](T-115.md) | R4 自有 Ubuntu、真实 FCM、蜂窝与实体 arm64 release/physical gate | active |
 
