@@ -66,10 +66,10 @@ for (let index = 0; index < 100; index += 1) {
   frames.push(line);
   try {
     const parsed = JSON.parse(line);
-    const message = parsed?.payload?.message;
+    const event = parsed?.payload?.event;
     if (
       parsed?.kind === "error" ||
-      (parsed?.kind === "sdk_message" && message?.type === "result")
+      (parsed?.kind === "sdk_event" && event?.event === "result")
     ) {
       break;
     }
@@ -78,8 +78,9 @@ for (let index = 0; index < 100; index += 1) {
   }
 }
 send("close", {});
+await nextLine(5_000);
 child.stdin.end();
-child.kill();
+if (child.exitCode === null) child.kill();
 lines.close();
 child.stdout.destroy();
 

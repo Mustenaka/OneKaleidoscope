@@ -1,9 +1,9 @@
 //! Reduction of versioned Claude Agent SDK frames into canonical effects.
 //!
-//! Claude's upstream union is intentionally not reproduced here.  The Node
-//! bridge validates it with `@anthropic-ai/claude-agent-sdk` and emits a small,
-//! versioned envelope; this reducer only reads the fields needed by the
-//! canonical model through `serde_json::Value`.
+//! Claude's upstream union is intentionally not reproduced here. The Node
+//! bridge exhausts it with `@anthropic-ai/claude-agent-sdk` and emits closed,
+//! versioned project-owned frames. `transcript` strictly validates each frame
+//! before this reducer dispatches the already-owned fields.
 
 use std::collections::BTreeMap;
 
@@ -42,7 +42,7 @@ use kaleido_proto::ContractViolation;
 use serde_json::Value;
 
 use crate::error::ClaudeAdapterError;
-use crate::transcript::{Transcript, TranscriptFrame};
+use crate::transcript::{Direction, Transcript, TranscriptFrame};
 
 /// How one reducer describes its connection to the host and project.
 #[derive(Debug, Clone)]
@@ -77,6 +77,7 @@ pub struct ClaudeReducer {
     project_binding_id: ProjectBindingId,
     session_id: Option<SessionId>,
     raw_session_id: Option<String>,
+    bound_cwd: Option<String>,
     session: Option<Session>,
     turns: BTreeMap<String, Turn>,
     current_turn_raw: Option<String>,
@@ -116,6 +117,7 @@ impl ClaudeReducer {
             project_binding_id,
             session_id: None,
             raw_session_id: None,
+            bound_cwd: None,
             session: None,
             turns: BTreeMap::new(),
             current_turn_raw: None,
@@ -271,6 +273,11 @@ impl ClaudeReducer {
         frame: &TranscriptFrame,
         content: &mut dyn ContentAccess,
     ) -> Result<Vec<StateEffect>, ClaudeAdapterError> {
+        if frame.direction() != Direction::BridgeToHost {
+            return Err(ClaudeAdapterError::ProtocolViolation {
+                detail: "host command frame cannot be reduced as provider evidence",
+            });
+        }
         let at_ms = self
             .config
             .base_at_ms
@@ -455,6 +462,7 @@ impl ClaudeReducer {
                 frame.kind() == "session_resumed",
             ),
             "session_list" => self.reduce_session_list(frame.payload(), at_ms, content),
+            "session_messages" => self.reduce_session_messages(frame.payload(), at_ms, content),
             "prompt_sent" | "prompt_accepted" => self.reduce_prompt(
                 frame.payload(),
                 at_ms,
@@ -466,7 +474,8 @@ impl ClaudeReducer {
             "question_request" => self.reduce_question_request(frame.payload(), at_ms, content),
             "question_result" => self.reduce_question_result(frame.payload(), at_ms, content),
             "interrupt_result" => self.reduce_interrupt(frame.payload(), at_ms),
-            "sdk_message" => self.reduce_sdk_message(frame.payload(), at_ms, content),
+            "sdk_event" => self.reduce_sdk_event(frame.payload(), at_ms, content),
+            "closed" => Ok(Vec::new()),
             "error" => {
                 let detail = frame
                     .payload()
@@ -509,6 +518,7 @@ impl ClaudeReducer {
                 detail: "ready contains an empty cwd",
             });
         }
+        self.bind_cwd(cwd)?;
         let root_ref = content.store(
             ContentKind::FilePath,
             Sensitivity::Sensitive,
@@ -574,9 +584,17 @@ impl ClaudeReducer {
     ) -> Result<Vec<StateEffect>, ClaudeAdapterError> {
         let raw =
             string_field(payload, "session_id").ok_or(ClaudeAdapterError::MissingSessionId)?;
+        if let Some(expected) = self.raw_session_id.as_deref() {
+            if expected != raw {
+                return Err(ClaudeAdapterError::ProtocolViolation {
+                    detail: "session binding changed the provider session id",
+                });
+            }
+        }
         let cwd = string_field(payload, "cwd").ok_or(ClaudeAdapterError::ProtocolViolation {
             detail: "session_started is missing cwd",
         })?;
+        self.bind_cwd(cwd)?;
         let root_ref = content.store(
             ContentKind::FilePath,
             Sensitivity::Sensitive,
@@ -593,7 +611,6 @@ impl ClaudeReducer {
         );
         self.raw_session_id = Some(raw.to_owned());
         self.session_id = Some(session_id.clone());
-        self.probe.prove(Capability::LiveObserve);
         if resumed {
             self.probe.prove(Capability::HistoryResume);
         }
@@ -666,6 +683,7 @@ impl ClaudeReducer {
         let cwd = string_field(payload, "cwd").ok_or(ClaudeAdapterError::ProtocolViolation {
             detail: "session list is missing cwd",
         })?;
+        self.bind_cwd(cwd)?;
         let entries = payload.get("sessions").and_then(Value::as_array).ok_or(
             ClaudeAdapterError::ProtocolViolation {
                 detail: "session list is missing sessions",
@@ -748,6 +766,165 @@ impl ClaudeReducer {
                     )),
                 },
             });
+        }
+        Ok(effects)
+    }
+
+    fn reduce_session_messages(
+        &mut self,
+        payload: &Value,
+        at_ms: i64,
+        content: &mut dyn ContentAccess,
+    ) -> Result<Vec<StateEffect>, ClaudeAdapterError> {
+        let raw = string_field(payload, "session_id")
+            .filter(|value| !value.is_empty())
+            .ok_or(ClaudeAdapterError::ProtocolViolation {
+                detail: "session messages contain an invalid session id",
+            })?;
+        let cwd = string_field(payload, "cwd")
+            .filter(|value| !value.is_empty())
+            .ok_or(ClaudeAdapterError::ProtocolViolation {
+                detail: "session messages contain an invalid cwd",
+            })?;
+        self.bind_cwd(cwd)?;
+        let offset = payload.get("offset").and_then(Value::as_u64).ok_or(
+            ClaudeAdapterError::ProtocolViolation {
+                detail: "session messages contain an invalid offset",
+            },
+        )?;
+        let limit = payload
+            .get("limit")
+            .and_then(Value::as_u64)
+            .filter(|limit| (1..=100).contains(limit))
+            .ok_or(ClaudeAdapterError::ProtocolViolation {
+                detail: "session messages contain an invalid page limit",
+            })?;
+        if payload
+            .get("next_offset")
+            .and_then(Value::as_u64)
+            .is_some_and(|next| next <= offset || next > offset.saturating_add(limit))
+        {
+            return Err(ClaudeAdapterError::ProtocolViolation {
+                detail: "session messages contain an invalid next offset",
+            });
+        }
+        let session_id = self.mint.session_id(raw);
+        if self.discovered_raw.get(&session_id).map(String::as_str) != Some(raw) {
+            return Err(ClaudeAdapterError::ProtocolViolation {
+                detail: "session messages are not scoped to a discovered session",
+            });
+        }
+        let entries = payload.get("messages").and_then(Value::as_array).ok_or(
+            ClaudeAdapterError::ProtocolViolation {
+                detail: "session messages are missing the page entries",
+            },
+        )?;
+        if entries.len() > usize::try_from(limit).unwrap_or(usize::MAX) {
+            return Err(ClaudeAdapterError::ProtocolViolation {
+                detail: "session messages exceed the requested page limit",
+            });
+        }
+        let root_ref = content.store(
+            ContentKind::FilePath,
+            Sensitivity::Sensitive,
+            cwd.as_bytes(),
+        )?;
+        let project = Project {
+            id: self.project_id.clone(),
+            display_name: self.config.project_display_name.clone(),
+            bindings: vec![ProjectBinding {
+                id: self.project_binding_id.clone(),
+                project_id: self.project_id.clone(),
+                runtime_id: self.runtime_id.clone(),
+                root_ref,
+            }],
+            session_counts: SessionCounts::default(),
+            workflow_count: 0,
+            attention_count: 0,
+            last_activity_at_ms: at_ms,
+        };
+        let raw_turn = format!("history|{raw}|{offset}");
+        let turn_id = self.mint.turn_id(&raw_turn);
+        let mut item_ids = Vec::with_capacity(entries.len());
+        let mut item_effects = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if string_field(entry, "session_id") != Some(raw) {
+                return Err(ClaudeAdapterError::ProtocolViolation {
+                    detail: "session message identity changed within a page",
+                });
+            }
+            let message_id = string_field(entry, "message_id")
+                .filter(|value| !value.is_empty())
+                .ok_or(ClaudeAdapterError::ProtocolViolation {
+                    detail: "session message is missing its provider identity",
+                })?;
+            let message_json = string_field(entry, "message_json").ok_or(
+                ClaudeAdapterError::ProtocolViolation {
+                    detail: "session message is missing its closed body",
+                },
+            )?;
+            serde_json::from_str::<Value>(message_json).map_err(|_| {
+                ClaudeAdapterError::ProtocolViolation {
+                    detail: "session message body is not valid JSON",
+                }
+            })?;
+            self.next_sequence = self.next_sequence.saturating_add(1);
+            let item_id = self.mint.item_id(&format!("history|{raw}|{message_id}"));
+            let body_ref =
+                self.store_text(content, ContentKind::StructuredSummary, message_json)?;
+            let body = match string_field(entry, "role") {
+                Some("user") => ItemBody::UserMessage { content: body_ref },
+                Some("assistant") => ItemBody::AgentMessage {
+                    content: body_ref,
+                    phase: MessagePhase::FinalAnswer,
+                },
+                Some("system") => ItemBody::Reasoning { content: body_ref },
+                _ => {
+                    return Err(ClaudeAdapterError::ProtocolViolation {
+                        detail: "session message has an invalid role",
+                    });
+                }
+            };
+            item_ids.push(item_id.clone());
+            item_effects.push(StateEffect::ItemUpserted {
+                item: Item {
+                    id: item_id,
+                    session_id: session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    sequence: self.next_sequence,
+                    status: ItemStatus::Completed,
+                    body,
+                    created_at_ms: at_ms,
+                    updated_at_ms: at_ms,
+                    binding_handle: Some(self.mint.binding_handle(
+                        &self.runtime_id,
+                        ProviderBindingKind::Item,
+                        message_id,
+                    )),
+                },
+            });
+        }
+        let mut effects = vec![StateEffect::ProjectUpserted { project }];
+        if !entries.is_empty() {
+            self.probe.prove(Capability::HistoryRead);
+            effects.push(StateEffect::TurnUpserted {
+                turn: Turn {
+                    id: turn_id,
+                    session_id,
+                    status: TurnStatus::Completed,
+                    origin: self.config.turn_origin.clone(),
+                    started_at_ms: Some(at_ms),
+                    completed_at_ms: Some(at_ms),
+                    item_ids,
+                    error: None,
+                    binding_handle: Some(self.mint.binding_handle(
+                        &self.runtime_id,
+                        ProviderBindingKind::Turn,
+                        &raw_turn,
+                    )),
+                },
+            });
+            effects.extend(item_effects);
         }
         Ok(effects)
     }
@@ -844,9 +1021,15 @@ impl ClaudeReducer {
             .or_else(|| string_field(payload, "tool_name"))
             .unwrap_or("Claude requested permission");
         let summary_ref = self.store_text(content, ContentKind::PlainText, summary)?;
-        let detail_ref = payload
-            .get("input")
-            .map(|input| self.store_json(content, ContentKind::ToolArguments, input))
+        let detail_ref = string_field(payload, "input_json")
+            .map(|input| {
+                serde_json::from_str::<Value>(input).map_err(|_| {
+                    ClaudeAdapterError::ProtocolViolation {
+                        detail: "permission input is not valid JSON",
+                    }
+                })?;
+                self.store_text(content, ContentKind::ToolArguments, input)
+            })
             .transpose()?;
         let binding_handle = self.mint.binding_handle(
             &self.runtime_id,
@@ -971,7 +1154,7 @@ impl ClaudeReducer {
         for (question_index, raw_question) in raw_questions.iter().enumerate() {
             let question = string_field(raw_question, "question").filter(|text| !text.is_empty());
             let header = string_field(raw_question, "header").filter(|text| !text.is_empty());
-            let multi_select = raw_question.get("multiSelect").and_then(Value::as_bool);
+            let multi_select = raw_question.get("multi_select").and_then(Value::as_bool);
             let raw_options = raw_question
                 .get("options")
                 .and_then(Value::as_array)
@@ -1188,31 +1371,47 @@ impl ClaudeReducer {
         Ok(Vec::new())
     }
 
-    fn reduce_sdk_message(
+    fn reduce_sdk_event(
         &mut self,
         payload: &Value,
         at_ms: i64,
         content: &mut dyn ContentAccess,
     ) -> Result<Vec<StateEffect>, ClaudeAdapterError> {
-        let message = payload
-            .get("message")
+        let event = payload
+            .get("event")
             .ok_or(ClaudeAdapterError::MalformedFrame)?;
-        let kind = message
-            .get("type")
+        let kind = event
+            .get("event")
             .and_then(Value::as_str)
             .ok_or(ClaudeAdapterError::MalformedFrame)?;
+        let raw_session = string_field(payload, "session_id")
+            .filter(|value| !value.is_empty())
+            .ok_or(ClaudeAdapterError::MissingSessionId)?;
+        if let Some(bound) = self.raw_session_id.as_deref() {
+            if bound != raw_session {
+                return Err(ClaudeAdapterError::ProtocolViolation {
+                    detail: "SDK event changed the bound provider session id",
+                });
+            }
+        }
         let raw_turn = string_field(payload, "turn_id")
             .map(str::to_owned)
             .or_else(|| self.current_turn_raw.clone())
             .unwrap_or_else(|| "sdk-turn".to_owned());
         match kind {
-            "user" => self.reduce_user_message(message, &raw_turn, at_ms, content),
-            "assistant" => self.reduce_assistant_message(message, &raw_turn, at_ms, content),
-            "stream_event" => self.reduce_stream_event(message, &raw_turn, at_ms, content),
-            "tool_progress" => self.reduce_tool_progress(message, at_ms),
-            "tool_use_summary" => self.reduce_tool_summary(message, at_ms, content),
-            "result" => self.reduce_result(message, &raw_turn, at_ms, content),
-            "system" => self.reduce_system_message(message, at_ms, content),
+            "user" => self.reduce_user_event(event, &raw_turn, at_ms, content),
+            "assistant" => self.reduce_assistant_event(event, &raw_turn, at_ms, content),
+            "stream_text" => self.reduce_stream_event(event, &raw_turn, at_ms, content),
+            "tool_progress" => self.reduce_tool_progress(event, at_ms),
+            "tool_summary" => self.reduce_tool_summary(event, at_ms, content),
+            "result" => self.reduce_result(event, &raw_turn, at_ms, content),
+            "init" => self.reduce_init_event(event),
+            "ignored" => Ok(vec![self.record_diagnostic(
+                DiagnosticCode::UnknownUpstreamMessage,
+                string_field(event, "label").unwrap_or("ignored_sdk_event"),
+                at_ms,
+                content,
+            )?]),
             _ => Ok(vec![self.record_diagnostic(
                 DiagnosticCode::UnknownUpstreamMessage,
                 kind,
@@ -1222,91 +1421,113 @@ impl ClaudeReducer {
         }
     }
 
-    fn reduce_system_message(
-        &mut self,
-        message: &Value,
-        at_ms: i64,
-        content: &mut dyn ContentAccess,
-    ) -> Result<Vec<StateEffect>, ClaudeAdapterError> {
-        let subtype = string_field(message, "subtype").unwrap_or("unknown");
-        if subtype == "init" {
-            self.probe.prove(Capability::LiveObserve);
-            return Ok(Vec::new());
+    fn reduce_init_event(&mut self, event: &Value) -> Result<Vec<StateEffect>, ClaudeAdapterError> {
+        let cwd = string_field(event, "cwd")
+            .filter(|value| !value.is_empty())
+            .ok_or(ClaudeAdapterError::ProtocolViolation {
+                detail: "SDK init event contains an invalid cwd",
+            })?;
+        if self.session.is_none() || self.bound_cwd.as_deref() != Some(cwd) {
+            return Err(ClaudeAdapterError::ProtocolViolation {
+                detail: "SDK init event arrived before the session binding",
+            });
         }
-        Ok(vec![self.record_diagnostic(
-            DiagnosticCode::UnknownUpstreamMessage,
-            subtype,
-            at_ms,
-            content,
-        )?])
+        self.probe.prove(Capability::LiveObserve);
+        Ok(Vec::new())
     }
 
-    fn reduce_user_message(
+    fn bind_cwd(&mut self, cwd: &str) -> Result<(), ClaudeAdapterError> {
+        if cwd.is_empty() {
+            return Err(ClaudeAdapterError::ProtocolViolation {
+                detail: "Claude sidecar cwd is empty",
+            });
+        }
+        if let Some(bound) = self.bound_cwd.as_deref() {
+            if bound != cwd {
+                return Err(ClaudeAdapterError::ProtocolViolation {
+                    detail: "Claude sidecar changed the exact project cwd",
+                });
+            }
+        } else {
+            self.bound_cwd = Some(cwd.to_owned());
+        }
+        Ok(())
+    }
+
+    fn reduce_user_event(
         &mut self,
-        message: &Value,
+        event: &Value,
         raw_turn: &str,
         at_ms: i64,
         content: &mut dyn ContentAccess,
     ) -> Result<Vec<StateEffect>, ClaudeAdapterError> {
         let mut effects = self.ensure_turn(raw_turn, at_ms, content)?;
-        if let Some(text) = text_from_message(message.get("message")) {
-            effects.extend(self.upsert_user_item(
-                raw_turn,
-                string_field(message, "uuid").unwrap_or("user"),
-                text,
-                at_ms,
-                content,
-            )?);
-        }
-        if let Some(blocks) = message
-            .get("message")
-            .and_then(|value| value.get("content"))
-            .and_then(Value::as_array)
-        {
-            for block in blocks {
-                if string_field(block, "type") == Some("tool_result") {
+        let message_id = string_field(event, "message_id").unwrap_or("user");
+        let blocks = event.get("blocks").and_then(Value::as_array).ok_or(
+            ClaudeAdapterError::ProtocolViolation {
+                detail: "user event is missing its closed content blocks",
+            },
+        )?;
+        for (index, block) in blocks.iter().enumerate() {
+            match string_field(block, "kind") {
+                Some("text") => {
+                    let text = string_field(block, "text").ok_or(
+                        ClaudeAdapterError::ProtocolViolation {
+                            detail: "user text block is missing text",
+                        },
+                    )?;
+                    effects.extend(self.upsert_user_item(
+                        raw_turn,
+                        &format!("{message_id}:{index}"),
+                        text,
+                        at_ms,
+                        content,
+                    )?);
+                }
+                Some("tool_result") => {
                     effects.extend(self.reduce_tool_result(block, at_ms, content)?);
+                }
+                Some("ignored") => {}
+                _ => {
+                    return Err(ClaudeAdapterError::ProtocolViolation {
+                        detail: "user event contains an unknown closed block",
+                    });
                 }
             }
         }
         Ok(effects)
     }
 
-    fn reduce_assistant_message(
+    fn reduce_assistant_event(
         &mut self,
-        message: &Value,
+        event: &Value,
         raw_turn: &str,
         at_ms: i64,
         content: &mut dyn ContentAccess,
     ) -> Result<Vec<StateEffect>, ClaudeAdapterError> {
         let mut effects = self.ensure_turn(raw_turn, at_ms, content)?;
-        if string_field(message, "error") == Some("authentication_failed") {
+        if string_field(event, "error") == Some("authentication_failed") {
             self.authentication_required = true;
             self.probe
                 .mark_connection_unavailable(CapabilityUnavailableReason::AuthenticationRequired);
         }
-        let message_id = string_field(message, "uuid")
-            .or_else(|| string_field(message.get("message").unwrap_or(&Value::Null), "id"))
-            .unwrap_or("assistant");
-        let Some(blocks) = message
-            .get("message")
-            .and_then(|value| value.get("content"))
-            .and_then(Value::as_array)
-        else {
-            return Ok(effects);
-        };
-        for (index, block) in blocks.iter().enumerate() {
-            let block_type = string_field(block, "type").unwrap_or("unknown");
-            let raw_item = string_field(block, "id")
-                .or_else(|| string_field(block, "tool_use_id"))
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("{}:{}", message_id, index));
+        let blocks = event.get("blocks").and_then(Value::as_array).ok_or(
+            ClaudeAdapterError::ProtocolViolation {
+                detail: "assistant event is missing its closed content blocks",
+            },
+        )?;
+        for block in blocks {
+            let block_type = string_field(block, "kind").unwrap_or("unknown");
+            let raw_item =
+                string_field(block, "item_id").ok_or(ClaudeAdapterError::ProtocolViolation {
+                    detail: "assistant block is missing its provider identity",
+                })?;
             match block_type {
                 "text" => {
                     if let Some(text) = string_field(block, "text") {
                         effects.extend(self.upsert_agent_item(
                             raw_turn,
-                            &raw_item,
+                            raw_item,
                             text,
                             ItemStatus::Completed,
                             at_ms,
@@ -1315,23 +1536,21 @@ impl ClaudeReducer {
                     }
                 }
                 "thinking" => {
-                    if let Some(text) = string_field(block, "thinking") {
+                    if let Some(text) = string_field(block, "text") {
                         effects.extend(
-                            self.upsert_reasoning_item(raw_turn, &raw_item, text, at_ms, content)?,
+                            self.upsert_reasoning_item(raw_turn, raw_item, text, at_ms, content)?,
                         );
                     }
                 }
                 "tool_use" => {
                     effects
-                        .extend(self.upsert_tool_item(raw_turn, block, &raw_item, at_ms, content)?);
+                        .extend(self.upsert_tool_item(raw_turn, block, raw_item, at_ms, content)?);
                 }
+                "ignored" => {}
                 _ => {
-                    effects.push(self.record_diagnostic(
-                        DiagnosticCode::UnknownUpstreamLabel,
-                        block_type,
-                        at_ms,
-                        content,
-                    )?);
+                    return Err(ClaudeAdapterError::ProtocolViolation {
+                        detail: "assistant event contains an unknown closed block",
+                    })
                 }
             }
         }
@@ -1345,29 +1564,13 @@ impl ClaudeReducer {
         at_ms: i64,
         content: &mut dyn ContentAccess,
     ) -> Result<Vec<StateEffect>, ClaudeAdapterError> {
-        let event = message
-            .get("event")
-            .ok_or(ClaudeAdapterError::MalformedFrame)?;
-        if string_field(event, "type") != Some("content_block_delta") {
-            return Ok(Vec::new());
-        }
-        let Some(delta) = event.get("delta") else {
-            return Ok(Vec::new());
-        };
-        if string_field(delta, "type") != Some("text_delta") {
-            return Ok(Vec::new());
-        }
-        let Some(text) = string_field(delta, "text") else {
-            return Ok(Vec::new());
-        };
-        let index = event
-            .get("index")
-            .and_then(|value| {
-                value
-                    .as_u64()
-                    .map(|number| number.to_string())
-                    .or_else(|| value.as_str().map(str::to_owned))
-            })
+        let text = string_field(message, "text").ok_or(ClaudeAdapterError::ProtocolViolation {
+            detail: "stream text event is missing text",
+        })?;
+        let index = message
+            .get("block_index")
+            .and_then(Value::as_u64)
+            .map(|number| number.to_string())
             .unwrap_or_else(|| "0".to_owned());
         let raw_item = format!("stream:{index}:{raw_turn}");
         let combined = {
@@ -1410,11 +1613,12 @@ impl ClaudeReducer {
         at_ms: i64,
         content: &mut dyn ContentAccess,
     ) -> Result<Vec<StateEffect>, ClaudeAdapterError> {
-        let Some(summary) = string_field(message, "summary") else {
-            return Ok(Vec::new());
-        };
+        let summary =
+            string_field(message, "summary").ok_or(ClaudeAdapterError::ProtocolViolation {
+                detail: "tool summary is missing text",
+            })?;
         let Some(raw_tool) = message
-            .get("preceding_tool_use_ids")
+            .get("tool_use_ids")
             .and_then(Value::as_array)
             .and_then(|items| items.first())
             .and_then(Value::as_str)
@@ -1452,10 +1656,16 @@ impl ClaudeReducer {
         let Some(item_id) = self.raw_items.get(raw_tool).cloned() else {
             return Ok(Vec::new());
         };
-        let output = block
-            .get("content")
-            .map(|value| self.store_json(content, ContentKind::ToolOutput, value))
-            .transpose()?;
+        let content_json =
+            string_field(block, "content_json").ok_or(ClaudeAdapterError::ProtocolViolation {
+                detail: "tool result is missing its closed body",
+            })?;
+        serde_json::from_str::<Value>(content_json).map_err(|_| {
+            ClaudeAdapterError::ProtocolViolation {
+                detail: "tool result body is not valid JSON",
+            }
+        })?;
+        let output = Some(self.store_text(content, ContentKind::ToolOutput, content_json)?);
         let Some(item) = self.items.get_mut(&item_id) else {
             return Ok(Vec::new());
         };
@@ -1466,11 +1676,7 @@ impl ClaudeReducer {
         {
             *item_output = output;
         }
-        item.status = if block
-            .get("is_error")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
+        item.status = if block.get("is_error").and_then(Value::as_bool) == Some(true) {
             ItemStatus::Failed
         } else {
             ItemStatus::Completed
@@ -1652,10 +1858,16 @@ impl ClaudeReducer {
         content: &mut dyn ContentAccess,
     ) -> Result<Vec<StateEffect>, ClaudeAdapterError> {
         let name = string_field(block, "name").unwrap_or("unknown");
-        let arguments = block
-            .get("input")
-            .map(|input| self.store_json(content, ContentKind::ToolArguments, input))
-            .transpose()?;
+        let input_json =
+            string_field(block, "input_json").ok_or(ClaudeAdapterError::ProtocolViolation {
+                detail: "tool use is missing its closed input",
+            })?;
+        serde_json::from_str::<Value>(input_json).map_err(|_| {
+            ClaudeAdapterError::ProtocolViolation {
+                detail: "tool input is not valid JSON",
+            }
+        })?;
+        let arguments = Some(self.store_text(content, ContentKind::ToolArguments, input_json)?);
         let body = ItemBody::ToolCall {
             tool: ToolDescriptor {
                 name: name.to_owned(),
@@ -1795,17 +2007,6 @@ impl ClaudeReducer {
 
 fn string_field<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
     value.get(field).and_then(Value::as_str)
-}
-
-fn text_from_message(value: Option<&Value>) -> Option<&str> {
-    let value = value?;
-    if let Some(text) = value.get("content").and_then(Value::as_str) {
-        return Some(text);
-    }
-    value
-        .get("content")
-        .and_then(Value::as_array)
-        .and_then(|blocks| blocks.iter().find_map(|block| string_field(block, "text")))
 }
 
 fn live_binding(

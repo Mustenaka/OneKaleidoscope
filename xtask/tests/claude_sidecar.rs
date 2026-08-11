@@ -68,7 +68,7 @@ fn successful_result_cannot_pass_as_an_authentication_failure_capture() -> TestR
 
     assert!(error.issues().iter().any(|issue| {
         issue.category == "authentication-failure fixture contains a successful result"
-            && issue.pointer.as_deref() == Some("/payload/message/is_error")
+            && issue.pointer.as_deref() == Some("/payload/event/is_error")
     }));
     assert!(error.issues().iter().any(|issue| {
         issue.category == "Claude failure fixture is missing the terminal API-error result"

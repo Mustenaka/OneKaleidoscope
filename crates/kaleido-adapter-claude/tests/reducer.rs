@@ -9,11 +9,11 @@ mod support;
 use std::fs;
 
 use kaleido_adapter_claude::error::ClaudeAdapterError;
+use kaleido_adapter_claude::parse_transcript;
 use kaleido_adapter_claude::transcript::{Direction, TranscriptFrame, SIDECAR_PROTOCOL};
-use kaleido_adapter_claude::{parse_transcript, ClaudeReducer};
 use kaleido_proto::attention::{AttentionState, AttentionSubject};
 use kaleido_proto::capability::{Capability, CapabilityState, CapabilityUnavailableReason};
-use kaleido_proto::effect::{DiagnosticCode, StateEffect};
+use kaleido_proto::effect::StateEffect;
 use kaleido_proto::turn::TurnStatus;
 use serde_json::{json, Value};
 
@@ -43,8 +43,8 @@ fn ready_projects_an_unbound_broker_session_until_the_sdk_assigns_its_id() {
                 "ready",
                 json!({
                     "sdk_version": "0.3.226",
-                    "resume": false,
-                    "cwd": "<sandbox/toy-project>"
+                    "cwd": "<sandbox/toy-project>",
+                    "resume_session_id": null
                 }),
                 BASE_AT_MS,
             ),
@@ -157,7 +157,7 @@ fn permission_allow_and_deny_are_structured_and_decline_is_not_a_turn_error() {
                 "tool_name": "Bash",
                 "tool_use_id": "tool-1",
                 "title": "Run a command",
-                "input": { "command": "true" }
+                "input_json": "{\"command\":\"true\"}"
             }),
             BASE_AT_MS + 2,
         ),
@@ -219,43 +219,39 @@ fn malformed_and_unknown_frames_fail_closed_without_business_projection() {
         ClaudeAdapterError::MalformedTranscriptLine { .. }
     ));
 
-    let mut reducer: ClaudeReducer = reducer();
-    let mut content = MemoryContent::default();
-    let session = frame(
-        "session_started",
-        json!({ "session_id": "session-unknown", "cwd": "<sandbox/toy-project>" }),
-        BASE_AT_MS,
-    );
-    reducer
-        .ingest_frame(&session, &mut content)
-        .expect("session frame reduces");
-    let unknown = frame(
-        "sdk_message",
-        json!({
-            "session_id": "session-unknown",
-            "message": { "type": "future_sdk_message" }
-        }),
-        BASE_AT_MS + 1,
-    );
-    let effects = reducer
-        .ingest_frame(&unknown, &mut content)
-        .expect("unknown message is diagnosed, not guessed");
-    assert!(effects.iter().any(|effect| matches!(
-        effect,
-        StateEffect::DiagnosticRecorded { diagnostic }
-            if diagnostic.code == DiagnosticCode::UnknownUpstreamMessage
-    )));
-    assert!(!effects
-        .iter()
-        .any(|effect| matches!(effect, StateEffect::ItemUpserted { .. })));
-
-    let malformed = frame(
-        "sdk_message",
-        json!({ "session_id": "session-unknown" }),
-        BASE_AT_MS + 2,
-    );
     assert!(matches!(
-        reducer.ingest_frame(&malformed, &mut content),
+        TranscriptFrame::from_value(
+            Direction::BridgeToHost,
+            BASE_AT_MS,
+            json!({
+                "v": 1,
+                "protocol": SIDECAR_PROTOCOL,
+                "kind": "sdk_event",
+                "payload": {
+                    "session_id": "session-unknown",
+                    "turn_id": null,
+                    "event": { "event": "future_sdk_event" }
+                }
+            }),
+        ),
+        Err(ClaudeAdapterError::UnknownFrameKind)
+    ));
+    assert!(matches!(
+        TranscriptFrame::from_value(
+            Direction::BridgeToHost,
+            BASE_AT_MS,
+            json!({
+                "v": 1,
+                "protocol": SIDECAR_PROTOCOL,
+                "kind": "ready",
+                "payload": {
+                    "sdk_version": "0.3.226",
+                    "cwd": "<sandbox/toy-project>",
+                    "resume_session_id": null,
+                    "unexpected": true
+                }
+            }),
+        ),
         Err(ClaudeAdapterError::MalformedFrame)
     ));
 }
@@ -285,7 +281,7 @@ fn ask_user_question_is_not_flattened_into_a_single_question() {
                         {"label": "A", "description": "First"},
                         {"label": "B", "description": "Second"}
                     ],
-                    "multiSelect": false
+                    "multi_select": false
                 },
                 {
                     "question": "Enable which features?",
@@ -294,7 +290,7 @@ fn ask_user_question_is_not_flattened_into_a_single_question() {
                         {"label": "Fast", "description": "Speed"},
                         {"label": "Safe", "description": "Checks"}
                     ],
-                    "multiSelect": true
+                    "multi_select": true
                 }
             ]
         }),
@@ -320,4 +316,113 @@ fn ask_user_question_is_not_flattened_into_a_single_question() {
                             .is_some_and(|question| question.multi_select)
             )
     )));
+}
+
+#[test]
+fn host_direction_and_changed_session_identity_are_rejected_before_projection() {
+    let mut reducer = reducer();
+    let mut content = MemoryContent::default();
+    let host_frame = TranscriptFrame::from_value(
+        Direction::HostToBridge,
+        BASE_AT_MS,
+        json!({
+            "v": 1,
+            "protocol": SIDECAR_PROTOCOL,
+            "kind": "prompt_accepted",
+            "payload": { "turn_id": "host-command" }
+        }),
+    )
+    .expect("closed frame parses independently from its recorded direction");
+    assert!(matches!(
+        reducer.ingest_frame(&host_frame, &mut content),
+        Err(ClaudeAdapterError::ProtocolViolation { .. })
+    ));
+
+    reducer
+        .ingest_frame(
+            &frame(
+                "session_started",
+                json!({ "session_id": "session-one", "cwd": "<sandbox/toy-project>" }),
+                BASE_AT_MS + 1,
+            ),
+            &mut content,
+        )
+        .expect("first provider identity binds");
+    assert!(matches!(
+        reducer.ingest_frame(
+            &frame(
+                "session_started",
+                json!({ "session_id": "session-two", "cwd": "<sandbox/toy-project>" }),
+                BASE_AT_MS + 2,
+            ),
+            &mut content,
+        ),
+        Err(ClaudeAdapterError::ProtocolViolation { .. })
+    ));
+}
+
+#[test]
+fn bounded_official_history_page_proves_read_only_after_real_messages() {
+    let mut reducer = reducer();
+    let mut content = MemoryContent::default();
+    let list = frame(
+        "session_list",
+        json!({
+            "cwd": "<sandbox/toy-project>",
+            "sessions": [{
+                "session_id": "history-session",
+                "summary": "History session",
+                "last_modified": BASE_AT_MS
+            }]
+        }),
+        BASE_AT_MS,
+    );
+    reducer
+        .ingest_frame(&list, &mut content)
+        .expect("official list response reduces");
+    let page = frame(
+        "session_messages",
+        json!({
+            "cwd": "<sandbox/toy-project>",
+            "session_id": "history-session",
+            "offset": 0,
+            "limit": 2,
+            "next_offset": null,
+            "messages": [{
+                "role": "assistant",
+                "message_id": "message-1",
+                "session_id": "history-session",
+                "parent_tool_use_id": null,
+                "parent_agent_id": null,
+                "message_json": "{\"role\":\"assistant\",\"content\":\"hello\"}"
+            }]
+        }),
+        BASE_AT_MS + 1,
+    );
+    let effects = reducer
+        .ingest_frame(&page, &mut content)
+        .expect("bounded official history response reduces");
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, StateEffect::ItemUpserted { .. })));
+    assert!(reducer
+        .capability_probe()
+        .is_proven(Capability::HistoryRead));
+
+    let wrong_scope = frame(
+        "session_messages",
+        json!({
+            "cwd": "<sandbox/toy-project>",
+            "session_id": "not-discovered",
+            "offset": 0,
+            "limit": 1,
+            "next_offset": null,
+            "messages": []
+        }),
+        BASE_AT_MS + 2,
+    );
+    assert!(matches!(
+        reducer.ingest_frame(&wrong_scope, &mut content),
+        Err(ClaudeAdapterError::ProtocolViolation { .. })
+    ));
 }

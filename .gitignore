@@ -2,5 +2,6 @@
 **/target
 /crates/kaleido-core/bindings/kotlin-probe/.gradle
 /crates/kaleido-core/bindings/kotlin-probe/build
+/crates/kaleido-adapter-claude/bridge/node_modules
 .DS_Store
 Thumbs.db

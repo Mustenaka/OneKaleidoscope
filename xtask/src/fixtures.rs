@@ -688,46 +688,36 @@ fn collect_claude_sidecar_evidence(
             evidence.saw_session_started = true;
             collect_claude_session_id(payload, session_ids);
         }
-        "sdk_message" => {
+        "sdk_event" => {
             collect_claude_session_id(payload, session_ids);
-            let Some(message) = payload.get("message").and_then(Value::as_object) else {
+            let Some(event) = payload.get("event").and_then(Value::as_object) else {
                 issues.push(issue(
                     label,
                     line,
-                    "Claude sdk_message payload must contain a message object",
-                    Some("/payload/message"),
+                    "Claude sdk_event payload must contain a closed event object",
+                    Some("/payload/event"),
                 ));
                 return;
             };
-            collect_claude_session_id(message, session_ids);
-            match message.get("type").and_then(Value::as_str) {
-                Some("system")
-                    if message.get("subtype").and_then(Value::as_str) == Some("init") =>
-                {
-                    evidence.saw_sdk_init = true;
-                }
+            match event.get("event").and_then(Value::as_str) {
+                Some("init") => evidence.saw_sdk_init = true,
                 Some("assistant")
-                    if message.get("error").and_then(Value::as_str)
-                        == Some("authentication_failed")
-                        && message.get("is_api_error_message").and_then(Value::as_bool)
-                            == Some(true) =>
+                    if event.get("error").and_then(Value::as_str)
+                        == Some("authentication_failed") =>
                 {
                     evidence.saw_auth_failure_assistant = true;
                 }
                 Some("result") => {
-                    let is_error = message.get("is_error").and_then(Value::as_bool);
+                    let is_error = event.get("is_error").and_then(Value::as_bool);
                     if is_error == Some(false) {
                         issues.push(issue(
                             label,
                             line,
                             "authentication-failure fixture contains a successful result",
-                            Some("/payload/message/is_error"),
+                            Some("/payload/event/is_error"),
                         ));
                     }
-                    if is_error == Some(true)
-                        && message.get("terminal_reason").and_then(Value::as_str)
-                            == Some("api_error")
-                    {
+                    if is_error == Some(true) {
                         evidence.saw_terminal_auth_failure = true;
                     }
                 }

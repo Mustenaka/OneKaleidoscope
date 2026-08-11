@@ -6,7 +6,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use tempfile::tempdir;
-use xtask::fixtures::{verify_paths, FixtureVerifyError, Identity, VerifySummary};
+use xtask::fixtures::{
+    verify_claude_sidecar_paths, verify_paths, FixtureVerifyError, Identity, VerifySummary,
+};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -1158,6 +1160,43 @@ fn recorded_fixtures_pass_repository_schemas() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn recorded_claude_auth_failure_uses_closed_sdk_events_and_is_not_acceptance() -> TestResult {
+    let fixture_root = repository_claude_fixtures()?;
+    let summary = verify_claude_sidecar_paths(&fixture_root, &Identity::default())?;
+
+    assert_eq!(summary.files, 1);
+    assert_eq!(summary.records, 6);
+    assert_eq!(summary.auth_failure_files, 1);
+    Ok(())
+}
+
+#[test]
+fn claude_auth_failure_fixture_rejects_a_terminal_success_mutation() -> TestResult {
+    let source_root = repository_claude_fixtures()?;
+    let root = tempdir()?;
+    let fixtures = root.path().join("fixtures");
+    let sandbox = fixtures.join("sandbox");
+    fs::create_dir_all(&sandbox)?;
+    let recording = fs::read_to_string(source_root.join("sandbox/real-sdk-simple-turn.jsonl"))?;
+    let mutated = recording.replace("\"is_error\":true", "\"is_error\":false");
+    fs::write(sandbox.join("real-sdk-simple-turn.jsonl"), mutated)?;
+    fs::copy(
+        source_root.join("sandbox/real-sdk-simple-turn.metadata.json"),
+        sandbox.join("real-sdk-simple-turn.metadata.json"),
+    )?;
+
+    let error = verification_error(
+        verify_claude_sidecar_paths(&fixtures, &Identity::default()),
+        "a successful result must not pass as authentication-failure evidence",
+    )?;
+    assert!(error.issues().iter().any(|issue| {
+        issue.category == "authentication-failure fixture contains a successful result"
+            && issue.pointer.as_deref() == Some("/payload/event/is_error")
+    }));
+    Ok(())
+}
+
 fn verify_with_repository_schemas(
     fixtures: &Path,
 ) -> io::Result<Result<VerifySummary, FixtureVerifyError>> {
@@ -1183,6 +1222,19 @@ fn repository_schemas() -> io::Result<PathBuf> {
         })
 }
 
+fn repository_claude_fixtures() -> io::Result<PathBuf> {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    manifest
+        .ancestors()
+        .map(|ancestor| ancestor.join("crates/kaleido-adapter-claude/tests/fixtures"))
+        .find(|candidate| {
+            candidate
+                .join("sandbox/real-sdk-simple-turn.jsonl")
+                .is_file()
+        })
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Claude fixtures are missing"))
+}
+
 fn write_fixture(root: &Path, relative: &str, contents: &str) -> io::Result<()> {
     let path = root.join(relative);
     let parent = path.parent().ok_or_else(|| {
@@ -1195,8 +1247,8 @@ fn write_fixture(root: &Path, relative: &str, contents: &str) -> io::Result<()> 
     fs::write(path, contents)
 }
 
-fn verification_error(
-    result: Result<VerifySummary, FixtureVerifyError>,
+fn verification_error<T>(
+    result: Result<T, FixtureVerifyError>,
     success_message: &'static str,
 ) -> io::Result<FixtureVerifyError> {
     match result {

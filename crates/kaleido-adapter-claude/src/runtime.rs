@@ -59,6 +59,8 @@ pub struct ClaudeRuntimeSession {
     started: bool,
     exit_reported: bool,
     next_turn: u64,
+    active_cwd: Option<String>,
+    discovery_cwd: Option<PathBuf>,
 }
 
 impl ClaudeRuntimeSession {
@@ -74,6 +76,8 @@ impl ClaudeRuntimeSession {
             started: false,
             exit_reported: false,
             next_turn: 0,
+            active_cwd: None,
+            discovery_cwd: None,
         }
     }
 
@@ -121,16 +125,83 @@ impl ClaudeRuntimeSession {
         self.transport = Some(transport);
         self.observation_started = Some(Instant::now());
         self.exit_reported = false;
-        let response = self.send_command("list_sessions", json!({ "cwd": cwd }));
+        let cwd_text = cwd.to_string_lossy().into_owned();
+        self.active_cwd = Some(cwd_text.clone());
+        let response = self.send_command("list_sessions", json!({ "cwd": cwd_text }));
         let result = response.and_then(|_| self.await_kind("session_list", content));
-        let cleanup = self.terminate_transport();
+        let cleanup = self.close_transport();
+        match result {
+            Ok(effects) => {
+                cleanup?;
+                self.discovery_cwd = Some(cwd.to_path_buf());
+                Ok(effects)
+            }
+            Err(error) => {
+                let _ = cleanup;
+                Err(error)
+            }
+        }
+    }
+
+    /// Read one bounded page through the official `getSessionMessages` API.
+    /// The canonical session must have been returned by `discover` for this
+    /// exact directory; neither the raw provider id nor an ambient project
+    /// search is accepted.
+    pub fn read_history(
+        &mut self,
+        session_id: &SessionId,
+        cwd: &Path,
+        offset: u64,
+        limit: u64,
+        content: &mut dyn ContentAccess,
+    ) -> Result<Vec<StateEffect>, RuntimeSessionError> {
+        if self.started || self.transport.is_some() {
+            return Err(RuntimeSessionError::AlreadyStarted);
+        }
+        if !cwd.is_absolute() || self.discovery_cwd.as_deref() != Some(cwd) {
+            return Err(RuntimeSessionError::ProtocolViolation {
+                detail: "Claude history cwd does not match the exact discovery scope".to_owned(),
+            });
+        }
+        if !(1..=100).contains(&limit) {
+            return Err(RuntimeSessionError::ProtocolViolation {
+                detail: "Claude history page limit must be between 1 and 100".to_owned(),
+            });
+        }
+        let raw = self
+            .reducer
+            .raw_discovered_session(session_id)
+            .map(str::to_owned)
+            .ok_or(RuntimeSessionError::CapabilityUnavailable)?;
+        self.transport = Some(
+            ChildTransport::spawn(&self.node_executable, &self.bridge_script, cwd).map_err(
+                |_| RuntimeSessionError::ConnectionFault {
+                    reason: ConnectionFaultReason::TransportError,
+                },
+            )?,
+        );
+        self.observation_started = Some(Instant::now());
+        self.exit_reported = false;
+        let cwd_text = cwd.to_string_lossy().into_owned();
+        self.active_cwd = Some(cwd_text.clone());
+        let response = self.send_command(
+            "get_session_messages",
+            json!({
+                "cwd": cwd_text,
+                "session_id": raw,
+                "offset": offset,
+                "limit": limit,
+            }),
+        );
+        let result = response.and_then(|_| self.await_kind("session_messages", content));
+        let cleanup = self.close_transport();
         match result {
             Ok(effects) => {
                 cleanup?;
                 Ok(effects)
             }
             Err(error) => {
-                let _ = cleanup;
+                let _ = self.force_terminate_transport();
                 Err(error)
             }
         }
@@ -145,15 +216,16 @@ impl ClaudeRuntimeSession {
         request: &SessionStartRequest,
         content: &mut dyn ContentAccess,
     ) -> Result<Vec<StateEffect>, RuntimeSessionError> {
+        if self.started || self.transport.is_some() {
+            return Err(RuntimeSessionError::AlreadyStarted);
+        }
         if raw_session_id.trim().is_empty() {
             return Err(RuntimeSessionError::ProtocolViolation {
                 detail: "Claude resume requires a non-empty provider session id".to_owned(),
             });
         }
         self.resume_session = Some(raw_session_id.to_owned());
-        let mut effects = self.start(request, content)?;
-        effects.extend(self.await_kind("session_resumed", content)?);
-        Ok(effects)
+        self.start(request, content)
     }
 
     /// Reconnect is an explicit alias for the SDK resume path.  Claude's
@@ -190,27 +262,88 @@ impl ClaudeRuntimeSession {
 
     fn send_command(&mut self, kind: &str, payload: Value) -> Result<(), RuntimeSessionError> {
         let bytes = encode_command(kind, payload)?;
-        self.transport
+        let sent = self
+            .transport
             .as_mut()
             .ok_or(RuntimeSessionError::NotConnected)?
             .send(&bytes)
             .map_err(|_| RuntimeSessionError::ConnectionFault {
                 reason: ConnectionFaultReason::TransportError,
-            })
+            });
+        if sent.is_err() {
+            let _ = self.force_terminate_transport();
+        }
+        sent
     }
 
-    fn terminate_transport(&mut self) -> Result<(), RuntimeSessionError> {
-        if let Some(transport) = self.transport.as_mut() {
-            let _ = transport.send(&encode_command("close", json!({}))?);
+    fn force_terminate_transport(&mut self) -> Result<(), RuntimeSessionError> {
+        let termination = if let Some(mut transport) = self.transport.take() {
             transport
                 .terminate()
                 .map_err(|_| RuntimeSessionError::ConnectionFault {
                     reason: ConnectionFaultReason::TransportError,
-                })?;
-        }
+                })
+        } else {
+            Ok(())
+        };
         self.transport = None;
         self.observation_started = None;
-        Ok(())
+        self.active_cwd = None;
+        self.started = false;
+        self.exit_reported = false;
+        termination
+    }
+
+    fn close_transport(&mut self) -> Result<(), RuntimeSessionError> {
+        if self.transport.is_none() {
+            return Ok(());
+        }
+        let handshake = (|| {
+            self.send_command("close", json!({}))?;
+            let deadline = Instant::now()
+                .checked_add(self.request_timeout)
+                .ok_or_else(timeout_error)?;
+            loop {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .ok_or_else(timeout_error)?;
+                let received = self
+                    .transport
+                    .as_mut()
+                    .ok_or(RuntimeSessionError::NotConnected)?
+                    .receive(remaining)
+                    .map_err(|_| RuntimeSessionError::ConnectionFault {
+                        reason: ConnectionFaultReason::TransportError,
+                    })?;
+                match received {
+                    Receive::Line(line) => {
+                        let frame = TranscriptFrame::from_wire(
+                            Direction::BridgeToHost,
+                            self.offset_ms(),
+                            &line,
+                        )
+                        .map_err(protocol_violation)?;
+                        if frame.kind() == "error" {
+                            return Err(RuntimeSessionError::ProtocolViolation {
+                                detail: "Claude sidecar rejected the close handshake".to_owned(),
+                            });
+                        }
+                        if frame.kind() == "closed" {
+                            return Ok(());
+                        }
+                    }
+                    Receive::EndOfStream(exit_code) => {
+                        return Err(RuntimeSessionError::ConnectionFault {
+                            reason: ConnectionFaultReason::ProcessExited { exit_code },
+                        });
+                    }
+                    Receive::TimedOut => return Err(timeout_error()),
+                }
+            }
+        })();
+        let cleanup = self.force_terminate_transport();
+        handshake?;
+        cleanup
     }
 
     fn ingest_line(
@@ -218,14 +351,60 @@ impl ClaudeRuntimeSession {
         line: &[u8],
         content: &mut dyn ContentAccess,
     ) -> Result<(String, Vec<StateEffect>), RuntimeSessionError> {
-        let frame = TranscriptFrame::from_wire(Direction::BridgeToHost, self.offset_ms(), line)
-            .map_err(protocol_violation)?;
+        let frame =
+            match TranscriptFrame::from_wire(Direction::BridgeToHost, self.offset_ms(), line) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    let _ = self.force_terminate_transport();
+                    return Err(protocol_violation(error));
+                }
+            };
         let kind = frame.kind().to_owned();
-        let effects = self
-            .reducer
-            .ingest_frame(&frame, content)
-            .map_err(protocol_violation)?;
-        validate_effects(&effects)?;
+        if kind == "error" {
+            let _ = self.force_terminate_transport();
+            return Err(RuntimeSessionError::ProtocolViolation {
+                detail: "Claude sidecar returned an explicit error frame".to_owned(),
+            });
+        }
+        if matches!(
+            kind.as_str(),
+            "ready" | "session_started" | "session_resumed" | "session_list" | "session_messages"
+        ) {
+            let returned_cwd = frame
+                .payload()
+                .get("cwd")
+                .and_then(Value::as_str)
+                .ok_or_else(|| protocol_violation(ClaudeAdapterError::MalformedFrame))?;
+            if self.active_cwd.as_deref() != Some(returned_cwd) {
+                let _ = self.force_terminate_transport();
+                return Err(RuntimeSessionError::ProtocolViolation {
+                    detail: "Claude sidecar changed the exact project cwd".to_owned(),
+                });
+            }
+        }
+        if kind == "ready" {
+            let returned_resume = frame
+                .payload()
+                .get("resume_session_id")
+                .and_then(Value::as_str);
+            if returned_resume != self.resume_session.as_deref() {
+                let _ = self.force_terminate_transport();
+                return Err(RuntimeSessionError::ProtocolViolation {
+                    detail: "Claude sidecar changed the requested resume identity".to_owned(),
+                });
+            }
+        }
+        let effects = match self.reducer.ingest_frame(&frame, content) {
+            Ok(effects) => effects,
+            Err(error) => {
+                let _ = self.force_terminate_transport();
+                return Err(protocol_violation(error));
+            }
+        };
+        if let Err(error) = validate_effects(&effects) {
+            let _ = self.force_terminate_transport();
+            return Err(error);
+        }
         Ok((kind, effects))
     }
 
@@ -239,17 +418,24 @@ impl ClaudeRuntimeSession {
             .ok_or_else(timeout_error)?;
         let mut effects = Vec::new();
         loop {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .ok_or_else(timeout_error)?;
-            let received = self
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                let _ = self.force_terminate_transport();
+                return Err(timeout_error());
+            };
+            let received = match self
                 .transport
                 .as_mut()
                 .ok_or(RuntimeSessionError::NotConnected)?
                 .receive(remaining)
-                .map_err(|_| RuntimeSessionError::ConnectionFault {
-                    reason: ConnectionFaultReason::TransportError,
-                })?;
+            {
+                Ok(received) => received,
+                Err(_) => {
+                    let _ = self.force_terminate_transport();
+                    return Err(RuntimeSessionError::ConnectionFault {
+                        reason: ConnectionFaultReason::TransportError,
+                    });
+                }
+            };
             match received {
                 Receive::Line(line) => {
                     let (kind, frame_effects) = self.ingest_line(&line, content)?;
@@ -265,11 +451,15 @@ impl ClaudeRuntimeSession {
                         .process_exited(exit_code, self.absolute_at_ms())
                         .map_err(protocol_violation)?;
                     effects.extend(exit_effects);
+                    let _ = self.force_terminate_transport();
                     return Err(RuntimeSessionError::ConnectionFault {
                         reason: ConnectionFaultReason::ProcessExited { exit_code },
                     });
                 }
-                Receive::TimedOut => return Err(timeout_error()),
+                Receive::TimedOut => {
+                    let _ = self.force_terminate_transport();
+                    return Err(timeout_error());
+                }
             }
         }
     }
@@ -280,14 +470,20 @@ impl ClaudeRuntimeSession {
     ) -> Result<Vec<StateEffect>, RuntimeSessionError> {
         let mut effects = Vec::new();
         loop {
-            let received = self
+            let received = match self
                 .transport
                 .as_mut()
                 .ok_or(RuntimeSessionError::NotConnected)?
                 .try_receive()
-                .map_err(|_| RuntimeSessionError::ConnectionFault {
-                    reason: ConnectionFaultReason::TransportError,
-                })?;
+            {
+                Ok(received) => received,
+                Err(_) => {
+                    let _ = self.force_terminate_transport();
+                    return Err(RuntimeSessionError::ConnectionFault {
+                        reason: ConnectionFaultReason::TransportError,
+                    });
+                }
+            };
             let Some(received) = received else {
                 break;
             };
@@ -303,6 +499,7 @@ impl ClaudeRuntimeSession {
                             .process_exited(exit_code, self.absolute_at_ms())
                             .map_err(protocol_violation)?,
                     );
+                    let _ = self.force_terminate_transport();
                     break;
                 }
                 Receive::TimedOut => break,
@@ -357,16 +554,22 @@ impl ProviderRuntimeSession for ClaudeRuntimeSession {
                 })?,
         );
         self.observation_started = Some(Instant::now());
+        self.active_cwd = Some(root.clone());
         self.started = true;
         self.exit_reported = false;
-        self.send_command(
-            "start",
-            json!({
-                "cwd": root,
-                "resume": self.resume_session,
-            }),
-        )?;
-        self.await_kind("ready", content)
+        let result = self
+            .send_command(
+                "start",
+                json!({
+                    "cwd": root,
+                    "resume": self.resume_session,
+                }),
+            )
+            .and_then(|_| self.await_kind("ready", content));
+        if result.is_err() {
+            let _ = self.force_terminate_transport();
+        }
+        result
     }
 
     fn submit_prompt(
@@ -532,7 +735,7 @@ impl ProviderRuntimeSession for ClaudeRuntimeSession {
             .cloned()
             .ok_or(RuntimeSessionError::CapabilityUnavailable)?;
         if self.transport.is_some() {
-            self.terminate_transport()?;
+            self.close_transport()?;
         }
         self.started = false;
         self.exit_reported = false;
@@ -552,7 +755,7 @@ impl ProviderRuntimeSession for ClaudeRuntimeSession {
             .map(str::to_owned)
             .ok_or(RuntimeSessionError::CapabilityUnavailable)?;
         if self.transport.is_some() {
-            self.terminate_transport()?;
+            self.close_transport()?;
         }
         self.started = false;
         self.exit_reported = false;
@@ -609,19 +812,10 @@ impl ProviderRuntimeSession for ClaudeRuntimeSession {
 
     fn close(&mut self) -> Result<Vec<StateEffect>, RuntimeSessionError> {
         self.require_started()?;
-        if self.transport.is_some() {
-            let _ = self.send_command("close", json!({}));
-        }
-        if let Some(transport) = self.transport.as_mut() {
-            transport
-                .terminate()
-                .map_err(|_| RuntimeSessionError::ConnectionFault {
-                    reason: ConnectionFaultReason::TransportError,
-                })?;
-        }
-        self.started = false;
+        let at_ms = self.absolute_at_ms();
+        self.close_transport()?;
         self.reducer
-            .clean_disconnected(self.absolute_at_ms())
+            .clean_disconnected(at_ms)
             .map_err(protocol_violation)
     }
 

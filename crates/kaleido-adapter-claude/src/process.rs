@@ -122,6 +122,19 @@ impl ChildTransport {
     }
 }
 
+impl Drop for ChildTransport {
+    fn drop(&mut self) {
+        self.stdin.take();
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = terminate_process_tree(&mut self.child);
+        }
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
 #[cfg(windows)]
 fn terminate_process_tree(child: &mut Child) -> io::Result<()> {
     use std::process::Command;
@@ -143,7 +156,17 @@ fn terminate_process_tree(child: &mut Child) -> io::Result<()> {
 
 #[cfg(not(windows))]
 fn terminate_process_tree(child: &mut Child) -> io::Result<()> {
-    child.kill()
+    let process_group = format!("-{}", child.id());
+    let status = Command::new("kill")
+        .args(["-KILL", process_group.as_str()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        child.kill()
+    }
 }
 
 #[cfg(windows)]
@@ -153,4 +176,7 @@ fn configure_platform(command: &mut Command) {
 }
 
 #[cfg(not(windows))]
-fn configure_platform(_command: &mut Command) {}
+fn configure_platform(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}

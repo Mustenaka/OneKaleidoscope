@@ -14,6 +14,6 @@
   },
   "scripts": {
     "record:real": "node record-real-fixture.mjs",
-    "typecheck": "tsc --noEmit --strict --skipLibCheck index.ts"
+    "typecheck": "tsc --noEmit -p tsconfig.json"
   }
 }
