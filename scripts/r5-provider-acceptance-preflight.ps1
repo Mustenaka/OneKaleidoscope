@@ -193,12 +193,51 @@ try {
                     Add-Blocker 'adb_reverse_forbidden'
                 }
                 $connectivity = Invoke-Text -Executable $adb -Arguments @('-s', $serial, 'shell', 'dumpsys', 'connectivity')
-                if (-not $connectivity -or $connectivity -notmatch 'TRANSPORT_WIFI') {
+                $wifiStatus = Invoke-Text -Executable $adb -Arguments @('-s', $serial, 'shell', 'cmd', 'wifi', 'status')
+                $wlanAddress = Invoke-Text -Executable $adb -Arguments @('-s', $serial, 'shell', 'ip', '-4', 'addr', 'show', 'wlan0')
+                $wifiConnected =
+                    $connectivity -and
+                    $connectivity -match '(?i)TRANSPORT_WIFI|Transports:\s*[^\r\n]*\bWIFI\b' -and
+                    $wifiStatus -and
+                    $wifiStatus -match '(?im)^Wifi is enabled\s*$' -and
+                    $wifiStatus -match '(?im)\bIP:\s*/?\d{1,3}(?:\.\d{1,3}){3}\b' -and
+                    $wlanAddress -and
+                    $wlanAddress -match '(?im)\binet\s+\d{1,3}(?:\.\d{1,3}){3}/\d{1,2}\b'
+                $vpnActive =
+                    $connectivity -and
+                    $connectivity -match '(?i)TRANSPORT_VPN|Transports:\s*[^\r\n]*\bVPN\b'
+                $directWifiRoute = $false
+                if ($wifiConnected) {
+                    $pcAddresses = @(
+                        Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                            Where-Object {
+                                $_.AddressState -eq 'Preferred' -and
+                                $_.IPAddress -notmatch '^(127\.|169\.254\.)'
+                            } |
+                            Select-Object -ExpandProperty IPAddress -Unique
+                    )
+                    foreach ($pcAddress in $pcAddresses) {
+                        $route = Invoke-Text -Executable $adb -Arguments @(
+                            '-s', $serial, 'shell', 'ip', 'route', 'get', $pcAddress
+                        )
+                        if (
+                            $route -and
+                            $route -match '(?i)\bdev\s+wlan\d*\b' -and
+                            $route -notmatch '(?i)\bvia\s+'
+                        ) {
+                            $directWifiRoute = $true
+                            break
+                        }
+                    }
+                }
+                if (-not $wifiConnected) {
                     Add-Blocker 'wifi_transport_required'
-                } elseif ($connectivity -match 'TRANSPORT_VPN') {
+                } elseif ($vpnActive -and -not $directWifiRoute) {
                     Add-Blocker 'vpn_transport_forbidden'
+                } elseif (-not $directWifiRoute) {
+                    Add-Blocker 'pc_lan_route_unavailable'
                 } else {
-                    $network = 'wifi-no-vpn'
+                    $network = if ($vpnActive) { 'wifi-direct-vpn-bypass' } else { 'wifi-direct' }
                 }
             }
         }
