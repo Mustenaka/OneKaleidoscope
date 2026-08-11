@@ -1,7 +1,7 @@
 # T-112 Claude Agent SDK evidence
 
 > 状态：**active evidence ledger；只有真实失败路径，不是成功验收**
-> 集成基线：`origin/main@c993d9f9bb115003e2ee69066c233ac47b7c52cc`
+> 集成基线：`origin/main@b54a12638cd044b277747d5fbc22627ad2adb016`
 > 记录日期：2026-08-11
 
 ## 1. 钉定上游与 bridge

@@ -1,7 +1,7 @@
 # T-113 multi-provider / mobile gate evidence
 
 > 状态：**active；composition bootstrap 通过，最终门禁未通过**
-> 集成基线：`origin/main@c993d9f9bb115003e2ee69066c233ac47b7c52cc`
+> 集成基线：`origin/main@b54a12638cd044b277747d5fbc22627ad2adb016`
 > 记录日期：2026-08-11
 
 ## 1. provider-neutral host composition
@@ -129,3 +129,18 @@ canonical pump 尚需最终真实 provider 重跑；Claude 本地 SDK input queu
 T-113 只有在 T-111/T-112 真实 provider 空缺闭合、三家同驻纵切、`cargo xtask ci`、跨平台
 CI exact commit runs 与实体 arm64 Android 真实 Wi-Fi 纵切全部通过后才能完成。R4 合并后还必须
 在最终 SHA 重跑蜂窝/relay；当前 LAN 证据不等于公网恢复。
+
+## 7. 零构建外部预检
+
+`scripts/r5-provider-acceptance-preflight.ps1` 是最终门禁的第一步。它只读取环境，不生成 APK、
+不编译 workspace，也不记录凭据、设备序列号或完整用户路径。预检覆盖：
+
+- candidate 包含 `origin/main` 且工作树 clean；
+- 可运行的 native Codex、OpenCode CLI 与 schema 精确版本一致；
+- Claude CLI 已登录、bridge 仍钉定官方 SDK、Node 至少为 22；
+- 恰好一台非模拟器 arm64 Android，真实 Wi-Fi、无 VPN、无 `adb reverse`。
+
+2026-08-11 在本机实际运行完整预检，安全结果为：Codex `0.147.0`、OpenCode/schema
+`1.18.16`、Claude SDK `0.3.226`、Node `22.13.1` 均可定位；当前阻塞码是
+`claude_auth_missing` 与 `exactly_one_android_device_required`。开发中的未提交脚本同时正确触发
+`working_tree_dirty`。预检因此在任何 Rust/Android 总构建前 exit 1，未把外部空缺误记为通过。

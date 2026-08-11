@@ -1,7 +1,7 @@
 # T-111 OpenCode / D-B11 evidence
 
 > 状态：**active evidence ledger，不是完成证明**
-> 集成基线：`origin/main@c993d9f9bb115003e2ee69066c233ac47b7c52cc`
+> 集成基线：`origin/main@b54a12638cd044b277747d5fbc22627ad2adb016`
 > 更新日期：2026-08-11
 
 ## 1. D-B11 版本结论
@@ -19,6 +19,12 @@ switch；adapter 只按当前连接的结构化成功/流量证明能力。早�
 unverified warning。2026-08-11 重新执行 `opencode --version`、`npm view opencode-ai version`
 与 `npm view @opencode-ai/sdk version`，三者仍均返回 `1.18.16`，因此下述漂移不能解释为
 CLI/server 与 SDK 的公开版本号不一致。
+
+同日又在隔离安装中重新审计 `1.18.11`，排除“降级即可支持”的假设：精确
+`cargo xtask schema diff` 相对当前快照得到 required surface 内外均 `0 drift`，但真实 Windows
+server 对明确隔离目录的 `/project/current` scope 返回盘符根目录。产品 adapter 因
+`ScopeMismatch` 在 discovery 阶段 fail-closed；没有放宽目录比较。由此 `1.18.11` 也不是当前
+Windows 产品候选，并再次证明静态 schema 相容不能代替真实 runtime 验收。
 
 ## 2. 生成链
 
