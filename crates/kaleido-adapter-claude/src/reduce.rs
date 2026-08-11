@@ -5,7 +5,7 @@
 //! versioned project-owned frames. `transcript` strictly validates each frame
 //! before this reducer dispatches the already-owned fields.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use kaleido_adapter::capability::CapabilityProbe;
 use kaleido_adapter::content::ContentAccess;
@@ -88,6 +88,7 @@ pub struct ClaudeReducer {
     attention_by_request: BTreeMap<String, AttentionId>,
     attention: BTreeMap<AttentionId, AttentionItem>,
     local_prompt_commands: BTreeMap<String, CommandId>,
+    queued_prompt_turns: BTreeSet<String>,
     local_attention_commands: BTreeMap<String, CommandId>,
     diagnostics: BTreeMap<String, u64>,
     discovered: Vec<DiscoveredSession>,
@@ -128,6 +129,7 @@ impl ClaudeReducer {
             attention_by_request: BTreeMap::new(),
             attention: BTreeMap::new(),
             local_prompt_commands: BTreeMap::new(),
+            queued_prompt_turns: BTreeSet::new(),
             local_attention_commands: BTreeMap::new(),
             diagnostics: BTreeMap::new(),
             discovered: Vec::new(),
@@ -169,6 +171,16 @@ impl ClaudeReducer {
             .insert(raw_turn.to_owned(), command_id.clone());
     }
 
+    pub(crate) fn register_queued_prompt(&mut self, raw_turn: &str, command_id: &CommandId) {
+        self.register_local_prompt(raw_turn, command_id);
+        self.queued_prompt_turns.insert(raw_turn.to_owned());
+    }
+
+    pub(crate) fn forget_local_prompt(&mut self, raw_turn: &str) {
+        self.local_prompt_commands.remove(raw_turn);
+        self.queued_prompt_turns.remove(raw_turn);
+    }
+
     pub(crate) fn is_active_turn(&self, turn_id: &TurnId) -> bool {
         self.current_turn_raw
             .as_deref()
@@ -202,6 +214,28 @@ impl ClaudeReducer {
                 acked_at_ms: at_ms,
             },
         }
+    }
+
+    pub(crate) fn publish_capabilities_effect(&mut self) -> StateEffect {
+        self.published_capabilities = self.probe.proven().to_vec();
+        StateEffect::CapabilitiesUpdated {
+            capabilities: self.probe.to_capabilities(),
+        }
+    }
+
+    pub(crate) fn refresh_live_binding(&mut self, at_ms: i64) -> Vec<StateEffect> {
+        let Some(session) = self.session.as_mut() else {
+            return Vec::new();
+        };
+        let next = live_binding(&self.probe, &self.runtime_id, at_ms, self.config.evidence);
+        if session.live_binding == next {
+            return Vec::new();
+        }
+        session.live_binding = next;
+        session.updated_at_ms = session.updated_at_ms.max(at_ms);
+        vec![StateEffect::SessionUpserted {
+            session: session.clone(),
+        }]
     }
 
     pub fn capability_probe(&self) -> CapabilityProbe {
@@ -286,10 +320,8 @@ impl ClaudeReducer {
         let mut effects = self.ensure_bootstrapped(at_ms);
         effects.extend(self.dispatch(frame, at_ms, content)?);
         if self.probe.proven() != self.published_capabilities.as_slice() {
-            self.published_capabilities = self.probe.proven().to_vec();
-            effects.push(StateEffect::CapabilitiesUpdated {
-                capabilities: self.probe.to_capabilities(),
-            });
+            effects.push(self.publish_capabilities_effect());
+            effects.extend(self.refresh_live_binding(at_ms));
         }
         Self::validate_effects(&effects)?;
         Ok(effects)
@@ -942,8 +974,8 @@ impl ClaudeReducer {
             })?;
         let text = string_field(payload, "text").unwrap_or_default();
         self.probe.prove(Capability::TurnPrompt);
-        if accepted {
-            self.probe.prove(Capability::LiveControl);
+        if accepted && self.queued_prompt_turns.contains(raw_turn) {
+            self.probe.prove(Capability::QueueWrite);
         }
         // The bridge acknowledges a prompt as soon as it enters the SDK input
         // queue.  The SDK's first `system/init` frame (which carries the
@@ -2015,7 +2047,7 @@ fn live_binding(
     at_ms: i64,
     evidence: EvidenceSource,
 ) -> LiveBinding {
-    if evidence != EvidenceSource::ObservedInTraffic {
+    if evidence != EvidenceSource::ObservedInTraffic || !probe.is_proven(Capability::LiveObserve) {
         return LiveBinding::NotBound {
             reason: LiveUnboundReason::NeverStarted,
         };

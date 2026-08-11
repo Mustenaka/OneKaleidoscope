@@ -58,5 +58,9 @@ lines.on("line", (line) => {
     });
     return;
   }
+  if (command.kind === "prompt") {
+    emit("prompt_accepted", { turn_id: command.payload.turn_id });
+    return;
+  }
   emit("error", { code: "unexpected_test_command" });
 });
