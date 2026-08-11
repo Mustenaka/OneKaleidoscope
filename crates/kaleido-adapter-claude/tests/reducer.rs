@@ -12,7 +12,7 @@ use kaleido_adapter_claude::error::ClaudeAdapterError;
 use kaleido_adapter_claude::parse_transcript;
 use kaleido_adapter_claude::transcript::{Direction, TranscriptFrame, SIDECAR_PROTOCOL};
 use kaleido_proto::attention::{AttentionState, AttentionSubject};
-use kaleido_proto::capability::{Capability, CapabilityState, CapabilityUnavailableReason};
+use kaleido_proto::capability::{Capability, CapabilityState};
 use kaleido_proto::effect::StateEffect;
 use kaleido_proto::turn::TurnStatus;
 use serde_json::{json, Value};
@@ -86,7 +86,7 @@ fn ready_projects_an_unbound_broker_session_until_the_sdk_assigns_its_id() {
 }
 
 #[test]
-fn real_sdk_capture_reduces_to_session_agent_item_and_failed_turn() {
+fn real_sdk_capture_reduces_to_session_agent_item_and_completed_turn() {
     let raw = fs::read_to_string(fixture_path()).expect("real SDK fixture exists");
     let transcript = parse_transcript(&raw).expect("real SDK fixture parses");
     let mut reducer = reducer();
@@ -98,9 +98,8 @@ fn real_sdk_capture_reduces_to_session_agent_item_and_failed_turn() {
     assert!(effects
         .iter()
         .any(|effect| matches!(effect, StateEffect::SessionUpserted { .. })));
-    // The fixture is intentionally an authentication failure, but the typed
-    // assistant message is still projected as an agent item rather than
-    // discarded or replaced by a fabricated success string.
+    // The typed assistant message is projected from the real SDK capture,
+    // rather than replaced by a fabricated success string.
     assert!(effects.iter().any(|effect| matches!(
         effect,
         StateEffect::ItemUpserted { item }
@@ -110,26 +109,13 @@ fn real_sdk_capture_reduces_to_session_agent_item_and_failed_turn() {
         StateEffect::TurnUpserted { turn } => Some(turn),
         _ => None,
     });
-    assert_eq!(turn.map(|value| value.status), Some(TurnStatus::Failed));
-    assert!(turn.is_some_and(|value| {
-        value
-            .error
-            .as_ref()
-            .is_some_and(|error| error.code == kaleido_proto::error::ErrorCode::AuthRequired)
-    }));
+    assert_eq!(turn.map(|value| value.status), Some(TurnStatus::Completed));
+    assert!(turn.is_some_and(|value| value.error.is_none()));
     assert!(effects
         .iter()
         .all(|effect| effect.validate_for_log().is_ok()));
     assert!(!reducer.capability_probe().is_proven(Capability::TurnSteer));
-    assert_eq!(
-        reducer
-            .capability_probe()
-            .to_capabilities()
-            .state_of(&Capability::TurnPrompt),
-        CapabilityState::UnavailableOnThisConnection {
-            reason: CapabilityUnavailableReason::AuthenticationRequired,
-        }
-    );
+    assert!(reducer.capability_probe().is_proven(Capability::TurnPrompt));
 }
 
 #[test]

@@ -13,6 +13,7 @@
     "typescript": "5.8.3"
   },
   "scripts": {
+    "probe:real-acceptance": "node probe-real-acceptance.mjs",
     "record:real": "node record-real-fixture.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   }

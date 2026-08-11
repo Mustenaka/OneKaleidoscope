@@ -637,7 +637,9 @@ async function start(payload: JsonObject): Promise<void> {
         cwd: activeCwd,
         resume,
         canUseTool: permissionCallback(),
+        permissionMode: "default",
         persistSession: true,
+        settingSources: [],
       },
     });
     activeQuery = queryHandle;

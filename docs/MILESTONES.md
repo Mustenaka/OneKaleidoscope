@@ -148,8 +148,9 @@ NAT 20 轮测试属于性能与容量数据，不再决定 relay 是否开发，
   fixture 通过；最新 generated product live probe 因同版本 `/doc`/`/event` 类型冲突及未声明
   heartbeat fail-closed，D-B11/实时恢复仍 blocked；恢复即使解码后也诚实标为
   `lossless_replay = false`；
-- Claude 官方 Agent SDK `0.3.226` sidecar 与 provisional Broker-managed Session 已接入；
-  真实 fixture 因 OAuth 过期以 `authentication_failed` 终止，只证明失败路径；
+- Claude 官方 Agent SDK `0.3.226` sidecar 与 provisional Broker-managed Session 已接入；真实成功
+  fixture 与 live probe 已覆盖 streaming、permission allow/deny、QuestionSet、interrupt、resume、
+  discovery 与非空 history；
 - StructuredLanHost 已让真实 OpenCode server 与 Claude provisional runtime 同驻并 clean
   shutdown；这不是三家真实会话纵切；
 - UACP `0.5.0` QuestionSet、scoped runtime ack、逐题单/多选/free-form、answer provenance
@@ -157,8 +158,8 @@ NAT 20 轮测试属于性能与容量数据，不再决定 relay 是否开发，
   diff 已通过；`fc896be` 的 Android 双 ABI clean AAR/APK/lint/JVM 与 API 35 instrumentation
   18 completed / 0 failed，T-114 合同保持完成；
 
-仍未通过：Claude 成功 turn/非空 history read 与真实 permission/question/interrupt/resume、OpenCode
-`/doc`/`/event` 漂移解除与实时/恢复/其余真实动作矩阵、三家同驻、Windows/macOS/Linux + Android CI、R5 实体 arm64 Android 纵切，以及
+仍未通过：OpenCode `/doc`/`/event` 漂移解除与实时/恢复/其余真实动作矩阵、三家同驻、
+Windows/macOS/Linux + Android CI、R5 实体 arm64 Android 纵切，以及
 R4 合并后的公网重跑。
 
 最终门禁：三家各完成真实流式 turn、历史、等待人工、断线恢复；缺失能力由 runtime

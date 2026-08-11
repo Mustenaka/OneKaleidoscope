@@ -7,8 +7,7 @@
 | 卡 | 范围 | 状态 |
 |---|---|---|
 | [T-111](T-111.md) | R5 OpenCode REST/SSE、D-B11、生成类型、真实会话与恢复 | active；question fixture 通过，latest generated live 因 `/doc`/`/event` 漂移 blocked |
-| [T-112](T-112.md) | R5 Claude Agent SDK Broker、真实流式会话、permissions 与恢复 | active；真实 OAuth 失败，success 未验 |
-| [T-113](T-113.md) | R5 多 provider hostd/移动端集成、跨平台 CI 与实体 Android 总门禁 | active；依赖 T-111/T-112 |
+| [T-113](T-113.md) | R5 多 provider hostd/移动端集成、跨平台 CI 与实体 Android 总门禁 | active；T-112 已完成，受 T-111 与最终总门禁阻塞 |
 | [T-114](T-114.md) | UACP QuestionSet、多选/自由文本回答与 Android 共享交互 | completed；本地总门禁通过，不代表 R5 完成 |
 | [T-115](T-115.md) | R4 自有 Ubuntu、真实 FCM、蜂窝与实体 arm64 release/physical gate | active |
 
@@ -26,6 +25,7 @@
 | [T-108](T-108.md) | Android Compose 纵切与 emulator 验收 | 通过，2026-08-10 |
 | [T-109](T-109.md) | 实体 arm64 Android 最终门禁 | R3 通过，2026-08-10 |
 | [T-110](T-110.md) | R4 自有 relay、跨公网 E2EE、FCM/恢复实现与进程树终止 | implementation merged，PR #11，2026-08-11；实体验收转 T-115 |
+| [T-112](T-112.md) | R5 Claude Agent SDK Broker、真实流式会话、permissions 与恢复 | 真实 SDK managed-session 验收通过，2026-08-11；移动端总门禁转 T-113 |
 
 ## 冻结
 

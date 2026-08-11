@@ -64,13 +64,14 @@ pub struct VerifySummary {
     pub claude_sidecar_files: usize,
     pub claude_sidecar_records: usize,
     pub claude_sidecar_auth_failure_files: usize,
+    pub claude_sidecar_acceptance_files: usize,
 }
 
 impl fmt::Display for VerifySummary {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "{} file(s), {} record(s) (codex: {}, acp-claude: {}, opencode: {}, claude-sidecar: {} file(s)/{} record(s), authentication-failure-only: {})",
+            "{} file(s), {} record(s) (codex: {}, acp-claude: {}, opencode: {}, claude-sidecar: {} file(s)/{} record(s), acceptance: {}, authentication-failure-only: {})",
             self.files,
             self.records,
             self.codex_files,
@@ -78,6 +79,7 @@ impl fmt::Display for VerifySummary {
             self.opencode_files,
             self.claude_sidecar_files,
             self.claude_sidecar_records,
+            self.claude_sidecar_acceptance_files,
             self.claude_sidecar_auth_failure_files
         )
     }
@@ -87,6 +89,7 @@ impl fmt::Display for VerifySummary {
 pub struct ClaudeSidecarVerifySummary {
     pub files: usize,
     pub records: usize,
+    pub acceptance_files: usize,
     pub auth_failure_files: usize,
 }
 
@@ -229,6 +232,7 @@ pub fn verify_workspace(workspace: &Path) -> Result<VerifySummary, FixtureVerify
     summary.claude_sidecar_files = claude.files;
     summary.claude_sidecar_records = claude.records;
     summary.claude_sidecar_auth_failure_files = claude.auth_failure_files;
+    summary.claude_sidecar_acceptance_files = claude.acceptance_files;
     Ok(summary)
 }
 
@@ -311,7 +315,7 @@ pub fn verify_claude_sidecar_paths(
                 label: label.clone(),
             }
         })?;
-        let expected_sdk_version = verify_claude_fixture_metadata(
+        let metadata = verify_claude_fixture_metadata(
             fixtures_root,
             &metadata_path,
             &sandbox,
@@ -323,13 +327,16 @@ pub fn verify_claude_sidecar_paths(
             &label,
             &sandbox,
             identity,
-            expected_sdk_version.as_deref(),
+            metadata.as_ref(),
             &mut issues,
         )?;
         summary.files += 1;
         summary.records += evidence.records;
         if evidence.auth_failure_complete() {
             summary.auth_failure_files += 1;
+        }
+        if evidence.acceptance_complete() {
+            summary.acceptance_files += 1;
         }
     }
 
@@ -396,13 +403,25 @@ fn claude_fixture_metadata_path(path: &Path) -> Option<PathBuf> {
     Some(path.with_file_name(format!("{stem}.metadata.json")))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClaudeExpectedOutcome {
+    AuthenticationFailure,
+    SimpleTurnSuccess,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClaudeFixtureMetadata {
+    provider_version: String,
+    expected_outcome: ClaudeExpectedOutcome,
+}
+
 fn verify_claude_fixture_metadata(
     root: &Path,
     path: &Path,
     sandbox: &Path,
     identity: &Identity,
     issues: &mut Vec<VerifyIssue>,
-) -> Result<Option<String>, FixtureVerifyError> {
+) -> Result<Option<ClaudeFixtureMetadata>, FixtureVerifyError> {
     let label = claude_fixture_label(root, path);
     let contents = fs::read_to_string(path).map_err(|source| FixtureVerifyError::Read {
         label: label.clone(),
@@ -450,14 +469,13 @@ fn verify_claude_fixture_metadata(
         issues.push(issue(
             &label,
             1,
-            "Claude fixture metadata fields do not match the closed failure-evidence contract",
+            "Claude fixture metadata fields do not match the closed evidence contract",
             None,
         ));
     }
     for (field, expected_value) in [
         ("capture", "real_provider"),
         ("provider", "@anthropic-ai/claude-agent-sdk"),
-        ("expected_outcome", "authentication_failure"),
     ] {
         if object.get(field).and_then(Value::as_str) != Some(expected_value) {
             issues.push(issue(
@@ -468,26 +486,54 @@ fn verify_claude_fixture_metadata(
             ));
         }
     }
-    if object.get("acceptance_eligible").and_then(Value::as_bool) != Some(false) {
-        issues.push(issue(
-            &label,
-            1,
-            "authentication-failure fixture must not be acceptance eligible",
-            Some("/acceptance_eligible"),
-        ));
-    }
-    match object.get("provider_version").and_then(Value::as_str) {
-        Some(version) if !version.is_empty() => Ok(Some(version.to_owned())),
+    let expected_outcome = match object.get("expected_outcome").and_then(Value::as_str) {
+        Some("authentication_failure") => Some(ClaudeExpectedOutcome::AuthenticationFailure),
+        Some("simple_turn_success") => Some(ClaudeExpectedOutcome::SimpleTurnSuccess),
         _ => {
             issues.push(issue(
                 &label,
                 1,
-                "Claude fixture provider_version must be a non-empty string",
-                Some("/provider_version"),
+                "Claude fixture metadata makes an unsupported evidence claim",
+                Some("/expected_outcome"),
             ));
-            Ok(None)
+            None
         }
+    };
+    let expected_acceptance = match expected_outcome {
+        Some(ClaudeExpectedOutcome::AuthenticationFailure) => Some(false),
+        Some(ClaudeExpectedOutcome::SimpleTurnSuccess) => Some(true),
+        None => None,
+    };
+    if expected_acceptance.is_some()
+        && object.get("acceptance_eligible").and_then(Value::as_bool) != expected_acceptance
+    {
+        issues.push(issue(
+            &label,
+            1,
+            "Claude fixture acceptance eligibility contradicts its expected outcome",
+            Some("/acceptance_eligible"),
+        ));
     }
+    let provider_version = object
+        .get("provider_version")
+        .and_then(Value::as_str)
+        .filter(|version| !version.is_empty());
+    if provider_version.is_none() {
+        issues.push(issue(
+            &label,
+            1,
+            "Claude fixture provider_version must be a non-empty string",
+            Some("/provider_version"),
+        ));
+    }
+    Ok(provider_version
+        .zip(expected_outcome)
+        .map(
+            |(provider_version, expected_outcome)| ClaudeFixtureMetadata {
+                provider_version: provider_version.to_owned(),
+                expected_outcome,
+            },
+        ))
 }
 
 #[derive(Debug, Default)]
@@ -497,11 +543,22 @@ struct ClaudeFixtureEvidence {
     saw_prompt_accepted: bool,
     saw_session_started: bool,
     saw_sdk_init: bool,
+    saw_success_assistant: bool,
+    saw_terminal_success: bool,
     saw_auth_failure_assistant: bool,
     saw_terminal_auth_failure: bool,
 }
 
 impl ClaudeFixtureEvidence {
+    const fn acceptance_complete(&self) -> bool {
+        self.saw_ready
+            && self.saw_prompt_accepted
+            && self.saw_session_started
+            && self.saw_sdk_init
+            && self.saw_success_assistant
+            && self.saw_terminal_success
+    }
+
     const fn auth_failure_complete(&self) -> bool {
         self.saw_ready
             && self.saw_prompt_accepted
@@ -517,7 +574,7 @@ fn parse_claude_sidecar_fixture(
     label: &str,
     sandbox: &Path,
     identity: &Identity,
-    expected_sdk_version: Option<&str>,
+    metadata: Option<&ClaudeFixtureMetadata>,
     issues: &mut Vec<VerifyIssue>,
 ) -> Result<ClaudeFixtureEvidence, FixtureVerifyError> {
     let contents = fs::read_to_string(path).map_err(|source| FixtureVerifyError::Read {
@@ -609,7 +666,7 @@ fn parse_claude_sidecar_fixture(
         collect_claude_sidecar_evidence(
             kind,
             payload,
-            expected_sdk_version,
+            metadata.map(|value| value.provider_version.as_str()),
             label,
             line,
             &mut session_ids,
@@ -622,39 +679,82 @@ fn parse_claude_sidecar_fixture(
         issues.push(issue(
             label,
             1,
-            "Claude failure fixture must contain exactly one consistent SDK session id",
+            "Claude fixture must contain exactly one consistent SDK session id",
             Some("/payload/session_id"),
         ));
     }
     for (present, category) in [
         (
             evidence.saw_ready,
-            "Claude failure fixture is missing sidecar ready",
+            "Claude fixture is missing sidecar ready",
         ),
         (
             evidence.saw_prompt_accepted,
-            "Claude failure fixture is missing local prompt acceptance",
+            "Claude fixture is missing local prompt acceptance",
         ),
         (
             evidence.saw_session_started,
-            "Claude failure fixture is missing a real SDK session start",
+            "Claude fixture is missing a real SDK session start",
         ),
         (
             evidence.saw_sdk_init,
-            "Claude failure fixture is missing the SDK init message",
-        ),
-        (
-            evidence.saw_auth_failure_assistant,
-            "Claude failure fixture is missing authentication_failed evidence",
-        ),
-        (
-            evidence.saw_terminal_auth_failure,
-            "Claude failure fixture is missing the terminal API-error result",
+            "Claude fixture is missing the SDK init message",
         ),
     ] {
         if !present {
             issues.push(issue(label, 1, category, None));
         }
+    }
+    match metadata.map(|value| value.expected_outcome) {
+        Some(ClaudeExpectedOutcome::AuthenticationFailure) => {
+            for (present, category) in [
+                (
+                    evidence.saw_auth_failure_assistant,
+                    "Claude authentication-failure fixture is missing authentication_failed evidence",
+                ),
+                (
+                    evidence.saw_terminal_auth_failure,
+                    "Claude authentication-failure fixture is missing the terminal API-error result",
+                ),
+            ] {
+                if !present {
+                    issues.push(issue(label, 1, category, None));
+                }
+            }
+            if evidence.saw_terminal_success {
+                issues.push(issue(
+                    label,
+                    1,
+                    "Claude authentication-failure fixture contains a successful result",
+                    Some("/payload/event/is_error"),
+                ));
+            }
+        }
+        Some(ClaudeExpectedOutcome::SimpleTurnSuccess) => {
+            for (present, category) in [
+                (
+                    evidence.saw_success_assistant,
+                    "Claude acceptance fixture is missing a non-error assistant message",
+                ),
+                (
+                    evidence.saw_terminal_success,
+                    "Claude acceptance fixture is missing the terminal success result",
+                ),
+            ] {
+                if !present {
+                    issues.push(issue(label, 1, category, None));
+                }
+            }
+            if evidence.saw_auth_failure_assistant || evidence.saw_terminal_auth_failure {
+                issues.push(issue(
+                    label,
+                    1,
+                    "Claude acceptance fixture contains authentication-failure evidence",
+                    Some("/payload/event"),
+                ));
+            }
+        }
+        None => {}
     }
     Ok(evidence)
 }
@@ -707,18 +807,32 @@ fn collect_claude_sidecar_evidence(
                 {
                     evidence.saw_auth_failure_assistant = true;
                 }
+                Some("assistant")
+                    if event
+                        .get("blocks")
+                        .and_then(Value::as_array)
+                        .is_some_and(|blocks| {
+                            blocks.iter().any(|block| {
+                                block.get("kind").and_then(Value::as_str) == Some("text")
+                                    && block
+                                        .get("text")
+                                        .and_then(Value::as_str)
+                                        .is_some_and(|text| !text.is_empty())
+                            })
+                        }) =>
+                {
+                    evidence.saw_success_assistant = true;
+                }
                 Some("result") => {
                     let is_error = event.get("is_error").and_then(Value::as_bool);
-                    if is_error == Some(false) {
-                        issues.push(issue(
-                            label,
-                            line,
-                            "authentication-failure fixture contains a successful result",
-                            Some("/payload/event/is_error"),
-                        ));
-                    }
-                    if is_error == Some(true) {
-                        evidence.saw_terminal_auth_failure = true;
+                    match is_error {
+                        Some(false)
+                            if event.get("subtype").and_then(Value::as_str) == Some("success") =>
+                        {
+                            evidence.saw_terminal_success = true;
+                        }
+                        Some(true) => evidence.saw_terminal_auth_failure = true,
+                        _ => {}
                     }
                 }
                 _ => {}

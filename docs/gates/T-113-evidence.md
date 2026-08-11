@@ -32,9 +32,9 @@ Session 也可通过 `ResumeSession` alias 回到同一 runtime actor，raw prov
 LAN sessions ses_aad3bcfecbad149a,ses_0177cdb6084b62b9 stopped cleanly
 ```
 
-这只证明 OpenCode + Claude 两个 runtime 同驻、bootstrap 与 clean shutdown。Claude Session 是
-未绑定 provisional Session，没有成功 prompt/auth 证据；Codex 未参加该命令，因此不能称为三家
-真实会话同驻。
+这条历史命令只证明 OpenCode + Claude 两个 runtime 同驻、bootstrap 与 clean shutdown。Claude
+随后已用独立真实 SDK probe 闭合成功 turn/人工交互/恢复，但 Codex 未参加同一运行，因此仍不能称为
+三家真实会话同驻。
 
 宿主编排现有 9 条 deterministic test 覆盖多 worker、scoped route、interrupt、discovered
 Session resume alias、Idle/NewTurn structured receipt delivery、无 receipt/Steer 保持 Pending、
@@ -76,14 +76,14 @@ arm64-v8a + x86_64 release Rust/UniFFI
 `claude-sidecar`、workspace test 与 fixtures verify。fixture summary：
 
 ```text
-8 file(s), 368 record(s)
+8 file(s), 369 record(s)
 codex: 3, acp-claude: 1, opencode: 3,
-claude-sidecar: 1 file / 6 records, authentication-failure-only: 1
+claude-sidecar: 1 file / 7 records, acceptance: 1, authentication-failure-only: 0
 ```
 
 隔离安装精确 Codex `0.147.0` 后，`cargo xtask schema diff` exit 0：Codex `0.147.0`、OpenCode `1.18.16`、ACP schema `1.18.0`，
 共 288 JSON files，required-surface 内外 0 drift。该静态结果不能发现 T-111 真实 `/event` 违反
-同版本 `/doc` 的 payload drift，也不能把 Claude authentication-failure-only 变成成功证据。
+同版本 `/doc` 的 payload drift；Claude 成功证据来自真实 SDK probe，不由 schema diff 推断。
 
 首次 clean workspace test 编译遇到一次 Windows rustc `STATUS_STACK_BUFFER_OVERRUN`；同一候选树、
 同一 clean target 的 hostd all-targets 定向复跑全部通过，随后完整 `cargo xtask ci` 复跑 exit 0。
@@ -101,9 +101,9 @@ canonical pump 尚需最终真实 provider 重跑；Claude 本地 SDK input queu
 
 | 门禁 | 状态 | 说明 |
 |---|---|---|
-| OpenCode + Claude dual runtime bootstrap | **通过（本地）** | 上述命令；Claude 仅 provisional |
-| Codex + OpenCode + Claude 三家真实 Session 同驻 | **未通过** | 缺 Claude successful turn，也没有三家同一运行证据 |
-| 三家 streaming/history/waiting-human/reconnect | **未通过** | OpenCode 部分通过；Claude success 缺失 |
+| OpenCode + Claude dual runtime bootstrap | **通过（本地）** | 历史同驻命令 + Claude 独立真实 acceptance probe |
+| Codex + OpenCode + Claude 三家真实 Session 同驻 | **未通过** | OpenCode stable live contract drift；没有三家同一运行证据 |
+| 三家 streaming/history/waiting-human/reconnect | **未通过** | Claude 已通过；OpenCode stable live/reconnect 仍 fail-closed |
 | Resume / queue / steer / interrupt contract | **focused 实现/测试通过** | canonical Resume alias、NewTurn receipt delivery、Steer Pending；需真实 provider + Android 纵切 |
 | host/provider crash 与 mobile cursor resume | **未通过 R5 最终纵切** | R3 Codex LAN 历史证据不能自动覆盖新 provider |
 | `cargo xtask ci` | **最新集成候选本地通过** | 全入口 exit 0；不替代 exact-commit remote CI |
@@ -118,15 +118,15 @@ canonical pump 尚需最终真实 provider 重跑；Claude 本地 SDK input queu
 - `CapabilityProbe` 目前只能表达 `Supported` / `NotVerified`，尚未把断线、OAuth auth failure 与
   明确 upstream block 映射为 `UnavailableOnThisConnection` / `AuthenticationRequired` /
   `UpstreamBlocked`；
-- Claude typed history read 已接入 exact-dir、discovered-session、有界分页守卫；无凭据探测没有非空
-  Session/message，故仍缺真实 `HistoryRead` 验收。discovered Session 使用 `ProviderManaged`，不冒充原生 CLI/GUI ownership；
+- Claude typed history read 已用真实新建 session 得到非空官方消息页；permission allow/deny、QuestionSet、
+  interrupt 与新进程 resume 也已通过。discovered Session 使用 `ProviderManaged`，不冒充原生 CLI/GUI ownership；
 - OpenCode SSE 已按 event session 精确路由并按 event id 去重，但 provider reconnect 仍明确
   `lossless_replay = false`；真实 gap/forced-disconnect 证据缺失。SSE reader 已与 command dispatch
   解耦，Attention 只有精确 typed SSE 回执才完成；真实 OpenCode `/doc`/`/event` 漂移仍 fail-closed。
 
 ## 6. 完成条件
 
-T-113 只有在 T-111/T-112 真实 provider 空缺闭合、三家同驻纵切、`cargo xtask ci`、跨平台
+T-113 只有在 T-111 上游空缺闭合、三家同驻纵切、`cargo xtask ci`、跨平台
 CI exact commit runs 与实体 arm64 Android 真实 Wi-Fi 纵切全部通过后才能完成。R4 合并后还必须
 在最终 SHA 重跑蜂窝/relay；当前 LAN 证据不等于公网恢复。
 
@@ -138,9 +138,10 @@ CI exact commit runs 与实体 arm64 Android 真实 Wi-Fi 纵切全部通过后�
 - candidate 包含 `origin/main` 且工作树 clean；
 - 可运行的 native Codex、OpenCode CLI 与 schema 精确版本一致；
 - Claude CLI 已登录、bridge 仍钉定官方 SDK、Node 至少为 22；
-- 恰好一台非模拟器 arm64 Android，真实 Wi-Fi、无 VPN、无 `adb reverse`。
+- 恰好一台非模拟器 arm64 Android、真实 Wi-Fi、到 PC 同链路直达且无 `adb reverse`；若系统叠加 VPN，
+  只有目标 PC 地址明确经 `wlan0` 且无网关转发时才接受为 LAN bypass。
 
-2026-08-11 在本机实际运行完整预检，安全结果为：Codex `0.147.0`、OpenCode/schema
-`1.18.16`、Claude SDK `0.3.226`、Node `22.13.1` 均可定位；当前阻塞码是
-`claude_auth_missing` 与 `exactly_one_android_device_required`。开发中的未提交脚本同时正确触发
-`working_tree_dirty`。预检因此在任何 Rust/Android 总构建前 exit 1，未把外部空缺误记为通过。
+2026-08-11 在提交 `3d3bca5` 上实际运行完整预检 exit 0：Codex `0.147.0`、OpenCode/schema
+`1.18.16`、Claude SDK `0.3.226`、Node `22.13.1`、Claude 登录、实体 arm64、同链路 Wi-Fi 与空
+`adb reverse` 全部成立。手机的默认网络含 VPN transport，但对目标 PC 的实际 route 是 `wlan0`
+直连且没有 `via` 网关，因此记录为 `wifi-direct-vpn-bypass`，没有通过删除 VPN 检查消绿。
