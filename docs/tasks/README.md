@@ -6,7 +6,7 @@
 
 | 卡 | 范围 | 状态 |
 |---|---|---|
-| [T-110](T-110.md) | R4 自有 Ubuntu rendezvous/P2P/relay、跨公网 E2EE、FCM、网络切换、活进程树终止 | active |
+| [T-115](T-115.md) | R4 自有 Ubuntu、真实 FCM、蜂窝与实体 arm64 release/physical gate | active |
 
 ## 已完成
 
@@ -21,6 +21,7 @@
 | [T-107](T-107.md) | hostd LAN broker、projection journal、配对/认证、Rust mobile core | 通过，2026-08-10 |
 | [T-108](T-108.md) | Android Compose 纵切与 emulator 验收 | 通过，2026-08-10 |
 | [T-109](T-109.md) | 实体 arm64 Android 最终门禁 | R3 通过，2026-08-10 |
+| [T-110](T-110.md) | R4 自有 relay、跨公网 E2EE、FCM/恢复实现与进程树终止 | implementation merged，PR #11，2026-08-11；实体验收转 T-115 |
 
 ## 冻结
 

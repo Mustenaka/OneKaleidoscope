@@ -1,13 +1,13 @@
 # OneKaleidoscope 当前状态
 
-> 生效：2026-08-10
+> 生效：2026-08-11
 > 进度基线：R3 / T-109 实体 arm64 Android 最终门禁通过；提交 SHA 与本机证据见
 > [T-109 门禁结果](gates/T-109-result.md)。
 
 ## 1. 当前结论
 
-**R0、R1、R2、R3 已完成；R4 自有 Ubuntu 远程连接已由
-[T-110](tasks/T-110.md) 开卡。**
+**R0、R1、R2、R3 已完成；R4 功能实现已通过 [T-110](tasks/T-110.md) / PR #11
+合并，release/physical acceptance 仍由 [T-115](tasks/T-115.md) 持续，R4 未标 completed。**
 
 已经跑通并持久化验证的 PC 端纵切是：
 
@@ -51,6 +51,7 @@ approval decline、90 秒 OEM 后台、外部 force-stop cursor 恢复与 durabl
 | T-106 | UACP `0.3.0` mobile contract、projection 独立游标、可信 command/content ingress、TRANSPORT `0.1.0` |
 | T-107 | pinned TLS LAN Broker、projection journal、可信 mobile ingress、Rust `MobileClient`、真实 Codex 冷重连纵切；两套三平台 CI 全绿 |
 | T-108 / T-109 | Android Compose 产品 App、Keystore/加密凭据、双 ABI UniFFI、七类真实 projection；API 35 emulator 与实体 arm64 Wi-Fi/审批/后台/冷启游标恢复/吊销门禁通过 |
+| T-110 / R4 implementation | 自有 iroh relay、跨公网 pinned TLS E2EE、FCM FID/outbox、网络/冷启 cursor 恢复、三平台进程树终止；PR #11 合并，最终实现 SHA `603dfd8` 自动化全绿 |
 
 ## 3. 当前可用能力
 
@@ -58,9 +59,9 @@ approval decline、90 秒 OEM 后台、外部 force-stop cursor 恢复与 durabl
 |---|---|---|
 | `kaleido-state` | canonical state、内容寻址存储、八类 projection builder、持久 projection journal、device command outbox | projection journal 尚无物理 checkpoint/compaction |
 | `kaleido-adapter-codex` | 真实 Codex JSON-RPC 会话、流式输出、file-change approval、prompt runtime ack | 尚无 interrupt/真实 steer delivery |
-| `kaleido-hostd` | 常驻 Codex runtime、pinned TLS 配对/认证、订阅、content/command gateway、断线恢复；R4 候选含自托管 iroh presence/P2P/relay、durable remote revoke | 公网候选仍须在自有 Ubuntu + 蜂窝实体机闭合 |
-| `kaleido-core` | 产品级 `MobileClient`、pair/connect/reconnect/subscribe/command/content、逐 key last-good cache；R4 候选含 pinned control、custom relay、网络 epoch 与 durable FCM outbox | iOS 产品接入仍在 R8；公网恢复仍待实体门禁 |
-| Android | Compose Project/Session/Transcript/Live/Queue/Attention/Capability，hardware-backed Keystore P-256、加密凭据、离线缓存与 cursor resume；R4 候选含 FCM FID、后台 WorkManager 与网络切换回调 | 蜂窝、真实 FCM、冷启与吊销公网组合门禁仍 pending |
+| `kaleido-hostd` | 常驻 Codex runtime、pinned TLS 配对/认证、订阅、content/command gateway、断线恢复；R4 已合并自托管 iroh presence/P2P/relay、durable remote revoke | 自有 Ubuntu + 蜂窝实体机 release gate 仍 pending |
+| `kaleido-core` | 产品级 `MobileClient`、pair/connect/reconnect/subscribe/command/content、逐 key last-good cache；R4 已合并 pinned control、custom relay、网络 epoch 与 durable FCM outbox | iOS 产品接入仍在 R8；公网实体恢复仍待 T-115 |
+| Android | Compose Project/Session/Transcript/Live/Queue/Attention/Capability，hardware-backed Keystore P-256、加密凭据、离线缓存与 cursor resume；R4 已合并 FCM FID、后台 WorkManager 与网络切换回调 | 蜂窝、真实 FCM、冷启与吊销公网组合门禁仍 pending |
 | iOS | Swift 绑定可生成并编译 | 尚无产品 App，归 R8 |
 
 因此当前已经交付并在实体 arm64 Android 上验证了 R3 Android LAN 纵切。公网 relay、
@@ -75,23 +76,23 @@ approval decline、90 秒 OEM 后台、外部 force-stop cursor 恢复与 durabl
 | 3 | [T-108](tasks/T-108.md) | Android Compose 项目/会话/实时/队列/Attention、冷启与断线恢复 |
 | 4 | [T-109](tasks/T-109.md) | 实体 arm64 Wi-Fi、硬件密钥、真实审批、OEM 后台、force-stop 与吊销最终门禁 |
 
-当前活动任务是 [T-110](tasks/T-110.md)：Ubuntu rendezvous/P2P/relay、跨公网 E2EE、
-Android FCM、网络切换与活进程树终止。
+当前活动任务是 [T-115](tasks/T-115.md)：只执行 R4 自有 Ubuntu、真实 FCM、蜂窝与
+实体 arm64 release/physical gate；不继续扩展 R4 功能代码。
 
-截至 2026-08-11，T-110 的实现候选已闭合 ADR-0024、REMOTE_CONTROL 0.1、
+截至 2026-08-11，T-110 的实现已闭合 ADR-0024、REMOTE_CONTROL 0.1、
 自有 iroh relay、复用 R3 pinned TLS 的公网数据面、FCM FID、逐 key cursor 恢复；本轮审核又
 补齐 route-scoped push、lost-ack outbox、Ubuntu ack 后主动 relay 断链、致命 control 错误断链、
-Windows Job Object 与真实 iroh server 集成门禁。旧 SHA 的 CI 绿灯不计，PR #11 的最终 SHA
-本地 `cargo xtask ci`、Android AAR/APK/JVM/lint 与显式 iroh server 集成门禁已通过；三平台与
-Android CI 仍须在最终 SHA 重跑。这不是 R4 完成声明：自有 Ubuntu 实例的 DNS/ACME/FCM
-运行及实体 arm64 Android 蜂窝公网纵切尚未执行，真实门禁保持
-[pending](gates/T-110-evidence.md)。
+Windows Job Object 与真实 iroh server 集成门禁。PR #11 最终实现 SHA `603dfd8` 的本地
+`cargo xtask ci`、Windows/macOS/Linux、Ubuntu relay integration、Android clean build/lint/JVM
+与 API 35 instrumentation 全绿并已合并为 `f7f7b3b`。这是 implementation merged，不是 R4
+completed：自有 Ubuntu 的 DNS/ACME/FCM 运行及实体 arm64 Android 蜂窝公网纵切尚未执行，
+真实门禁继续保持 [pending](gates/T-110-evidence.md)，由 T-115 承接。
 
 ## 5. 尚未完成的后续里程碑
 
 | 里程碑 | 内容 |
 |---|---|
-| R4 / [T-110](tasks/T-110.md) | Ubuntu rendezvous/relay、跨公网 E2EE、推送、活进程树终止 |
+| R4 release gate / [T-115](tasks/T-115.md) | 自有 Ubuntu、真实 FCM、蜂窝/实体 arm64 全纵切与零 canary 验收 |
 | R5 | OpenCode、Claude Broker 管理会话；先结清 OpenCode D-B11 |
 | R6 | 跨 Agent workflow 执行器与手机 WorkflowBoard |
 | R7 | 三家 CLI/GUI 六格真实验收 |
@@ -102,9 +103,7 @@ Android CI 仍须在最终 SHA 重跑。这不是 R4 完成声明：自有 Ubunt
 
 | ID | 内容 | 结清点 |
 |---|---|---|
-| D-B2 | R4 候选已用 Windows Job Object、Unix process group 和真实存活子树测试修复；待最终 SHA 三平台 CI 固化证据 | T-110 |
 | D-B6 / D-B7 | Unix 反斜杠与 macOS `/var` 符号链接路径规则 | R9 |
-| D-B8 | R4 产品 remote 边界已按 canonical sandbox 优先于 home 修复并做用户名/路径零泄漏测试；待最终 SHA CI 固化证据 | T-110 |
 | D-B11 | OpenCode 实机与快照版本对齐 | R5 |
 | P-2 | Codex approval 没有真实过期时间 | UI 必须诚实显示无过期时间 |
 

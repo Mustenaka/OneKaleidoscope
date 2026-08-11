@@ -106,7 +106,9 @@ force-stop 精确 cursor 恢复与 durable revoke；结果见 [T-109-result.md](
 
 ## R4 — 自有 Ubuntu 远程连接
 
-状态：**active**，任务卡 [T-110](tasks/T-110.md)。
+状态：**implementation merged**（[T-110](tasks/T-110.md)，PR #11）；release/physical
+acceptance 仍为 **pending**，由 [T-115](tasks/T-115.md) 执行并回填
+[T-110 evidence](gates/T-110-evidence.md)。这不是 R4 completed 声明。
 
 产出：
 
