@@ -1382,6 +1382,39 @@ mod executable_tests {
         Ok(())
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn descendant_exit_proves_cleanup_even_if_the_force_request_raced_with_taskkill() {
+        let force = Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "process is already terminating",
+        ));
+
+        assert!(combine_descendant_termination(force, Ok(())).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn descendant_force_failure_still_fails_if_the_exact_handle_does_not_exit(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let force = Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "force request rejected",
+        ));
+        let wait = Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "exact handle remained live",
+        ));
+
+        let Err(error) = combine_descendant_termination(force, wait) else {
+            return Err("a live exact handle unexpectedly proved cleanup".into());
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("force request rejected"));
+        assert!(error.to_string().contains("exact handle remained live"));
+        Ok(())
+    }
+
     #[test]
     fn explicit_schema_tool_path_has_priority() {
         #[cfg(windows)]
@@ -1998,16 +2031,35 @@ mod process_handle_ffi {
         }
 
         pub(super) fn terminate_and_wait(&self, timeout: Duration) -> io::Result<()> {
-            for handle in &self.handles {
-                handle.terminate()?;
-            }
+            let force_results = self
+                .handles
+                .iter()
+                .map(OwnedProcessHandle::terminate)
+                .collect::<Vec<_>>();
             let started = Instant::now();
-            for handle in &self.handles {
+            for (handle, force_result) in self.handles.iter().zip(force_results) {
                 let remaining = timeout.saturating_sub(started.elapsed());
-                handle.wait_for_exit(remaining)?;
+                super::combine_descendant_termination(
+                    force_result,
+                    handle.wait_for_exit(remaining),
+                )?;
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(windows)]
+fn combine_descendant_termination(force: io::Result<()>, wait: io::Result<()>) -> io::Result<()> {
+    match (force, wait) {
+        (_, Ok(())) => Ok(()),
+        (Ok(()), Err(wait)) => Err(wait),
+        (Err(force), Err(wait)) => Err(io::Error::new(
+            wait.kind(),
+            format!(
+                "descendant force request failed ({force}); exact handle did not exit ({wait})"
+            ),
+        )),
     }
 }
 

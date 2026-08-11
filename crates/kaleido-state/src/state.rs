@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 
 use kaleido_proto::attention::{AttentionItem, AttentionState, AttentionSubject};
 use kaleido_proto::capability::{Capability, RuntimeCapabilities};
-use kaleido_proto::command::{CommandAck, CommandOutcome};
+use kaleido_proto::command::{CommandAck, CommandOutcome, RuntimeAcceptanceKind};
 use kaleido_proto::content::ContentRef;
 use kaleido_proto::effect::{DiagnosticRecord, SessionSnapshot, StateEffect};
 use kaleido_proto::host::{Host, Project, ProviderRuntime, SessionCounts};
@@ -134,6 +134,15 @@ impl CanonicalState {
 
     pub fn queue_entry(&self, entry_id: &QueueEntryId) -> Option<&QueueEntry> {
         self.queue.get(entry_id)
+    }
+
+    pub fn queue_command_id(&self, entry_id: &QueueEntryId) -> Option<&CommandId> {
+        self.acks.iter().find_map(|ack| match &ack.outcome {
+            CommandOutcome::Enqueued {
+                entry_id: acknowledged,
+            } if acknowledged == entry_id => Some(&ack.command_id),
+            _ => None,
+        })
     }
 
     /// Resolves only references that are actually reachable from canonical
@@ -340,7 +349,24 @@ impl CanonicalState {
                 runtime.capabilities = capabilities.clone();
             }
             StateEffect::ProjectUpserted { project } => {
-                self.projects.insert(project.id.clone(), project.clone());
+                let mut merged = project.clone();
+                if let Some(existing) = self.projects.get(&project.id) {
+                    let mut bindings = existing.bindings.clone();
+                    for incoming in &project.bindings {
+                        if let Some(existing_binding) = bindings
+                            .iter_mut()
+                            .find(|binding| binding.id == incoming.id)
+                        {
+                            *existing_binding = incoming.clone();
+                        } else {
+                            bindings.push(incoming.clone());
+                        }
+                    }
+                    merged.bindings = bindings;
+                    merged.last_activity_at_ms =
+                        merged.last_activity_at_ms.max(existing.last_activity_at_ms);
+                }
+                self.projects.insert(merged.id.clone(), merged);
             }
             StateEffect::SessionUpserted { session } => {
                 // Rule R-P7 in the write path: a live binding is only accepted
@@ -362,8 +388,8 @@ impl CanonicalState {
                 ) {
                     let candidate_runtime = self.live_runtime_of(session)?;
                     let has_runtime_acceptance = self.acks.iter().any(|ack| {
-                        self.accepted_runtime_turn(ack, &candidate_runtime.id)
-                            .is_some_and(|turn| turn.session_id == session.id)
+                        self.accepted_runtime_session(ack, &candidate_runtime.id)
+                            .is_some_and(|accepted| accepted.id == session.id)
                     });
                     if !has_runtime_acceptance {
                         return Err(StateError::ControllingBindingWithoutRuntimeAcceptance);
@@ -466,7 +492,12 @@ impl CanonicalState {
                 self.attention.insert(item.id.clone(), item.clone());
             }
             StateEffect::CommandAcknowledged { ack } => {
-                if let CommandOutcome::AcceptedByRuntime { binding_handle } = &ack.outcome {
+                if let CommandOutcome::AcceptedByRuntime {
+                    session_id,
+                    acceptance_kind,
+                    binding_handle,
+                } = &ack.outcome
+                {
                     let accepted_locally = self.acks.iter().any(|existing| {
                         existing.command_id == ack.command_id
                             && matches!(existing.outcome, CommandOutcome::AcceptedLocally { .. })
@@ -481,10 +512,9 @@ impl CanonicalState {
                     if already_accepted_by_runtime {
                         return Err(StateError::DuplicateRuntimeAcknowledgement);
                     }
-                    let turn = self.remote_command_turn(&ack.command_id)?;
-                    let session = self.sessions.get(&turn.session_id).ok_or_else(|| {
+                    let session = self.sessions.get(session_id).ok_or_else(|| {
                         StateError::UnknownSession {
-                            session_id: turn.session_id.clone(),
+                            session_id: session_id.clone(),
                         }
                     })?;
                     let runtime_matches = self
@@ -492,6 +522,12 @@ impl CanonicalState {
                         .is_some_and(|runtime| runtime.id == binding_handle.runtime_id);
                     if !runtime_matches {
                         return Err(StateError::RuntimeAcknowledgementRuntimeMismatch);
+                    }
+                    if *acceptance_kind == RuntimeAcceptanceKind::PromptTurn {
+                        let turn = self.remote_command_turn(&ack.command_id)?;
+                        if turn.session_id != *session_id {
+                            return Err(StateError::RuntimeAcknowledgementRuntimeMismatch);
+                        }
                     }
                 }
                 self.acks.push(ack.clone());
@@ -517,7 +553,7 @@ impl CanonicalState {
     fn has_runtime_acceptance_for(&self, runtime_id: &ProviderRuntimeId) -> bool {
         self.acks
             .iter()
-            .any(|ack| self.accepted_runtime_turn(ack, runtime_id).is_some())
+            .any(|ack| self.accepted_runtime_session(ack, runtime_id).is_some())
     }
 
     fn live_runtime_of(&self, session: &Session) -> Result<&ProviderRuntime, StateError> {
@@ -534,22 +570,26 @@ impl CanonicalState {
             })
     }
 
-    fn accepted_runtime_turn<'a>(
+    fn accepted_runtime_session<'a>(
         &'a self,
         ack: &CommandAck,
         runtime_id: &ProviderRuntimeId,
-    ) -> Option<&'a Turn> {
-        let CommandOutcome::AcceptedByRuntime { binding_handle } = &ack.outcome else {
+    ) -> Option<&'a Session> {
+        let CommandOutcome::AcceptedByRuntime {
+            session_id,
+            binding_handle,
+            ..
+        } = &ack.outcome
+        else {
             return None;
         };
         if binding_handle.runtime_id != *runtime_id {
             return None;
         }
-        let turn = self.remote_command_turn(&ack.command_id).ok()?;
-        let session = self.sessions.get(&turn.session_id)?;
+        let session = self.sessions.get(session_id)?;
         self.runtime_of(session)
             .is_some_and(|runtime| runtime.id == *runtime_id)
-            .then_some(turn)
+            .then_some(session)
     }
 
     fn remote_command_turn(&self, command_id: &CommandId) -> Result<&Turn, StateError> {
@@ -762,7 +802,11 @@ fn attention_content_refs(item: &AttentionItem) -> Vec<&ContentRef> {
         AttentionSubject::Approval { request } => std::iter::once(&request.summary_ref)
             .chain(request.detail_ref.iter())
             .collect(),
-        AttentionSubject::Question { request } => vec![&request.prompt_ref],
+        AttentionSubject::Question { request } => request
+            .questions
+            .iter()
+            .map(|question| &question.prompt_ref)
+            .collect(),
         AttentionSubject::WorkflowGate { request } => vec![&request.prompt_ref],
         AttentionSubject::ConnectionFault { .. } => Vec::new(),
     };
@@ -772,6 +816,16 @@ fn attention_content_refs(item: &AttentionItem) -> Vec<&ContentRef> {
     } = &item.state
     {
         references.push(reference);
+    }
+    if let AttentionState::Answered {
+        question_answers, ..
+    } = &item.state
+    {
+        references.extend(
+            question_answers
+                .iter()
+                .filter_map(|answer| answer.free_form_ref.as_ref()),
+        );
     }
     references
 }

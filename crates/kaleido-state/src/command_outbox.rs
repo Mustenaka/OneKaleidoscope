@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use kaleido_proto::command::{
     Actor, CommandAck, CommandEnvelope, CommandOutcome, DeviceCommandRequest,
 };
-use kaleido_proto::ids::{CommandId, ContentId, DeviceId};
+use kaleido_proto::ids::{AttentionId, CommandId, ContentId, DeviceId};
 use kaleido_proto::projection::ProjectionEnvelope;
 use serde::{Deserialize, Serialize};
 
@@ -235,6 +235,17 @@ impl DeviceCommandOutbox {
             })
             .map(|record| record.envelope.command_id.clone())
             .collect()
+    }
+
+    pub(crate) fn has_unfinished_attention(&self, attention_id: &AttentionId) -> bool {
+        self.by_key.values().any(|record| {
+            record.status != OutboxStatus::Completed
+                && matches!(
+                    &record.envelope.body,
+                    kaleido_proto::command::Command::RespondAttention { response }
+                        if &response.attention_id == attention_id
+                )
+        })
     }
 
     pub(crate) fn referenced_content_ids(&self) -> BTreeSet<ContentId> {

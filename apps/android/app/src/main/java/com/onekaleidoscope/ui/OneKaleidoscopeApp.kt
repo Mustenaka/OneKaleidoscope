@@ -146,7 +146,12 @@ private fun AppNavHost(
             }
         }
         composable(Routes.Attention) {
-            AttentionScreen(panel = state.attention, drafts = state.attentionDrafts, onAction = onAction)
+            AttentionScreen(
+                panel = state.attention,
+                drafts = state.attentionDrafts,
+                questionDrafts = state.questionDrafts,
+                onAction = onAction,
+            )
         }
         composable(Routes.Capabilities) {
             CapabilitiesScreen(panel = state.capabilities, onAction = onAction)

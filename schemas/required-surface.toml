@@ -11,7 +11,7 @@ supported_range = ">=0.146.0, <=0.147.0"
 
 [[tools]]
 name = "opencode"
-supported_range = "=1.18.8"
+supported_range = "=1.18.16"
 
 [[tools]]
 name = "acp"
@@ -707,6 +707,27 @@ name = "POST /session/{sessionID}/message"
 reason = "Required to submit a UACP prompt turn to OpenCode."
 
 [[entries]]
+id = "opencode.method.session-create"
+tool = "opencode"
+kind = "method"
+name = "POST /session"
+reason = "Required to create a session in the selected shared OpenCode runtime; this does not imply ownership of the server process."
+
+[[entries]]
+id = "opencode.method.session-prompt-async"
+tool = "opencode"
+kind = "method"
+name = "POST /session/{sessionID}/prompt_async"
+reason = "Required only as the capability-unverified legacy fallback when durable admission is unavailable."
+
+[[entries]]
+id = "opencode.method.v2-session-prompt"
+tool = "opencode"
+kind = "method"
+name = "POST /api/session/{sessionID}/prompt"
+reason = "Required to obtain a structured durable queue or steer admission receipt."
+
+[[entries]]
 id = "opencode.method.session-abort"
 tool = "opencode"
 kind = "method"
@@ -735,6 +756,20 @@ name = "POST /api/session/{sessionID}/permission/{requestID}/reply"
 reason = "Required by the recorder's v2 OpenCode permission approval and denial path."
 
 [[entries]]
+id = "opencode.method.v2-session-question-reply"
+tool = "opencode"
+kind = "method"
+name = "POST /api/session/{sessionID}/question/{requestID}/reply"
+reason = "Required to answer a structured multi-question OpenCode request without flattening it."
+
+[[entries]]
+id = "opencode.method.v2-session-question-reject"
+tool = "opencode"
+kind = "method"
+name = "POST /api/session/{sessionID}/question/{requestID}/reject"
+reason = "Required to reject a structured OpenCode question as a normal attention outcome."
+
+[[entries]]
 id = "opencode.method.event-subscribe"
 tool = "opencode"
 kind = "method"
@@ -746,7 +781,7 @@ id = "opencode.method.project-current"
 tool = "opencode"
 kind = "method"
 name = "GET /project/current"
-reason = "Required to prove the active OpenCode project root is the protected fixture sandbox."
+reason = "Required to prove the active OpenCode project root matches the configured canonical project binding."
 
 # OpenCode core, permission, and question schema types
 
@@ -770,6 +805,104 @@ tool = "opencode"
 kind = "type"
 name = "Part"
 reason = "Required to normalize OpenCode text, reasoning, tool, and file-change parts into UACP."
+
+[[entries]]
+id = "opencode.type.PromptInput"
+tool = "opencode"
+kind = "type"
+name = "PromptInput"
+reason = "Required to encode the v2 durable prompt admission request from generated upstream types."
+
+[[entries]]
+id = "opencode.type.SessionInputAdmitted"
+tool = "opencode"
+kind = "type"
+name = "SessionInputAdmitted"
+reason = "Required to prove queue or steer admission using the upstream session, message, delivery, and sequence receipt."
+
+[[entries]]
+id = "opencode.type.EventServerConnected"
+tool = "opencode"
+kind = "type"
+name = "EventServerConnected"
+reason = "Required to validate the live structured SSE subscription handshake."
+
+[[entries]]
+id = "opencode.type.EventPluginAdded"
+tool = "opencode"
+kind = "type"
+name = "EventPluginAdded"
+reason = "Required to fail closed on the plugin-added event emitted before session traffic instead of bypassing generated SSE validation."
+
+[[entries]]
+id = "opencode.type.EventSessionNextPromptAdmitted"
+tool = "opencode"
+kind = "type"
+name = "EventSessionNextPromptAdmitted"
+reason = "Required to validate the structured prompt-admission event, including its timestamp contract, before live capability evidence is accepted."
+
+[[entries]]
+id = "opencode.type.EventSessionCreated"
+tool = "opencode"
+kind = "type"
+name = "EventSessionCreated"
+reason = "Required to discover newly created OpenCode sessions from structured SSE."
+
+[[entries]]
+id = "opencode.type.EventSessionUpdated"
+tool = "opencode"
+kind = "type"
+name = "EventSessionUpdated"
+reason = "Required to project OpenCode session metadata changes in real time."
+
+[[entries]]
+id = "opencode.type.EventSessionDeleted"
+tool = "opencode"
+kind = "type"
+name = "EventSessionDeleted"
+reason = "Required to remove an OpenCode session projection after a structured deletion event."
+
+[[entries]]
+id = "opencode.type.EventSessionStatus"
+tool = "opencode"
+kind = "type"
+name = "EventSessionStatus"
+reason = "Required to project busy, retry, and idle OpenCode session status."
+
+[[entries]]
+id = "opencode.type.EventSessionIdle"
+tool = "opencode"
+kind = "type"
+name = "EventSessionIdle"
+reason = "Required to close a streamed turn only after the runtime reports idle."
+
+[[entries]]
+id = "opencode.type.EventSessionDiff"
+tool = "opencode"
+kind = "type"
+name = "EventSessionDiff"
+reason = "Required to validate structured diff notifications before projecting file changes."
+
+[[entries]]
+id = "opencode.type.EventMessageUpdated"
+tool = "opencode"
+kind = "type"
+name = "EventMessageUpdated"
+reason = "Required to project structured OpenCode user and assistant message lifecycles."
+
+[[entries]]
+id = "opencode.type.EventMessagePartUpdated"
+tool = "opencode"
+kind = "type"
+name = "EventMessagePartUpdated"
+reason = "Required to project structured OpenCode text and tool part updates."
+
+[[entries]]
+id = "opencode.type.EventMessagePartDelta"
+tool = "opencode"
+kind = "type"
+name = "EventMessagePartDelta"
+reason = "Required to project streaming OpenCode text deltas without polling history."
 
 [[entries]]
 id = "opencode.type.EventPermissionAsked"

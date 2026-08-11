@@ -2,7 +2,9 @@
 
 > 生效：2026-08-10（R3 最终门禁后更新）
 > 原 M1 与 T-001～T-014 已冻结/撤销。R0～R3 已完成，R1 携带的 UB-R1-S 已由
-> [T-102](tasks/T-102.md) 解除；下一里程碑是 R4。平台顺序见
+> [T-102](tasks/T-102.md) 解除；R4 功能实现已进入 `main`，release/physical acceptance 由
+> T-115 承接；独立 R5 provider 工作仍为 active。R5 不得把 LAN/provider 进展冒充 R4
+> 公网门禁。平台顺序见
 > [ADR-0013](adr/0013-platform-track-order.md)：Windows + Android 先行。
 
 ## 总原则
@@ -110,6 +112,10 @@ force-stop 精确 cursor 恢复与 durable revoke；结果见 [T-109-result.md](
 acceptance 仍为 **pending**，由 [T-115](tasks/T-115.md) 执行并回填
 [T-110 evidence](gates/T-110-evidence.md)。这不是 R4 completed 声明。
 
+PR #11 已把自有 relay、pinned remote control、FCM/网络恢复和进程树终止实现合并进主线；
+真实 Ubuntu rendezvous/relay、FCM、蜂窝切换与实体 Android 公网纵切仍未闭合。后续 R5
+最终远程验收必须在包含 R4 的 exact SHA 重跑；当前 LAN 结果不能替代。
+
 产出：
 
 - rendezvous、P2P 连接信息交换；
@@ -124,6 +130,10 @@ NAT 20 轮测试属于性能与容量数据，不再决定 relay 是否开发，
 
 ## R5 — 三家 Broker 管理会话
 
+状态：**active，未完成**。独立任务卡为 [T-111](tasks/T-111.md)、
+[T-112](tasks/T-112.md)、[T-113](tasks/T-113.md) 与合同前置
+[T-114](tasks/T-114.md)。
+
 依次加入 OpenCode、Claude Code：
 
 - OpenCode server REST + SSE；
@@ -132,7 +142,28 @@ NAT 20 轮测试属于性能与容量数据，不再决定 relay 是否开发，
 
 每加入一家，都必须复用相同 canonical state 和移动端投影，不能复制一套 provider 专属 UI。
 
-门禁：三家各完成流式 turn、历史、等待人工、断线恢复；缺失能力由 runtime capability 明示。
+当前证据：
+
+- OpenCode `1.18.16` 原样 OpenAPI → 规范化 → 生成链已接通，真实 `09-elicitation` question
+  fixture 通过；最新 generated product live probe 因同版本 `/doc`/`/event` 类型冲突及未声明
+  heartbeat fail-closed，D-B11/实时恢复仍 blocked；恢复即使解码后也诚实标为
+  `lossless_replay = false`；
+- Claude 官方 Agent SDK `0.3.226` sidecar 与 provisional Broker-managed Session 已接入；
+  真实 fixture 因 OAuth 过期以 `authentication_failed` 终止，只证明失败路径；
+- StructuredLanHost 已让真实 OpenCode server 与 Claude provisional runtime 同驻并 clean
+  shutdown；这不是三家真实会话纵切；
+- UACP `0.5.0` QuestionSet、scoped runtime ack、逐题单/多选/free-form、answer provenance
+  与共享 Android 交互已实现；最新 R4/R5 集成候选的完整 `cargo xtask ci` 与精确支持版本 schema
+  diff 已通过；`fc896be` 的 Android 双 ABI clean AAR/APK/lint/JVM 与 API 35 instrumentation
+  18 completed / 0 failed，T-114 合同保持完成；
+
+仍未通过：Claude 成功 turn/非空 history read 与真实 permission/question/interrupt/resume、OpenCode
+`/doc`/`/event` 漂移解除与实时/恢复/其余真实动作矩阵、三家同驻、Windows/macOS/Linux + Android CI、R5 实体 arm64 Android 纵切，以及
+R4 合并后的公网重跑。
+
+最终门禁：三家各完成真实流式 turn、历史、等待人工、断线恢复；缺失能力由 runtime
+capability 明示；`cargo xtask ci`、跨平台 CI 和实体 Android 纵切全部有 exact commit 证据。
+任一项缺失时 R5 保持 active。
 
 ## R6 — 跨 Agent 工作流
 

@@ -19,7 +19,10 @@ data class AppUiState(
     val promptAction: ActionAvailability = ActionAvailability.disabled("选择一个会话后可发送"),
     val enqueueNewTurnAction: ActionAvailability = ActionAvailability.disabled("选择一个会话后可排队"),
     val enqueueSteerAction: ActionAvailability = ActionAvailability.disabled("当前会话不支持引导"),
+    val resumeAction: ActionAvailability = ActionAvailability.disabled("选择可恢复的历史会话后可用"),
+    val interruptAction: ActionAvailability = ActionAvailability.disabled("当前没有可中断的活动回合"),
     val attentionDrafts: Map<String, String> = emptyMap(),
+    val questionDrafts: Map<String, List<QuestionAnswerDraftUi>> = emptyMap(),
     val message: UiMessage? = null,
 )
 
@@ -182,13 +185,30 @@ sealed interface AttentionSubjectUi {
     ) : AttentionSubjectUi
 
     data class Question(
-        val prompt: String?,
-        val options: List<DecisionOptionUi>,
-        val freeFormAllowed: Boolean,
+        val questions: List<QuestionPromptUi> = emptyList(),
+        // Kept as a rendering fallback for cached pre-R5 UI fixtures. New
+        // projections always populate `questions` and never flatten a set.
+        val prompt: String? = null,
+        val options: List<DecisionOptionUi> = emptyList(),
+        val freeFormAllowed: Boolean = false,
     ) : AttentionSubjectUi
 
     data class ConnectionFault(val runtimeLabel: String, val safeReason: String) : AttentionSubjectUi
 }
+
+data class QuestionPromptUi(
+    val key: String,
+    val prompt: String?,
+    val options: List<DecisionOptionUi>,
+    val multiSelect: Boolean,
+    val freeFormAllowed: Boolean,
+)
+
+data class QuestionAnswerDraftUi(
+    val questionKey: String,
+    val optionIds: List<String>,
+    val freeForm: String?,
+)
 
 data class DecisionOptionUi(val id: String, val label: String, val tone: DecisionToneUi)
 enum class DecisionToneUi { Positive, Neutral, Destructive }
@@ -226,11 +246,21 @@ sealed interface UiAction {
     data class SelectRuntime(val runtimeId: String) : UiAction
     data class UpdateDraft(val value: String) : UiAction
     data object SubmitPrompt : UiAction
+    data object ResumeSession : UiAction
+    data object InterruptTurn : UiAction
     data class EnqueueInput(val intent: QueueIntentUi) : UiAction
     data class RespondAttention(
         val attentionId: String,
         val optionId: String?,
         val freeForm: String?,
+    ) : UiAction
+    data class RespondQuestion(
+        val attentionId: String,
+        val answers: List<QuestionAnswerDraftUi>,
+    ) : UiAction
+    data class UpdateQuestionDraft(
+        val attentionId: String,
+        val answer: QuestionAnswerDraftUi,
     ) : UiAction
     data class UpdateAttentionDraft(val attentionId: String, val value: String) : UiAction
     data object Refresh : UiAction

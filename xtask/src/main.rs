@@ -7,7 +7,7 @@ use std::process::{Command, ExitCode, ExitStatus};
 
 use xtask::antipattern::{self, scan_repository};
 use xtask::schema::{self, SchemaCommand};
-use xtask::{deps, fixtures};
+use xtask::{deps, fixtures, sidecar};
 
 #[derive(Debug)]
 enum Task {
@@ -17,6 +17,7 @@ enum Task {
     Test,
     CheckDeps,
     LintForbidden,
+    ClaudeSidecar,
     FixturesVerify,
     Schema(SchemaCommand),
 }
@@ -34,6 +35,7 @@ enum XtaskError {
     Dependencies(deps::DependencyCheckError),
     Antipattern(antipattern::AntipatternError),
     Fixtures(fixtures::FixtureVerifyError),
+    Sidecar(sidecar::SidecarCheckError),
     Schema(schema::SchemaError),
 }
 
@@ -42,7 +44,7 @@ impl fmt::Display for XtaskError {
         match self {
             Self::Usage => write!(
                 formatter,
-                "usage: cargo xtask <ci|fmt|clippy|test|check-deps|lint-forbidden|fixtures verify|schema <refresh|diff|history <tool> <entry-id>>>"
+                "usage: cargo xtask <ci|fmt|clippy|test|check-deps|lint-forbidden|claude-sidecar|fixtures verify|schema <refresh|diff|history <tool> <entry-id>>>"
             ),
             Self::WorkspaceRoot => write!(formatter, "could not resolve the workspace root"),
             Self::Io(error) => write!(formatter, "I/O failure: {error}"),
@@ -55,6 +57,7 @@ impl fmt::Display for XtaskError {
             Self::Dependencies(error) => write!(formatter, "{error}"),
             Self::Antipattern(error) => write!(formatter, "{error}"),
             Self::Fixtures(error) => write!(formatter, "{error}"),
+            Self::Sidecar(error) => write!(formatter, "{error}"),
             Self::Schema(error) => write!(formatter, "{error}"),
         }
     }
@@ -67,6 +70,7 @@ impl std::error::Error for XtaskError {
             Self::Dependencies(error) => Some(error),
             Self::Antipattern(error) => Some(error),
             Self::Fixtures(error) => Some(error),
+            Self::Sidecar(error) => Some(error),
             Self::Schema(error) => Some(error),
             _ => None,
         }
@@ -100,6 +104,12 @@ impl From<antipattern::AntipatternError> for XtaskError {
 impl From<fixtures::FixtureVerifyError> for XtaskError {
     fn from(error: fixtures::FixtureVerifyError) -> Self {
         Self::Fixtures(error)
+    }
+}
+
+impl From<sidecar::SidecarCheckError> for XtaskError {
+    fn from(error: sidecar::SidecarCheckError) -> Self {
+        Self::Sidecar(error)
     }
 }
 
@@ -143,6 +153,7 @@ fn run() -> Result<(), XtaskError> {
                 "clippy",
                 &["clippy", "--all-targets", "--", "-D", "warnings"],
             )?;
+            run_claude_sidecar_step(&root)?;
             run_test_step(&root, Some(&target))?;
             run_fixtures_step(&root)
         }
@@ -158,6 +169,7 @@ fn run() -> Result<(), XtaskError> {
         }
         Task::CheckDeps => run_deps_step(&root),
         Task::LintForbidden => run_forbidden_step(&root),
+        Task::ClaudeSidecar => run_claude_sidecar_step(&root),
         Task::FixturesVerify => run_fixtures_step(&root),
         Task::Schema(command) => schema::run(command, &root).map_err(Into::into),
     }
@@ -176,6 +188,7 @@ fn parse_task() -> Result<Task, XtaskError> {
         Some("test") => parse_without_extra_arguments(Task::Test, arguments),
         Some("check-deps") => parse_without_extra_arguments(Task::CheckDeps, arguments),
         Some("lint-forbidden") => parse_without_extra_arguments(Task::LintForbidden, arguments),
+        Some("claude-sidecar") => parse_without_extra_arguments(Task::ClaudeSidecar, arguments),
         Some("fixtures") => {
             let Some(subcommand) = arguments.next() else {
                 return Err(XtaskError::Usage);
@@ -328,6 +341,14 @@ fn run_fixtures_step(root: &Path) -> Result<(), XtaskError> {
     } else {
         println!("<== {STEP}: ok; {summary}");
     }
+    Ok(())
+}
+
+fn run_claude_sidecar_step(root: &Path) -> Result<(), XtaskError> {
+    const STEP: &str = "claude-sidecar";
+    announce(STEP)?;
+    sidecar::check_workspace(root)?;
+    println!("<== {STEP}: ok; npm ci --ignore-scripts + npm run typecheck");
     Ok(())
 }
 

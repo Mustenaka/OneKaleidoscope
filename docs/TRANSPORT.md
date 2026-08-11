@@ -39,7 +39,7 @@ UacpHelloAck { request_id: u64, protocol_version: String }
 ```
 
 TRANSPORT 0.1 的 `max_frame_length` 固定为 65,545。双方必须先接受 `0.1.x` transport，再接受
-`0.3.x` UACP；ack 回显 responder 的完整版本和相同 frame 上限。minor 不兼容、畸形版本、
+`0.5.x` UACP；ack 回显 responder 的完整版本和相同 frame 上限。minor 不兼容、畸形版本、
 上限不等或顺序错误均返回 `VersionMismatch`（若可安全编码）并关闭连接。任何业务 frame 在
 两次版本协商与设备认证完成前一律拒绝。R3 没有明文 fallback。
 

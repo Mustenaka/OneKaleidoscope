@@ -35,6 +35,7 @@ private fun AttentionPreview() {
         AttentionScreen(
             panel = previewState().attention,
             drafts = emptyMap(),
+            questionDrafts = emptyMap(),
             onAction = {},
             modifier = Modifier.fillMaxSize(),
         )

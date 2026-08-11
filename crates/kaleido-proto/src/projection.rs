@@ -22,7 +22,7 @@ use crate::workflow::{Artifact, StepAssignment, StepBlocker, StepState, Workflow
 use crate::ContractViolation;
 
 /// Bumped whenever a payload shape changes so clients know to refresh fully.
-pub const PROJECTION_VERSION: u32 = 2;
+pub const PROJECTION_VERSION: u32 = 3;
 
 /// The sole cursor domain for one projection.
 ///

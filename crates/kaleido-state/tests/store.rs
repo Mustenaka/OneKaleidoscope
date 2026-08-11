@@ -163,6 +163,8 @@ fn runtime_ack(command_id: &CommandId) -> CommandAck {
     CommandAck {
         command_id: command_id.clone(),
         outcome: CommandOutcome::AcceptedByRuntime {
+            session_id: SessionId::new("ses_0123456789abcdef"),
+            acceptance_kind: kaleido_proto::command::RuntimeAcceptanceKind::PromptTurn,
             binding_handle: handle(
                 ProviderBindingKind::RuntimeAcknowledgement,
                 "0000000000000005",
@@ -370,9 +372,32 @@ fn reply(
                 expected_expires_at_ms: expires_at_ms,
                 option_id: Some(option.to_owned()),
                 free_form_ref: None,
+                question_answers: Vec::new(),
             },
         },
     }
+}
+
+fn provider_answered_effect(fixture: &Fixture, envelope: &CommandEnvelope) -> StateEffect {
+    let Command::RespondAttention { response } = &envelope.body else {
+        panic!("test reply must contain RespondAttention");
+    };
+    let mut answered = fixture
+        .store
+        .state()
+        .attention(&response.attention_id)
+        .expect("open attention")
+        .clone();
+    answered.state = AttentionState::Answered {
+        option_id: response.option_id.clone(),
+        free_form_ref: response.free_form_ref.clone(),
+        question_answers: response.question_answers.clone(),
+        decided_at_ms: NOW_MS + 1,
+        answer_source: AttentionAnswerSource::LocalCommand {
+            command_id: envelope.command_id.clone(),
+        },
+    };
+    StateEffect::AttentionUpserted { item: answered }
 }
 
 fn prompt(fixture: &Fixture, command: &str) -> CommandEnvelope {
@@ -542,6 +567,10 @@ fn answering_an_already_answered_approval_is_refused() {
             .outcome,
         CommandOutcome::AcceptedLocally { .. }
     ));
+    fixture
+        .store
+        .apply(&provider_answered_effect(&fixture, &first))
+        .expect("provider-observed answer");
     // A different command, so idempotency does not mask the refusal.
     let second = reply(&fixture, "second", "decline", None);
     match fixture
@@ -565,6 +594,10 @@ fn a_local_answer_references_the_real_envelope_command() {
         .store
         .submit_command(&envelope, NOW_MS)
         .expect("submit local answer");
+    fixture
+        .store
+        .apply(&provider_answered_effect(&fixture, &envelope))
+        .expect("provider-observed answer");
 
     let answered = fixture
         .store
@@ -592,6 +625,7 @@ fn a_local_reply_after_an_external_answer_is_already_answered() {
     externally_answered.state = AttentionState::Answered {
         option_id: Some("accept".to_owned()),
         free_form_ref: None,
+        question_answers: Vec::new(),
         decided_at_ms: NOW_MS,
         answer_source: AttentionAnswerSource::ObservedExternal {
             evidence: AttentionAnswerEvidence {
@@ -641,6 +675,10 @@ fn a_zero_one_answered_log_fails_loud_without_migration() {
         .store
         .submit_command(&envelope, NOW_MS)
         .expect("write a current answer");
+    fixture
+        .store
+        .apply(&provider_answered_effect(&fixture, &envelope))
+        .expect("write provider-observed answer");
 
     let stream = StreamKey::Session {
         session_id: fixture.session_id.clone(),
@@ -1295,7 +1333,7 @@ fn runtime_acceptance_cannot_cross_runtime_boundaries() {
         })
         .expect("record remote-command turn");
     let mut ack = runtime_ack(&envelope.command_id);
-    let CommandOutcome::AcceptedByRuntime { binding_handle } = &mut ack.outcome else {
+    let CommandOutcome::AcceptedByRuntime { binding_handle, .. } = &mut ack.outcome else {
         panic!("runtime_ack helper returned the wrong outcome");
     };
     binding_handle.runtime_id = ProviderRuntimeId::new("rtm_other_runtime");
@@ -2378,6 +2416,7 @@ fn attention_admission_recovery_closes_a_partial_canonical_decision_idempotently
     attention.state = AttentionState::Answered {
         option_id: Some("accept".to_owned()),
         free_form_ref: None,
+        question_answers: Vec::new(),
         decided_at_ms: NOW_MS,
         answer_source: AttentionAnswerSource::LocalCommand {
             command_id: envelope.command_id.clone(),
@@ -2447,9 +2486,9 @@ fn a_claimed_attention_crash_never_redispatches_after_durable_local_decision() {
             .store
             .state()
             .attention(&fixture.attention_id)
-            .expect("attention decided during admission")
+            .expect("attention remains visible during admission")
             .state,
-        AttentionState::Answered { .. }
+        AttentionState::Open
     ));
     assert!(fixture
         .store
@@ -2459,10 +2498,16 @@ fn a_claimed_attention_crash_never_redispatches_after_durable_local_decision() {
         .any(|ack| ack == &admission.ack));
 
     let competing = reply(&fixture, "competing-answer", "decline", None);
+    let competing_request = DeviceCommandRequest {
+        idempotency_key: competing.idempotency_key.clone(),
+        ttl_ms: None,
+        body: competing.body.clone(),
+    };
     let competing_ack = fixture
         .store
-        .submit_command(&competing, NOW_MS)
-        .expect("competing local answer");
+        .admit_device_command(&device_id, &competing, &competing_request, NOW_MS)
+        .expect("competing device answer")
+        .ack;
     assert!(matches!(
         competing_ack.outcome,
         CommandOutcome::Rejected {
@@ -2498,15 +2543,14 @@ fn approval_dispatch_completes_without_fabricating_runtime_acceptance() {
         .store
         .admit_device_command(&device_id, &envelope, &request, NOW_MS)
         .expect("approval admission");
-    assert!(!admission.projections.is_empty());
     assert!(matches!(
         fixture
             .store
             .state()
             .attention(&fixture.attention_id)
-            .expect("admission durably decides attention")
+            .expect("admission leaves attention open")
             .state,
-        AttentionState::Answered { .. }
+        AttentionState::Open
     ));
     assert!(fixture
         .store
@@ -2521,8 +2565,17 @@ fn approval_dispatch_completes_without_fabricating_runtime_acceptance() {
         .expect("approval claim");
     fixture
         .store
-        .finish_dispatch(&ticket, &[])
+        .finish_dispatch(&ticket, &[provider_answered_effect(&fixture, &envelope)])
         .expect("structured approval success completes without runtime ack");
+    assert!(matches!(
+        fixture
+            .store
+            .state()
+            .attention(&fixture.attention_id)
+            .expect("provider result answers attention")
+            .state,
+        AttentionState::Answered { .. }
+    ));
     let matching = fixture
         .store
         .state()

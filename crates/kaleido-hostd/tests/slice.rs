@@ -534,7 +534,7 @@ fn live_orchestration_latches_streaming_and_keeps_steer_pending() {
     ));
     assert!(matches!(
         submitted_acks.get(1).map(|ack| &ack.outcome),
-        Some(CommandOutcome::AcceptedByRuntime { binding_handle })
+        Some(CommandOutcome::AcceptedByRuntime { binding_handle, .. })
             if binding_handle.kind == ProviderBindingKind::RuntimeAcknowledgement
     ));
     assert!(matches!(

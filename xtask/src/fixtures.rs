@@ -61,16 +61,33 @@ pub struct VerifySummary {
     pub codex_files: usize,
     pub acp_files: usize,
     pub opencode_files: usize,
+    pub claude_sidecar_files: usize,
+    pub claude_sidecar_records: usize,
+    pub claude_sidecar_auth_failure_files: usize,
 }
 
 impl fmt::Display for VerifySummary {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "{} file(s), {} record(s) (codex: {}, acp-claude: {}, opencode: {})",
-            self.files, self.records, self.codex_files, self.acp_files, self.opencode_files
+            "{} file(s), {} record(s) (codex: {}, acp-claude: {}, opencode: {}, claude-sidecar: {} file(s)/{} record(s), authentication-failure-only: {})",
+            self.files,
+            self.records,
+            self.codex_files,
+            self.acp_files,
+            self.opencode_files,
+            self.claude_sidecar_files,
+            self.claude_sidecar_records,
+            self.claude_sidecar_auth_failure_files
         )
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ClaudeSidecarVerifySummary {
+    pub files: usize,
+    pub records: usize,
+    pub auth_failure_files: usize,
 }
 
 #[derive(Debug)]
@@ -199,7 +216,20 @@ pub fn verify_workspace(workspace: &Path) -> Result<VerifySummary, FixtureVerify
     let fixtures = workspace.join("tests").join("fixtures");
     let schemas = workspace.join("schemas");
     let sandbox = fixtures.join("sandbox");
-    verify_paths(&fixtures, &schemas, &sandbox, &Identity::from_environment())
+    let identity = Identity::from_environment();
+    let mut summary = verify_paths(&fixtures, &schemas, &sandbox, &identity)?;
+    let claude_fixtures = workspace
+        .join("crates")
+        .join("kaleido-adapter-claude")
+        .join("tests")
+        .join("fixtures");
+    let claude = verify_claude_sidecar_paths(&claude_fixtures, &identity)?;
+    summary.files += claude.files;
+    summary.records += claude.records;
+    summary.claude_sidecar_files = claude.files;
+    summary.claude_sidecar_records = claude.records;
+    summary.claude_sidecar_auth_failure_files = claude.auth_failure_files;
+    Ok(summary)
 }
 
 pub fn verify_paths(
@@ -253,6 +283,468 @@ pub fn verify_paths(
         sort_and_deduplicate_issues(&mut issues);
         Err(FixtureVerifyError::Failed { issues })
     }
+}
+
+pub fn verify_claude_sidecar_paths(
+    fixtures_root: &Path,
+    identity: &Identity,
+) -> Result<ClaudeSidecarVerifySummary, FixtureVerifyError> {
+    let sandbox = fixtures_root.join("sandbox");
+    let mut issues = Vec::new();
+    let mut files = Vec::new();
+    visit_claude_sidecar_fixture_directory(fixtures_root, &sandbox, &mut files, &mut issues)?;
+    files.sort();
+    if files.is_empty() {
+        issues.push(issue(
+            &claude_fixture_label(fixtures_root, &sandbox),
+            1,
+            "Claude sidecar fixture directory contains no JSONL capture",
+            None,
+        ));
+    }
+
+    let mut summary = ClaudeSidecarVerifySummary::default();
+    for path in files {
+        let label = claude_fixture_label(fixtures_root, &path);
+        let metadata_path = claude_fixture_metadata_path(&path).ok_or_else(|| {
+            FixtureVerifyError::InvalidSnapshot {
+                label: label.clone(),
+            }
+        })?;
+        let expected_sdk_version = verify_claude_fixture_metadata(
+            fixtures_root,
+            &metadata_path,
+            &sandbox,
+            identity,
+            &mut issues,
+        )?;
+        let evidence = parse_claude_sidecar_fixture(
+            &path,
+            &label,
+            &sandbox,
+            identity,
+            expected_sdk_version.as_deref(),
+            &mut issues,
+        )?;
+        summary.files += 1;
+        summary.records += evidence.records;
+        if evidence.auth_failure_complete() {
+            summary.auth_failure_files += 1;
+        }
+    }
+
+    if issues.is_empty() {
+        Ok(summary)
+    } else {
+        sort_and_deduplicate_issues(&mut issues);
+        Err(FixtureVerifyError::Failed { issues })
+    }
+}
+
+fn visit_claude_sidecar_fixture_directory(
+    root: &Path,
+    directory: &Path,
+    files: &mut Vec<PathBuf>,
+    issues: &mut Vec<VerifyIssue>,
+) -> Result<(), FixtureVerifyError> {
+    let label = claude_fixture_label(root, directory);
+    let mut entries = fs::read_dir(directory)
+        .map_err(|source| FixtureVerifyError::Read {
+            label: label.clone(),
+            source,
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| FixtureVerifyError::Read {
+            label: label.clone(),
+            source,
+        })?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+
+    for entry in entries {
+        let path = entry.path();
+        let entry_label = claude_fixture_label(root, &path);
+        let file_type = entry
+            .file_type()
+            .map_err(|source| FixtureVerifyError::Read {
+                label: entry_label.clone(),
+                source,
+            })?;
+        let indirect_directory = file_type.is_dir()
+            && directory_entry_resolves_elsewhere(root, directory, &path, &entry_label)?;
+        if file_type.is_symlink() || indirect_directory {
+            issues.push(issue(
+                &entry_label,
+                1,
+                "Claude sidecar fixture symlink is not allowed",
+                None,
+            ));
+        } else if file_type.is_dir() {
+            visit_claude_sidecar_fixture_directory(root, &path, files, issues)?;
+        } else if file_type.is_file()
+            && path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
+        {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn claude_fixture_metadata_path(path: &Path) -> Option<PathBuf> {
+    let stem = path.file_stem()?.to_string_lossy();
+    Some(path.with_file_name(format!("{stem}.metadata.json")))
+}
+
+fn verify_claude_fixture_metadata(
+    root: &Path,
+    path: &Path,
+    sandbox: &Path,
+    identity: &Identity,
+    issues: &mut Vec<VerifyIssue>,
+) -> Result<Option<String>, FixtureVerifyError> {
+    let label = claude_fixture_label(root, path);
+    let contents = fs::read_to_string(path).map_err(|source| FixtureVerifyError::Read {
+        label: label.clone(),
+        source,
+    })?;
+    let mut raw_leaks = Vec::new();
+    scan_unparsed_line(&contents, sandbox, identity, &label, 1, &mut raw_leaks);
+    let value = match serde_json::from_str::<Value>(&contents) {
+        Ok(value) => value,
+        Err(_) => {
+            issues.extend(raw_leaks);
+            issues.push(issue(
+                &label,
+                1,
+                "invalid Claude fixture metadata JSON",
+                None,
+            ));
+            return Ok(None);
+        }
+    };
+    let semantic_start = issues.len();
+    scan_value_for_leaks(&value, "", false, sandbox, identity, &label, 1, issues);
+    merge_raw_leak_findings(raw_leaks, semantic_start, false, issues);
+
+    let Some(object) = value.as_object() else {
+        issues.push(issue(
+            &label,
+            1,
+            "Claude fixture metadata must be a JSON object",
+            None,
+        ));
+        return Ok(None);
+    };
+    let actual: BTreeSet<&str> = object.keys().map(String::as_str).collect();
+    let expected: BTreeSet<&str> = [
+        "acceptance_eligible",
+        "capture",
+        "expected_outcome",
+        "provider",
+        "provider_version",
+    ]
+    .into_iter()
+    .collect();
+    if actual != expected {
+        issues.push(issue(
+            &label,
+            1,
+            "Claude fixture metadata fields do not match the closed failure-evidence contract",
+            None,
+        ));
+    }
+    for (field, expected_value) in [
+        ("capture", "real_provider"),
+        ("provider", "@anthropic-ai/claude-agent-sdk"),
+        ("expected_outcome", "authentication_failure"),
+    ] {
+        if object.get(field).and_then(Value::as_str) != Some(expected_value) {
+            issues.push(issue(
+                &label,
+                1,
+                "Claude fixture metadata makes an unsupported evidence claim",
+                Some(&pointer_child("", field)),
+            ));
+        }
+    }
+    if object.get("acceptance_eligible").and_then(Value::as_bool) != Some(false) {
+        issues.push(issue(
+            &label,
+            1,
+            "authentication-failure fixture must not be acceptance eligible",
+            Some("/acceptance_eligible"),
+        ));
+    }
+    match object.get("provider_version").and_then(Value::as_str) {
+        Some(version) if !version.is_empty() => Ok(Some(version.to_owned())),
+        _ => {
+            issues.push(issue(
+                &label,
+                1,
+                "Claude fixture provider_version must be a non-empty string",
+                Some("/provider_version"),
+            ));
+            Ok(None)
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ClaudeFixtureEvidence {
+    records: usize,
+    saw_ready: bool,
+    saw_prompt_accepted: bool,
+    saw_session_started: bool,
+    saw_sdk_init: bool,
+    saw_auth_failure_assistant: bool,
+    saw_terminal_auth_failure: bool,
+}
+
+impl ClaudeFixtureEvidence {
+    const fn auth_failure_complete(&self) -> bool {
+        self.saw_ready
+            && self.saw_prompt_accepted
+            && self.saw_session_started
+            && self.saw_sdk_init
+            && self.saw_auth_failure_assistant
+            && self.saw_terminal_auth_failure
+    }
+}
+
+fn parse_claude_sidecar_fixture(
+    path: &Path,
+    label: &str,
+    sandbox: &Path,
+    identity: &Identity,
+    expected_sdk_version: Option<&str>,
+    issues: &mut Vec<VerifyIssue>,
+) -> Result<ClaudeFixtureEvidence, FixtureVerifyError> {
+    let contents = fs::read_to_string(path).map_err(|source| FixtureVerifyError::Read {
+        label: label.to_owned(),
+        source,
+    })?;
+    let mut evidence = ClaudeFixtureEvidence::default();
+    let mut session_ids = BTreeSet::new();
+    if contents.is_empty() {
+        issues.push(issue(label, 1, "empty Claude sidecar fixture", None));
+    }
+
+    for (zero_based_line, raw) in contents.lines().enumerate() {
+        let line = zero_based_line + 1;
+        if raw.trim().is_empty() {
+            issues.push(issue(label, line, "blank Claude sidecar JSONL line", None));
+            continue;
+        }
+        let mut raw_leaks = Vec::new();
+        scan_unparsed_line(raw, sandbox, identity, label, line, &mut raw_leaks);
+        let value = match serde_json::from_str::<Value>(raw) {
+            Ok(value) => value,
+            Err(_) => {
+                issues.extend(raw_leaks);
+                issues.push(issue(label, line, "invalid Claude sidecar JSON", None));
+                continue;
+            }
+        };
+        let semantic_start = issues.len();
+        scan_value_for_leaks(&value, "", false, sandbox, identity, label, line, issues);
+        merge_raw_leak_findings(raw_leaks, semantic_start, false, issues);
+
+        let Some(object) = value.as_object() else {
+            issues.push(issue(
+                label,
+                line,
+                "Claude sidecar fixture line must be a JSON object",
+                None,
+            ));
+            continue;
+        };
+        let actual: BTreeSet<&str> = object.keys().map(String::as_str).collect();
+        let expected: BTreeSet<&str> = ["kind", "payload", "protocol", "v"].into_iter().collect();
+        if actual != expected {
+            issues.push(issue(
+                label,
+                line,
+                "Claude sidecar envelope must contain exactly v, protocol, kind, payload",
+                None,
+            ));
+            continue;
+        }
+        if object.get("v").and_then(Value::as_u64) != Some(1) {
+            issues.push(issue(
+                label,
+                line,
+                "unsupported Claude sidecar envelope version",
+                Some("/v"),
+            ));
+        }
+        if object.get("protocol").and_then(Value::as_str) != Some("onekaleidoscope.claude.sidecar")
+        {
+            issues.push(issue(
+                label,
+                line,
+                "unexpected Claude sidecar protocol identifier",
+                Some("/protocol"),
+            ));
+        }
+        let Some(kind) = object.get("kind").and_then(Value::as_str) else {
+            issues.push(issue(
+                label,
+                line,
+                "Claude sidecar kind must be a string",
+                Some("/kind"),
+            ));
+            continue;
+        };
+        let Some(payload) = object.get("payload").and_then(Value::as_object) else {
+            issues.push(issue(
+                label,
+                line,
+                "Claude sidecar payload must be a JSON object",
+                Some("/payload"),
+            ));
+            continue;
+        };
+        evidence.records += 1;
+        collect_claude_sidecar_evidence(
+            kind,
+            payload,
+            expected_sdk_version,
+            label,
+            line,
+            &mut session_ids,
+            &mut evidence,
+            issues,
+        );
+    }
+
+    if session_ids.len() != 1 {
+        issues.push(issue(
+            label,
+            1,
+            "Claude failure fixture must contain exactly one consistent SDK session id",
+            Some("/payload/session_id"),
+        ));
+    }
+    for (present, category) in [
+        (
+            evidence.saw_ready,
+            "Claude failure fixture is missing sidecar ready",
+        ),
+        (
+            evidence.saw_prompt_accepted,
+            "Claude failure fixture is missing local prompt acceptance",
+        ),
+        (
+            evidence.saw_session_started,
+            "Claude failure fixture is missing a real SDK session start",
+        ),
+        (
+            evidence.saw_sdk_init,
+            "Claude failure fixture is missing the SDK init message",
+        ),
+        (
+            evidence.saw_auth_failure_assistant,
+            "Claude failure fixture is missing authentication_failed evidence",
+        ),
+        (
+            evidence.saw_terminal_auth_failure,
+            "Claude failure fixture is missing the terminal API-error result",
+        ),
+    ] {
+        if !present {
+            issues.push(issue(label, 1, category, None));
+        }
+    }
+    Ok(evidence)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_claude_sidecar_evidence(
+    kind: &str,
+    payload: &Map<String, Value>,
+    expected_sdk_version: Option<&str>,
+    label: &str,
+    line: usize,
+    session_ids: &mut BTreeSet<String>,
+    evidence: &mut ClaudeFixtureEvidence,
+    issues: &mut Vec<VerifyIssue>,
+) {
+    match kind {
+        "ready" => {
+            evidence.saw_ready = true;
+            let actual = payload.get("sdk_version").and_then(Value::as_str);
+            if actual.is_none() || actual != expected_sdk_version {
+                issues.push(issue(
+                    label,
+                    line,
+                    "Claude fixture SDK version does not match its metadata",
+                    Some("/payload/sdk_version"),
+                ));
+            }
+        }
+        "prompt_accepted" => evidence.saw_prompt_accepted = true,
+        "session_started" => {
+            evidence.saw_session_started = true;
+            collect_claude_session_id(payload, session_ids);
+        }
+        "sdk_event" => {
+            collect_claude_session_id(payload, session_ids);
+            let Some(event) = payload.get("event").and_then(Value::as_object) else {
+                issues.push(issue(
+                    label,
+                    line,
+                    "Claude sdk_event payload must contain a closed event object",
+                    Some("/payload/event"),
+                ));
+                return;
+            };
+            match event.get("event").and_then(Value::as_str) {
+                Some("init") => evidence.saw_sdk_init = true,
+                Some("assistant")
+                    if event.get("error").and_then(Value::as_str)
+                        == Some("authentication_failed") =>
+                {
+                    evidence.saw_auth_failure_assistant = true;
+                }
+                Some("result") => {
+                    let is_error = event.get("is_error").and_then(Value::as_bool);
+                    if is_error == Some(false) {
+                        issues.push(issue(
+                            label,
+                            line,
+                            "authentication-failure fixture contains a successful result",
+                            Some("/payload/event/is_error"),
+                        ));
+                    }
+                    if is_error == Some(true) {
+                        evidence.saw_terminal_auth_failure = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_claude_session_id(object: &Map<String, Value>, session_ids: &mut BTreeSet<String>) {
+    if let Some(session_id) = object.get("session_id").and_then(Value::as_str) {
+        session_ids.insert(session_id.to_owned());
+    }
+}
+
+fn claude_fixture_label(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .map(|relative| {
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            if relative.is_empty() {
+                "crates/kaleido-adapter-claude/tests/fixtures".to_owned()
+            } else {
+                format!("crates/kaleido-adapter-claude/tests/fixtures/{relative}")
+            }
+        })
+        .unwrap_or_else(|_| "crates/kaleido-adapter-claude/tests/fixtures/<external>".to_owned())
 }
 
 fn discover_fixture_files(

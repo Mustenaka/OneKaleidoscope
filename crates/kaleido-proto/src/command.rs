@@ -152,6 +152,11 @@ pub enum CommandOutcome {
         note_ref: Option<ContentRef>,
     },
     AcceptedByRuntime {
+        /// Canonical session whose state-changing command was accepted.
+        /// This makes non-turn commands such as interrupt independently
+        /// scopeable without inventing a `RemoteCommand` turn.
+        session_id: SessionId,
+        acceptance_kind: RuntimeAcceptanceKind,
         binding_handle: ProviderBindingHandle,
     },
     Enqueued {
@@ -164,6 +169,16 @@ pub enum CommandOutcome {
     Duplicate {
         original_command_id: CommandId,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeAcceptanceKind {
+    /// A prompt admission must also materialize one correlated RemoteCommand turn.
+    PromptTurn,
+    /// A session-scoped state change, such as interrupt, does not create a turn.
+    SessionControl,
 }
 
 impl CommandOutcome {
@@ -181,7 +196,16 @@ impl CommandOutcome {
             CommandOutcome::AcceptedLocally {
                 note_ref: Some(note_ref),
             } => validate_sensitive(note_ref, "command_outcome.note_ref"),
-            CommandOutcome::AcceptedByRuntime { binding_handle } => {
+            CommandOutcome::AcceptedByRuntime {
+                session_id,
+                acceptance_kind: _,
+                binding_handle,
+            } => {
+                if session_id.is_empty() {
+                    return Err(ContractViolation::EmptyIdentifier {
+                        field: "command_outcome.session_id",
+                    });
+                }
                 binding_handle.validate_for(ProviderBindingKind::RuntimeAcknowledgement)
             }
             CommandOutcome::Rejected { error } => error.validate(),

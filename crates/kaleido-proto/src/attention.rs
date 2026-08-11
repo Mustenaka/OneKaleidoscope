@@ -58,6 +58,7 @@ pub enum AttentionState {
     Answered {
         option_id: Option<String>,
         free_form_ref: Option<ContentRef>,
+        question_answers: Vec<QuestionAnswer>,
         decided_at_ms: i64,
         answer_source: AttentionAnswerSource,
     },
@@ -143,10 +144,28 @@ pub enum JoinFailureReason {
 #[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 pub struct QuestionRequest {
     pub request_key: String,
+    pub questions: Vec<QuestionPrompt>,
+    pub binding_handle: ProviderBindingHandle,
+}
+
+/// One prompt in a multi-question elicitation request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct QuestionPrompt {
+    pub question_key: String,
     pub prompt_ref: ContentRef,
     pub options: Vec<DecisionOption>,
+    pub multi_select: bool,
     pub free_form_allowed: bool,
-    pub binding_handle: ProviderBindingHandle,
+}
+
+/// The answer to one prompt in a [`QuestionRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct QuestionAnswer {
+    pub question_key: String,
+    pub option_ids: Vec<String>,
+    pub free_form_ref: Option<ContentRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +208,7 @@ pub struct AttentionResponse {
     pub expected_expires_at_ms: Option<i64>,
     pub option_id: Option<String>,
     pub free_form_ref: Option<ContentRef>,
+    pub question_answers: Vec<QuestionAnswer>,
 }
 
 impl AttentionState {
@@ -210,17 +230,15 @@ impl AttentionItem {
     pub fn options(&self) -> &[DecisionOption] {
         match &self.subject {
             AttentionSubject::Approval { request } => &request.options,
-            AttentionSubject::Question { request } => &request.options,
+            // This compatibility accessor is only meaningful for callers
+            // rendering a single-prompt question. Multi-question consumers
+            // must use `QuestionRequest::questions` so no prompt is hidden.
+            AttentionSubject::Question { request } => request
+                .questions
+                .first()
+                .map_or(&[], |question| question.options.as_slice()),
             AttentionSubject::WorkflowGate { request } => &request.options,
             AttentionSubject::ConnectionFault { .. } => &[],
-        }
-    }
-
-    fn free_form_allowed(&self) -> bool {
-        match &self.subject {
-            AttentionSubject::Approval { .. } | AttentionSubject::ConnectionFault { .. } => false,
-            AttentionSubject::Question { request } => request.free_form_allowed,
-            AttentionSubject::WorkflowGate { request } => request.free_form_allowed,
         }
     }
 
@@ -265,29 +283,37 @@ impl AttentionItem {
         if self.expired_at(now_ms) {
             return Err(ReplyRejection::Expired);
         }
-        if let Some(option_id) = &response.option_id {
-            if !self
-                .options()
-                .iter()
-                .any(|option| option.option_id == *option_id)
-            {
-                return Err(ReplyRejection::UnknownOption);
+        match &self.subject {
+            AttentionSubject::Question { request } => {
+                if response.option_id.is_some() || response.free_form_ref.is_some() {
+                    return Err(ReplyRejection::QuestionTopLevelDecision);
+                }
+                validate_question_answers(request, &response.question_answers)
             }
-        }
-        if let Some(free_form_ref) = &response.free_form_ref {
-            if !self.free_form_allowed() {
-                return Err(ReplyRejection::FreeFormNotAllowed);
+            AttentionSubject::Approval { request } => {
+                if !response.question_answers.is_empty() {
+                    return Err(ReplyRejection::QuestionAnswersUnexpected);
+                }
+                validate_top_level_response(
+                    &request.options,
+                    false,
+                    response.option_id.as_ref(),
+                    response.free_form_ref.as_ref(),
+                )
             }
-            if free_form_ref.validate().is_err()
-                || free_form_ref.sensitivity != Sensitivity::Sensitive
-            {
-                return Err(ReplyRejection::InvalidFreeForm);
+            AttentionSubject::WorkflowGate { request } => {
+                if !response.question_answers.is_empty() {
+                    return Err(ReplyRejection::QuestionAnswersUnexpected);
+                }
+                validate_top_level_response(
+                    &request.options,
+                    request.free_form_allowed,
+                    response.option_id.as_ref(),
+                    response.free_form_ref.as_ref(),
+                )
             }
+            AttentionSubject::ConnectionFault { .. } => Err(ReplyRejection::NotReplyable),
         }
-        if response.option_id.is_none() && response.free_form_ref.is_none() {
-            return Err(ReplyRejection::DecisionMissing);
-        }
-        Ok(())
     }
 
     pub fn validate(&self) -> Result<(), ContractViolation> {
@@ -365,8 +391,7 @@ impl AttentionItem {
                 request
                     .binding_handle
                     .validate_for(ProviderBindingKind::InteractionRequest)?;
-                validate_options(&request.options, request.free_form_allowed)?;
-                validate_sensitive(&request.prompt_ref, "question.prompt_ref")?;
+                validate_questions(&request.questions)?;
             }
             AttentionSubject::WorkflowGate { request } => {
                 if self.workflow_id.is_none() {
@@ -385,15 +410,43 @@ impl AttentionItem {
         if let AttentionState::Answered {
             option_id,
             free_form_ref,
+            question_answers,
             answer_source,
             ..
         } = &self.state
         {
-            if option_id.is_none() && free_form_ref.is_none() {
-                return Err(ContractViolation::AttentionDecisionMissing);
-            }
-            if let Some(free_form_ref) = free_form_ref {
-                validate_sensitive(free_form_ref, "attention_state.free_form_ref")?;
+            match &self.subject {
+                AttentionSubject::Question { request } => {
+                    if option_id.is_some() || free_form_ref.is_some() {
+                        return Err(ContractViolation::QuestionTopLevelDecision);
+                    }
+                    validate_question_answers_state(request, question_answers)?;
+                }
+                AttentionSubject::Approval { request } => {
+                    if !question_answers.is_empty() {
+                        return Err(ContractViolation::QuestionAnswersUnexpected);
+                    }
+                    validate_top_level_state(
+                        &request.options,
+                        false,
+                        option_id.as_ref(),
+                        free_form_ref.as_ref(),
+                    )?;
+                }
+                AttentionSubject::WorkflowGate { request } => {
+                    if !question_answers.is_empty() {
+                        return Err(ContractViolation::QuestionAnswersUnexpected);
+                    }
+                    validate_top_level_state(
+                        &request.options,
+                        request.free_form_allowed,
+                        option_id.as_ref(),
+                        free_form_ref.as_ref(),
+                    )?;
+                }
+                AttentionSubject::ConnectionFault { .. } => {
+                    return Err(ContractViolation::AttentionDecisionMissing);
+                }
             }
             match answer_source {
                 AttentionAnswerSource::LocalCommand { command_id } => {
@@ -474,13 +527,79 @@ impl AttentionResponse {
         if self.option_id.as_ref().is_some_and(String::is_empty) {
             return Err(ContractViolation::EmptyIdentifier { field: "option_id" });
         }
-        if self.option_id.is_none() && self.free_form_ref.is_none() {
-            return Err(ContractViolation::AttentionDecisionMissing);
+        if !self.question_answers.is_empty() {
+            if self.option_id.is_some() || self.free_form_ref.is_some() {
+                return Err(ContractViolation::QuestionTopLevelDecision);
+            }
+            validate_question_answers_shape(&self.question_answers)
+        } else {
+            validate_top_level_response(
+                &[],
+                true,
+                self.option_id.as_ref(),
+                self.free_form_ref.as_ref(),
+            )
+            .map_err(|rejection| rejection.contract_violation())
         }
-        if let Some(free_form_ref) = &self.free_form_ref {
-            validate_sensitive(free_form_ref, "attention_response.free_form_ref")?;
+    }
+}
+
+impl ReplyRejection {
+    fn from_contract_violation(error: ContractViolation) -> Self {
+        match error {
+            ContractViolation::QuestionAnswersRequired => ReplyRejection::QuestionAnswersRequired,
+            ContractViolation::QuestionAnswerEmpty => ReplyRejection::QuestionAnswerEmpty,
+            ContractViolation::QuestionAnswerDuplicateKey => {
+                ReplyRejection::QuestionAnswerDuplicateKey
+            }
+            ContractViolation::QuestionAnswerDuplicateOption => {
+                ReplyRejection::QuestionAnswerDuplicateOption
+            }
+            ContractViolation::QuestionAnswerUnknownKey => ReplyRejection::QuestionAnswerUnknownKey,
+            ContractViolation::QuestionAnswerUnknownOption => {
+                ReplyRejection::QuestionAnswerUnknownOption
+            }
+            ContractViolation::QuestionAnswerTooManyOptions => {
+                ReplyRejection::QuestionAnswerTooManyOptions
+            }
+            ContractViolation::QuestionAnswerMissing => ReplyRejection::QuestionAnswerMissing,
+            ContractViolation::FreeFormNotAllowed => ReplyRejection::FreeFormNotAllowed,
+            ContractViolation::InvalidFreeForm => ReplyRejection::InvalidFreeForm,
+            ContractViolation::QuestionTopLevelDecision => ReplyRejection::QuestionTopLevelDecision,
+            ContractViolation::QuestionAnswersUnexpected => {
+                ReplyRejection::QuestionAnswersUnexpected
+            }
+            _ => ReplyRejection::DecisionMissing,
         }
-        Ok(())
+    }
+
+    fn contract_violation(self) -> ContractViolation {
+        match self {
+            ReplyRejection::DecisionMissing => ContractViolation::AttentionDecisionMissing,
+            ReplyRejection::QuestionAnswersUnexpected => {
+                ContractViolation::QuestionAnswersUnexpected
+            }
+            ReplyRejection::QuestionTopLevelDecision => ContractViolation::QuestionTopLevelDecision,
+            ReplyRejection::QuestionAnswerEmpty => ContractViolation::QuestionAnswerEmpty,
+            ReplyRejection::QuestionAnswerDuplicateKey => {
+                ContractViolation::QuestionAnswerDuplicateKey
+            }
+            ReplyRejection::QuestionAnswerDuplicateOption => {
+                ContractViolation::QuestionAnswerDuplicateOption
+            }
+            ReplyRejection::QuestionAnswerUnknownOption => {
+                ContractViolation::QuestionAnswerUnknownOption
+            }
+            ReplyRejection::QuestionAnswerTooManyOptions => {
+                ContractViolation::QuestionAnswerTooManyOptions
+            }
+            ReplyRejection::QuestionAnswerUnknownKey => ContractViolation::QuestionAnswerUnknownKey,
+            ReplyRejection::QuestionAnswerMissing => ContractViolation::QuestionAnswerMissing,
+            ReplyRejection::FreeFormNotAllowed => ContractViolation::FreeFormNotAllowed,
+            ReplyRejection::InvalidFreeForm => ContractViolation::InvalidFreeForm,
+            ReplyRejection::UnknownOption => ContractViolation::UnknownOption,
+            _ => ContractViolation::AttentionDecisionMissing,
+        }
     }
 }
 
@@ -503,6 +622,157 @@ fn validate_options(
         }
     }
     Ok(())
+}
+
+fn validate_questions(questions: &[QuestionPrompt]) -> Result<(), ContractViolation> {
+    if questions.is_empty() {
+        return Err(ContractViolation::QuestionSetEmpty);
+    }
+    let mut seen = HashSet::new();
+    for question in questions {
+        if question.question_key.is_empty() {
+            return Err(ContractViolation::EmptyIdentifier {
+                field: "question_key",
+            });
+        }
+        if !seen.insert(&question.question_key) {
+            return Err(ContractViolation::DuplicateQuestionKey {
+                question_key: question.question_key.clone(),
+            });
+        }
+        validate_options(&question.options, question.free_form_allowed)?;
+        validate_sensitive(&question.prompt_ref, "question.prompt_ref")?;
+    }
+    Ok(())
+}
+
+fn validate_question_answers_shape(answers: &[QuestionAnswer]) -> Result<(), ContractViolation> {
+    if answers.is_empty() {
+        return Err(ContractViolation::QuestionAnswersRequired);
+    }
+    let mut keys = HashSet::new();
+    for answer in answers {
+        if answer.question_key.is_empty() {
+            return Err(ContractViolation::EmptyIdentifier {
+                field: "question_answer.question_key",
+            });
+        }
+        if !keys.insert(&answer.question_key) {
+            return Err(ContractViolation::QuestionAnswerDuplicateKey);
+        }
+        validate_answer_options_shape(answer)?;
+    }
+    Ok(())
+}
+
+fn validate_answer_options_shape(answer: &QuestionAnswer) -> Result<(), ContractViolation> {
+    let mut options = HashSet::new();
+    for option_id in &answer.option_ids {
+        if option_id.is_empty() {
+            return Err(ContractViolation::EmptyIdentifier {
+                field: "question_answer.option_id",
+            });
+        }
+        if !options.insert(option_id) {
+            return Err(ContractViolation::QuestionAnswerDuplicateOption);
+        }
+    }
+    if answer.option_ids.is_empty() && answer.free_form_ref.is_none() {
+        return Err(ContractViolation::QuestionAnswerEmpty);
+    }
+    if let Some(free_form_ref) = &answer.free_form_ref {
+        if free_form_ref.validate().is_err() || free_form_ref.sensitivity != Sensitivity::Sensitive
+        {
+            return Err(ContractViolation::InvalidFreeForm);
+        }
+    }
+    Ok(())
+}
+
+fn validate_question_answers(
+    request: &QuestionRequest,
+    answers: &[QuestionAnswer],
+) -> Result<(), ReplyRejection> {
+    validate_question_answers_shape(answers).map_err(ReplyRejection::from_contract_violation)?;
+    let mut prompts = HashSet::new();
+    for question in &request.questions {
+        prompts.insert(question.question_key.as_str());
+    }
+    for answer in answers {
+        if !prompts.contains(answer.question_key.as_str()) {
+            return Err(ReplyRejection::QuestionAnswerUnknownKey);
+        }
+        let question = request
+            .questions
+            .iter()
+            .find(|question| question.question_key == answer.question_key)
+            .ok_or(ReplyRejection::QuestionAnswerUnknownKey)?;
+        if !question.multi_select && answer.option_ids.len() > 1 {
+            return Err(ReplyRejection::QuestionAnswerTooManyOptions);
+        }
+        for option_id in &answer.option_ids {
+            if !question
+                .options
+                .iter()
+                .any(|option| &option.option_id == option_id)
+            {
+                return Err(ReplyRejection::QuestionAnswerUnknownOption);
+            }
+        }
+        if answer.free_form_ref.is_some() && !question.free_form_allowed {
+            return Err(ReplyRejection::FreeFormNotAllowed);
+        }
+    }
+    if answers.len() != request.questions.len() {
+        return Err(ReplyRejection::QuestionAnswerMissing);
+    }
+    Ok(())
+}
+
+fn validate_question_answers_state(
+    request: &QuestionRequest,
+    answers: &[QuestionAnswer],
+) -> Result<(), ContractViolation> {
+    validate_question_answers(request, answers).map_err(ReplyRejection::contract_violation)
+}
+
+fn validate_top_level_response(
+    options: &[DecisionOption],
+    free_form_allowed: bool,
+    option_id: Option<&String>,
+    free_form_ref: Option<&ContentRef>,
+) -> Result<(), ReplyRejection> {
+    if let Some(option_id) = option_id {
+        if option_id.is_empty() {
+            return Err(ReplyRejection::UnknownOption);
+        }
+        if !options.is_empty() && !options.iter().any(|option| &option.option_id == option_id) {
+            return Err(ReplyRejection::UnknownOption);
+        }
+    }
+    if let Some(free_form_ref) = free_form_ref {
+        if !free_form_allowed {
+            return Err(ReplyRejection::FreeFormNotAllowed);
+        }
+        if free_form_ref.validate().is_err() || free_form_ref.sensitivity != Sensitivity::Sensitive
+        {
+            return Err(ReplyRejection::InvalidFreeForm);
+        }
+    }
+    if option_id.is_none() && free_form_ref.is_none() {
+        return Err(ReplyRejection::DecisionMissing);
+    }
+    Ok(())
+}
+
+fn validate_top_level_state(
+    options: &[DecisionOption],
+    free_form_allowed: bool,
+    option_id: Option<&String>,
+    free_form_ref: Option<&ContentRef>,
+) -> Result<(), ContractViolation> {
+    validate_top_level_response(options, free_form_allowed, option_id, free_form_ref)
+        .map_err(ReplyRejection::contract_violation)
 }
 
 fn validate_sensitive(content: &ContentRef, field: &'static str) -> Result<(), ContractViolation> {
@@ -528,4 +798,14 @@ pub enum ReplyRejection {
     FreeFormNotAllowed,
     InvalidFreeForm,
     DecisionMissing,
+    QuestionAnswersRequired,
+    QuestionAnswersUnexpected,
+    QuestionTopLevelDecision,
+    QuestionAnswerEmpty,
+    QuestionAnswerDuplicateKey,
+    QuestionAnswerDuplicateOption,
+    QuestionAnswerUnknownKey,
+    QuestionAnswerUnknownOption,
+    QuestionAnswerTooManyOptions,
+    QuestionAnswerMissing,
 }

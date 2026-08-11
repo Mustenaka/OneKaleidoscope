@@ -800,16 +800,32 @@ fn validate_prompt_response(
     }
 }
 
-fn validate_and_record_prompt_response<W: Write>(
+fn validate_and_record_prompt_messages<W: Write>(
     response: &RawResponse,
-    prompt_path: &str,
+    messages_path: &str,
     session_id: &str,
     sandbox: &Path,
     fixture: &mut FixtureSink<W>,
 ) -> Result<Value, OpenCodeError> {
     let value: Value = serde_json::from_str(&response.body)?;
-    validate_prompt_response(&value, session_id, sandbox)?;
-    record_raw_response("POST", prompt_path, response, fixture)?;
+    let messages = value
+        .as_array()
+        .filter(|messages| !messages.is_empty())
+        .ok_or(OpenCodeError::PromptResponseIsolation)?;
+    let mut validated_assistant_path = false;
+    for message in messages {
+        if message.pointer("/info/sessionID").and_then(Value::as_str) != Some(session_id) {
+            return Err(OpenCodeError::PromptResponseIsolation);
+        }
+        if message.pointer("/info/role").and_then(Value::as_str) == Some("assistant") {
+            validate_prompt_response(message, session_id, sandbox)?;
+            validated_assistant_path = true;
+        }
+    }
+    if !validated_assistant_path {
+        return Err(OpenCodeError::PromptResponseIsolation);
+    }
+    record_raw_response("GET", messages_path, response, fixture)?;
     Ok(value)
 }
 
@@ -850,7 +866,7 @@ fn record_prompt_scenario<W: Write>(
     let prompt = scenario.prompt().ok_or(OpenCodeError::Protocol(
         "prompt scenario did not have a prompt",
     ))?;
-    let prompt_path = format!("/session/{session_id}/message");
+    let prompt_path = format!("/session/{session_id}/prompt_async");
     let prompt_body = json!({"parts": [{"type": "text", "text": prompt}]}).to_string();
     let prompt_request =
         http_request_payload("POST", &prompt_path, "application/json", &prompt_body)?;
@@ -910,22 +926,38 @@ fn record_prompt_scenario<W: Write>(
         }
         CancellableReceive::Disconnected => return Err(OpenCodeError::PromptWorkerClosed),
     };
-    if !prompt_response.status.is_success() {
+    if prompt_response.status != StatusCode::NO_CONTENT {
         return Err(OpenCodeError::HttpStatus {
             method: "POST",
             path: prompt_path,
             status: prompt_response.status,
         });
     }
-    let prompt_value = validate_and_record_prompt_response(
-        &prompt_response,
-        &prompt_path,
+    if !prompt_response.body.is_empty() {
+        return Err(OpenCodeError::Protocol(
+            "OpenCode async prompt acceptance unexpectedly contained a body",
+        ));
+    }
+    record_raw_response("POST", &prompt_path, &prompt_response, fixture)?;
+
+    let messages_path = format!("/session/{session_id}/message");
+    let messages_request = http_request_payload("GET", &messages_path, "", "null")?;
+    fixture.record(Direction::C2s, Transport::Http, &messages_request)?;
+    let messages_response =
+        request_json_unrecorded(client, base_url, Method::GET, &messages_path, None)?;
+    let prompt_messages = validate_and_record_prompt_messages(
+        &messages_response,
+        &messages_path,
         &session_id,
         sandbox,
         fixture,
     )?;
     if scenario == Scenario::Cancel {
-        observe_prompt_abort(&prompt_value, &mut state);
+        if let Some(messages) = prompt_messages.as_array() {
+            for message in messages {
+                observe_prompt_abort(message, &mut state);
+            }
+        }
     }
 
     if scenario == Scenario::FileChange {
@@ -959,6 +991,13 @@ fn recv_with_cancellation<T>(
 ) -> Result<CancellableReceive<T>, OpenCodeError> {
     loop {
         cancellation.check()?;
+        match receiver.try_recv() {
+            Ok(value) => return Ok(CancellableReceive::Item(value)),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return Ok(CancellableReceive::Disconnected);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Ok(CancellableReceive::TimedOut);
@@ -976,7 +1015,7 @@ fn recv_with_cancellation<T>(
 fn prompt_timeout_outcome(state: ObservationState, session_id: String) -> Outcome {
     state.not_observed(
         session_id,
-        "the prompt POST timed out before its sandbox session response could be validated",
+        "the async prompt POST timed out before acceptance could be validated",
     )
 }
 
@@ -1230,6 +1269,7 @@ struct ObservationState {
     abort_sent: bool,
     question_asked: bool,
     question_replied: bool,
+    question_tool_target: Option<(String, String)>,
     unverified_tool_event: bool,
     unverified_permission_event: bool,
     observations: Vec<String>,
@@ -1488,7 +1528,18 @@ impl ObservationState {
                 self.permission_target_has_terminal(ToolTerminal::Failed) && self.idle
             }
             Scenario::Elicitation => {
-                self.tool_calls.is_empty()
+                let question_tool_complete = match self.question_tool_target.as_ref() {
+                    Some((call_id, message_id)) => {
+                        self.tool_calls.len() == 1
+                            && self.tool_calls.get(call_id).is_some_and(|lifecycle| {
+                                lifecycle.message_id == *message_id
+                                    && lifecycle.updated
+                                    && lifecycle.terminal == Some(ToolTerminal::Succeeded)
+                            })
+                    }
+                    None => self.tool_calls.is_empty(),
+                };
+                question_tool_complete
                     && self.permission.is_none()
                     && self.question_asked
                     && self.question_replied
@@ -1790,6 +1841,15 @@ fn observe_event(event: &Value, state: &mut ObservationState) {
         "question.asked" | "question.v2.asked" => {
             state.idle = false;
             state.question_asked = true;
+            state.question_tool_target = event
+                .pointer("/properties/tool/callID")
+                .and_then(Value::as_str)
+                .zip(
+                    event
+                        .pointer("/properties/tool/messageID")
+                        .and_then(Value::as_str),
+                )
+                .map(|(call_id, message_id)| (call_id.to_owned(), message_id.to_owned()));
             state.add(event_type);
         }
         _ => {}
@@ -2953,7 +3013,7 @@ mod tests {
     }
 
     #[test]
-    fn foreign_prompt_response_is_not_written() -> Result<(), Box<dyn std::error::Error>> {
+    fn foreign_prompt_messages_are_not_written() -> Result<(), Box<dyn std::error::Error>> {
         const PROMPT_MARKER: &str = "PRIVATE FOREIGN PROMPT RESPONSE";
         let temporary = tempfile::tempdir()?;
         let sandbox = temporary.path().join("sandbox");
@@ -2962,7 +3022,7 @@ mod tests {
         let response = RawResponse {
             status: StatusCode::OK,
             content_type: "application/json".to_owned(),
-            body: json!({
+            body: json!([{
                 "info": {
                     "id": "msg_foreign",
                     "sessionID": "ses_foreign",
@@ -2970,12 +3030,12 @@ mod tests {
                 },
                 "parts": [],
                 "private": PROMPT_MARKER
-            })
+            }])
             .to_string(),
         };
         let mut fixture = FixtureSink::new(Vec::new(), Redactor::from_pairs([]));
 
-        let result = validate_and_record_prompt_response(
+        let result = validate_and_record_prompt_messages(
             &response,
             "/session/ses_current/message",
             "ses_current",
@@ -2990,6 +3050,50 @@ mod tests {
         let output = String::from_utf8(fixture.into_inner())?;
         assert!(output.is_empty());
         assert!(!output.contains(PROMPT_MARKER));
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_messages_allow_pathless_user_only_with_a_scoped_assistant(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let sandbox = temporary.path().join("sandbox");
+        std::fs::create_dir_all(&sandbox)?;
+        let sandbox = sandbox.canonicalize()?;
+        let response = RawResponse {
+            status: StatusCode::OK,
+            content_type: "application/json".to_owned(),
+            body: json!([
+                {
+                    "info": {
+                        "id": "msg_user",
+                        "sessionID": "ses_current",
+                        "role": "user"
+                    },
+                    "parts": []
+                },
+                {
+                    "info": {
+                        "id": "msg_assistant",
+                        "sessionID": "ses_current",
+                        "role": "assistant",
+                        "path": {"cwd": sandbox, "root": sandbox}
+                    },
+                    "parts": []
+                }
+            ])
+            .to_string(),
+        };
+        let mut fixture = FixtureSink::new(Vec::new(), Redactor::from_pairs([]));
+        assert!(validate_and_record_prompt_messages(
+            &response,
+            "/session/ses_current/message",
+            "ses_current",
+            &sandbox,
+            &mut fixture,
+        )
+        .is_ok());
+        assert!(!fixture.into_inner().is_empty());
         Ok(())
     }
 
@@ -4150,6 +4254,30 @@ mod tests {
     }
 
     #[test]
+    fn elicitation_completion_accepts_only_its_correlated_question_tool() {
+        let mut state = ObservationState {
+            idle: true,
+            question_asked: true,
+            question_replied: true,
+            question_tool_target: Some(("call_question".to_owned(), "msg_question".to_owned())),
+            ..ObservationState::default()
+        };
+        let mut lifecycle = ToolLifecycle::new("msg_question", Some("part_question"));
+        lifecycle.updated = true;
+        lifecycle.terminal = Some(ToolTerminal::Succeeded);
+        state
+            .tool_calls
+            .insert("call_question".to_owned(), lifecycle);
+        assert!(state.is_complete(Scenario::Elicitation));
+
+        state.tool_calls.insert(
+            "call_unrelated".to_owned(),
+            ToolLifecycle::new("msg_unrelated", None),
+        );
+        assert!(!state.is_complete(Scenario::Elicitation));
+    }
+
+    #[test]
     fn user_text_does_not_complete_simple_turn() {
         let mut state = ObservationState::default();
         observe_event(
@@ -4456,6 +4584,16 @@ mod tests {
 
         assert!(matches!(result, Err(OpenCodeError::Interrupted)));
         assert!(!git.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn queued_receive_wins_even_after_the_deadline() -> Result<(), Box<dyn std::error::Error>> {
+        let (sender, receiver) = mpsc::channel();
+        sender.send(7_u8)?;
+        let received =
+            recv_with_cancellation(&receiver, Instant::now(), &CancellationToken::default())?;
+        assert!(matches!(received, CancellableReceive::Item(7)));
         Ok(())
     }
 

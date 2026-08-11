@@ -14,6 +14,8 @@ publish = false
 iroh = { version = "=1.0.3", default-features = false, features = ["tls-ring"] }
 kaleido-adapter = { path = "../kaleido-adapter" }
 kaleido-adapter-codex = { path = "../kaleido-adapter-codex" }
+kaleido-adapter-claude = { path = "../kaleido-adapter-claude" }
+kaleido-adapter-opencode = { path = "../kaleido-adapter-opencode" }
 kaleido-proto = { path = "../kaleido-proto" }
 kaleido-state = { path = "../kaleido-state" }
 kaleido-transport = { path = "../kaleido-transport" }

@@ -68,13 +68,24 @@ impl ProjectionCache {
         let mut current: HashMap<ProjectionKey, ProjectionEnvelope> = HashMap::new();
         for path in paths {
             let bytes = fs::read(&path).map_err(|error| io("read", error))?;
+            let header = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .map_err(|_| CacheError::Malformed)?;
+            let version_is_current = header
+                .get("projection_version")
+                .and_then(serde_json::Value::as_u64)
+                == Some(u64::from(PROJECTION_VERSION));
+            // Decode the version header before the payload. A pre-v3
+            // AttentionInbox has the old single-question wire shape and is
+            // intentionally not deserializable as v3; derived projection
+            // cache may be discarded without touching pairing credentials.
+            // #[allow(kaleido::version_branch)] reason: cache invalidation enforces the negotiated projection wire format and never selects a product capability
+            if !version_is_current {
+                fs::remove_file(&path).map_err(|error| io("invalidate", error))?;
+                continue;
+            }
             let envelope = serde_json::from_slice::<ProjectionEnvelope>(&bytes)
                 .map_err(|_| CacheError::Malformed)?;
             envelope.validate_for_transport()?;
-            // #[allow(kaleido::version_branch)] reason: cache invalidation enforces the negotiated projection wire format and never selects a product capability
-            if envelope.projection_version != PROJECTION_VERSION {
-                continue;
-            }
             if path.file_name().and_then(|name| name.to_str())
                 != Some(file_name(&envelope)?.as_str())
             {
@@ -371,5 +382,23 @@ mod tests {
                 .cached(&valid.key),
             None
         );
+    }
+
+    #[test]
+    fn cold_start_discards_an_old_projection_before_decoding_its_payload() {
+        let directory = tempfile::tempdir().expect("cache directory");
+        let cache_root = directory.path().join("projection-cache");
+        std::fs::create_dir_all(&cache_root).expect("cache directory");
+        let stale = cache_root.join("r4-attention-cache.json");
+        std::fs::write(
+            &stale,
+            br#"{"projection_version":2,"payload":{"kind":"attention_inbox","view":{"old_question_shape":true}}}"#,
+        )
+        .expect("old cache fixture");
+
+        let cache = ProjectionCache::open(directory.path()).expect("open after upgrade");
+
+        assert!(cache.current.is_empty());
+        assert!(!stale.exists());
     }
 }

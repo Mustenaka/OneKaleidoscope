@@ -17,13 +17,14 @@ use kaleido_proto::content::{
 use kaleido_proto::effect::StateEffect;
 use kaleido_proto::error::{CanonicalError, ErrorCode};
 use kaleido_proto::host::HostReachability;
-use kaleido_proto::ids::{DeviceId, HostId};
+use kaleido_proto::ids::{CommandId, DeviceId, HostId, QueueEntryId};
 use kaleido_proto::projection::{
     ProjectionEnvelope, ProjectionKey, ProjectionSubscribe, ProjectionSubscribeOutcome,
 };
+use kaleido_proto::queue::QueueEntry;
 use kaleido_state::{
     CanonicalStore, ClockSource, ContentStore, DeviceCommandAdmission, DispatchClaim,
-    DispatchTicket, PendingDispatch, ProjectionReplay, StateError,
+    DispatchTicket, PendingDispatch, ProjectionReplay, QueueDeliveryClaim, StateError,
 };
 
 const DEFAULT_SUBSCRIPTION_CAPACITY: usize = 32;
@@ -310,6 +311,33 @@ impl Broker {
 
     pub fn pending_dispatches(&self) -> Vec<PendingDispatch> {
         lock(&self.inner).store.pending_dispatches()
+    }
+
+    pub fn pending_queue_deliveries(&self) -> Vec<(QueueEntry, CommandId)> {
+        lock(&self.inner).store.pending_queue_deliveries()
+    }
+
+    pub fn claim_queue_delivery(
+        &self,
+        entry_id: &QueueEntryId,
+        at_ms: i64,
+    ) -> Result<QueueDeliveryClaim, BrokerError> {
+        let mut state = lock(&self.inner);
+        let claim = state.store.claim_queue_delivery(entry_id, at_ms)?;
+        publish(&mut state, &claim.projections, at_ms);
+        Ok(claim)
+    }
+
+    pub fn finish_queue_delivery(
+        &self,
+        entry_id: &QueueEntryId,
+        effects: &[StateEffect],
+        at_ms: i64,
+    ) -> Result<Vec<ProjectionEnvelope>, BrokerError> {
+        let mut state = lock(&self.inner);
+        let projections = state.store.finish_queue_delivery(entry_id, effects)?;
+        publish(&mut state, &projections, at_ms);
+        Ok(projections)
     }
 
     pub fn claim_dispatch(

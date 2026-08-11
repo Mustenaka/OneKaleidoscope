@@ -1,16 +1,19 @@
-# PROTOCOL — UACP v0.3
+# PROTOCOL — UACP v0.5
 
-> 状态：**v0.3 合同定稿，2026-08-09**
+> 状态：**v0.5 合同定稿，2026-08-10**
 > 需求真源是 [REQUIREMENTS.md](REQUIREMENTS.md)。本文件在其之下、在任务卡之上。
 > 相关决策：[ADR-0009](adr/0009-session-broker.md)、[ADR-0010](adr/0010-canonical-state-and-workflow.md)、
 > [ADR-0011](adr/0011-self-hosted-connectivity.md)、[ADR-0012](adr/0012-provider-decode-strategy.md)、
 > [ADR-0018](adr/0018-attention-answer-provenance.md)、
+> [ADR-0025](adr/0025-question-set.md)、
+> [ADR-0026](adr/0026-opencode-generated-rest-sse.md)、
+> [ADR-0027](adr/0027-claude-sdk-sidecar-provisional-session.md)、
 > [ADR-0020](adr/0020-projection-cursors-and-mobile-ingress.md)、
 > [ADR-0021](adr/0021-r3-lan-security.md)。
 
 本文件定义 UACP（Unified Agent Control Protocol）的**规范化状态、命令、状态转移、
 投影、cursor 与能力语义**。它是 `crates/kaleido-proto` 的逐字来源：proto 中出现的每个类型
-都必须能在本文件找到定义，本文件定义的每个 v0.3 类型都必须在 proto 中存在。
+都必须能在本文件找到定义，本文件定义的每个 v0.5 类型都必须在 proto 中存在。
 
 **关键词**：必须 / 不得 / 应当 / 可以，按 RFC 2119 语义解释。
 
@@ -49,7 +52,7 @@ provider 报文
 ## 1. 版本与兼容
 
 ```
-PROTOCOL_VERSION = "0.3.0"
+PROTOCOL_VERSION = "0.5.0"
 ```
 
 - 握手时双方交换 `protocol_version`，格式必须是三个十进制分量
@@ -58,10 +61,10 @@ PROTOCOL_VERSION = "0.3.0"
   [TRANSPORT 0.1](TRANSPORT.md) 定义：先接受 transport hello，再接受 UACP hello，最后完成
   设备认证；三者全部成功前不得解码业务消息。版本失败是 transport error，不是 provider
   `CanonicalError`。
-- v0.3 是 pre-1.0。**minor 是兼容边界**：本实现只接受 `0.3.x`；`0.0.x`、
-  `0.1.x`、`0.2.x`、其他 `0.x`、`1.x` 和畸形版本都必须在解码业务消息前拒绝。
-- `0.3.x` 的 patch 版本只允许文档澄清和不改变 wire 形状的修复。
-- 所有 v0.3 UACP wire enum 都是**闭合合同**。未知 UACP `kind` 必须解码失败，
+- v0.5 是 pre-1.0。**minor 是兼容边界**：本实现只接受 `0.5.x`；`0.0.x`、
+  `0.1.x`、`0.2.x`、`0.3.x`、其他 `0.x`、`1.x` 和畸形版本都必须在解码业务消息前拒绝。
+- `0.5.x` 的 patch 版本只允许文档澄清和不改变 wire 形状的修复。
+- 所有 v0.5 UACP wire enum 都是**闭合合同**。未知 UACP `kind` 必须解码失败，
   不得猜成相近语义，也不得声称新增变体天然向前兼容。
 - v0.2 durable data 不做启发式迁移；特别是旧 `Actor::Human { device_label }` 不得按显示名
   铸造 `DeviceId`。遇到旧形状必须 fail-loud，再由显式离线迁移工具或清理策略处理。
@@ -89,10 +92,10 @@ PROTOCOL_VERSION = "0.3.0"
 `JoinState`、`JoinFailureReason`、`DecisionSemantics`、`WorkflowState`、
 `StepRole`、`StepState`、`CompletionCondition`、`ArtifactKind`,
 `WorkflowAction`、`StepBlocker`、`ErrorCode`、`Actor`、`Command`、
-`CommandOutcome`、`StateEffect`、`DiagnosticCode`、`StreamKey`、
+`CommandOutcome`、`RuntimeAcceptanceKind`、`StateEffect`、`DiagnosticCode`、`StreamKey`、
 `SnapshotPayload`、`SubscribeOutcome`、`ProjectionKey`、`ProjectionPayload`、
 `ProjectionSubscribeOutcome`、`ContentWriteResponse` 和
-`ContentReadResponse`。v0.3 没有用于承接上游未知标签的开放 wire enum。
+`ContentReadResponse`。v0.5 没有用于承接上游未知标签的开放 wire enum。
 
 ---
 
@@ -360,7 +363,7 @@ Session {
   binding_handle: Option<ProviderBindingHandle>,
 }
 
-OwnershipMode = BrokerManaged | SharedRuntime | ExternalNative
+OwnershipMode = BrokerManaged | ProviderManaged | SharedRuntime | ExternalNative
 
 SessionStatus =
   | Offline | Idle | Running | WaitingUser | WaitingApproval
@@ -404,8 +407,10 @@ LiveUnboundReason =
 - 写入 `Observing` / `Controlling` 时，候选 Session 必须从它自己的 binding 或 history
   runtime 引用解析到当前 runtime；不得在候选对象删除或改写引用后，借用 store 中旧 Session
   的 runtime 或 capability 通过校验。
-- `BrokerManaged`、`SharedRuntime` 与 `ExternalNative` 使用相同的控制证据门槛；ownership
-  不构成能力证据。Replay、仅观察、无本地 command correlation 或只有本地接受的路径不得进入
+- `BrokerManaged` 表示 Broker 拥有会话生命周期；`ProviderManaged` 表示公开 provider SDK
+  管理持久化并允许结构化 list/resume，但不声称独立 native CLI/GUI surface；`SharedRuntime`
+  表示共享结构化 runtime，`ExternalNative` 才表示由外部原生表面创建/拥有。四者使用相同的
+  控制证据门槛；ownership 不构成能力证据。Replay、仅观察、无本地 command correlation 或只有本地接受的路径不得进入
   `Controlling`。
 - R3 客户端显示一个具体干预按钮时，必须同时检查 Session 仍为 live，以及该动作对应的具体
   capability 为 `Supported`。`Controlling` 表示已取得的 Session 级控制证据，不是所有按钮的
@@ -601,7 +606,8 @@ AttentionSubject =
 AttentionState =
   | Open
   | Answered { option_id: Option<String>, free_form_ref: Option<ContentRef>,
-               decided_at_ms: i64, answer_source: AttentionAnswerSource }
+               question_answers: Vec<QuestionAnswer>, decided_at_ms: i64,
+               answer_source: AttentionAnswerSource }
   | Expired  { at_ms: i64 }
   | Superseded { by: AttentionId }
   | Cancelled { at_ms: i64 }
@@ -639,10 +645,22 @@ JoinFailureReason = ItemNotYetSeen | ItemUnknown | AmbiguousTarget
 
 QuestionRequest {
   request_key: String,
+  questions: Vec<QuestionPrompt>,          // non-empty
+  binding_handle: ProviderBindingHandle,
+}
+
+QuestionPrompt {
+  question_key: String,
   prompt_ref: ContentRef,
   options: Vec<DecisionOption>,
+  multi_select: bool,
   free_form_allowed: bool,
-  binding_handle: ProviderBindingHandle,
+}
+
+QuestionAnswer {
+  question_key: String,
+  option_ids: Vec<String>,
+  free_form_ref: Option<ContentRef>,
 }
 
 WorkflowGateRequest {
@@ -674,6 +692,7 @@ AttentionResponse {
   expected_expires_at_ms: Option<i64>,
   option_id: Option<String>,
   free_form_ref: Option<ContentRef>,
+  question_answers: Vec<QuestionAnswer>,
 }
 ```
 
@@ -686,7 +705,12 @@ AttentionResponse {
   重复目标为 `AmbiguousTarget`；session/turn 不同为 `ScopeMismatch`。
 - Approval 与 Question 必须有 `AttentionItem.session_id`。WorkflowGate 必须有
   `workflow_id`、稳定 `request_key`、可选择的 options 或允许 free-form，因此三类都
-  可以被同一个 `AttentionResponse` 回答。
+  可以被同一个 `AttentionResponse` 回答。Approval 与 WorkflowGate 的
+  `question_answers` 必须为空，并继续使用顶层 `option_id` / `free_form_ref`。
+  Question 的两个顶层字段必须为空；`question_answers` 必须恰好覆盖
+  `QuestionRequest.questions` 的每个 `question_key`。问题 key、答案 key 与
+  每题 option id 都不得重复；单选题最多一个 option。空答案、未知问题/选项、
+  不允许的 free-form、非法 free-form 引用和重复值都必须拒绝。
 - 回复必须同时绑定 `attention_id`、目标 `session_id`（若有）、`request_key` 与
   `expected_expires_at_ms`；expected expiry 必须与当前 AttentionItem 完全一致。
   validator 还必须检查当前 state 是 `Open`、`now_ms < expires_at_ms`、选择项存在，
@@ -703,12 +727,18 @@ AttentionResponse {
   `CommandOutcome::Duplicate`；对任何已经 `Answered` 的事项新发本地回复，均返回
   `Rejected { error.code = ApprovalAlreadyAnswered }`，不得下发给 runtime。
 - `options` 由 runtime 提供，**不得**在客户端硬编码为「同意/拒绝」两项。
-- 同一 request 的 `option_id` 不得重复；回复至少要有 option 或 free-form 之一。
+- 同一 request 的 `option_id` 不得重复；审批/工作流回复至少要有 option 或
+  free-form 之一。Question 回复至少要有一条 `QuestionAnswer`，且每条答案
+  至少含一个 option 或一个合法 free-form 引用。
 - `ConnectionFault` 使会话在移动端 Inbox 可见，但不产生 `Turn.error`。
+
+每个 `QuestionPrompt.prompt_ref` 与每个 `QuestionAnswer.free_form_ref` 都是
+独立的 `ContentRef`。正文只能通过内容读写接口访问，不能内嵌进 attention
+JSON、durable log、projection 或 tracing；状态引用遍历必须覆盖这些引用。
 
 ### 4.8 Workflow
 
-Workflow 是 v1 必做（[ADR-0010](adr/0010-canonical-state-and-workflow.md) D-4），v0.3 只定义状态与人工推进，不含自动调度策略。
+Workflow 是 v1 必做（[ADR-0010](adr/0010-canonical-state-and-workflow.md) D-4），v0.5 只定义状态与人工推进，不含自动调度策略。
 
 ```
 Workflow {
@@ -890,7 +920,7 @@ ContentUnavailableReason =
 `Some(next_offset)`；overflow 或不一致都明确拒绝。`Evicted`/`NeverStored` 必须显式
 返回，不得以空 bytes 冒充成功。transport 在发送 bytes 前必须完成 Host pin、设备鉴权与
 TLS 1.3 加密。R3 的读取请求绑定当前已认证 `DeviceId`；更细粒度的多用户/团队 ACL 不属于
-v0.3。
+v0.5。
 
 ### 4.11 内容写入
 
@@ -1112,7 +1142,7 @@ Command =
   | CancelWorkflow    { workflow_id: WorkflowId }
 ```
 
-注意 v0.3 **没有** `SteerActiveTurn` 命令。引导一律通过
+注意 v0.5 **没有** `SteerActiveTurn` 命令。引导一律通过
 `EnqueueInput { intent: SteerActiveTurn }` 表达，由 Broker 依据能力和 runtime 确认决定
 它最终是 `DeliveredAsSteer` 还是留在 `Pending`。这样协议层面就不存在「假装已引导」的
 表达方式（R-P9）。
@@ -1153,18 +1183,23 @@ CommandAck {
 
 CommandOutcome =
   | AcceptedLocally   { note_ref: Option<ContentRef> }
-  | AcceptedByRuntime { binding_handle: ProviderBindingHandle }
+  | AcceptedByRuntime { session_id: SessionId, acceptance_kind: RuntimeAcceptanceKind, binding_handle: ProviderBindingHandle }
   | Enqueued          { entry_id: QueueEntryId }
   | Rejected          { error: CanonicalError }
   | Duplicate         { original_command_id: CommandId }
+
+RuntimeAcceptanceKind = PromptTurn | SessionControl
 ```
 
 规范（R-P10）：
 
 - `AcceptedLocally` 表示 Broker 已持久化，但 runtime 还没接受。UI 不得显示为
   「Agent 已收到」。
-- `AcceptedByRuntime` 必须携带 Broker `ProviderBindingHandle`；上游原始确认 ID 仍只在
-  adapter 私有绑定存储。
+- `AcceptedByRuntime` 必须携带 canonical `session_id` 与 Broker
+  `ProviderBindingHandle`；上游原始确认 ID 仍只在 adapter 私有绑定存储。write path 必须验证
+  该 Session 解析到 handle 的同一 runtime，因此 interrupt 等不创建新 Turn 的命令也有明确 scope。
+- `PromptTurn` 必须关联同一 `command_id` / Session 的唯一 `RemoteCommand` Turn；
+  `SessionControl` 只用于 interrupt 等不创建新 Turn 的 session-scoped 操作，两者不得互换。
 - `AcceptedByRuntime` 只能在 adapter 收到与本地 command 关联、足以证明 runtime 已接受的
   结构化响应或通知后产生。发送 bytes 成功或 transport API 无错误返回不足以产生该 outcome。它是
   `LiveControl` / `Controlling` 的唯一合格控制证据，见 §4.2 / §4.3。
@@ -1224,7 +1259,7 @@ ErrorCode =
 `projection_version`，客户端据此判断是否需要全量刷新。
 
 ```
-PROJECTION_VERSION = 2
+PROJECTION_VERSION = 3
 ```
 
 | Projection | 内容 | 需求来源 |
@@ -1551,9 +1586,9 @@ diff 或命令内容。可展示上下文在 `:48` 的 item 报文里。因此 `
 两条 reasoning、两条 agentMessage 和一条 fileChange。因此 `Turn.item_ids` 必须由逐条
 item 转移累积，见 §4.4。
 
-### 11.3 观测到但 v0.3 不使用的面
+### 11.3 观测到但 v0.5 不使用的面
 
-以下 method 在真实录制中出现，v0.3 **不**建模，一律走 `DiagnosticRecorded`：
+以下 method 在真实录制中出现，v0.5 **不**建模，一律走 `DiagnosticRecorded`：
 
 `mcpServer/startupStatus/updated`、`thread/tokenUsage/updated`、
 `account/rateLimits/updated`、`remoteControl/status/changed`。
@@ -1562,16 +1597,73 @@ item 转移累积，见 §4.4。
 `codex app-server daemon` 的控制 socket 是 R7 原生表面研究的线索，**不得**在 T-100 中
 作为依赖使用（[ADR-0009](adr/0009-session-broker.md) D-5）。
 
+### 11.4 OpenCode server REST + SSE
+
+本映射只适用于公开 OpenCode server。REST history 与 SSE live 是不同证据；共享 server
+也不等于可以附着任意独立 TUI/GUI 进程。类型与恢复决策见
+[ADR-0026](adr/0026-opencode-generated-rest-sse.md)。
+
+| 上游 operation/event | canonical 效果 |
+|---|---|
+| `GET /session` | 每个结构化 Session 经私有 raw binding 映射为 `SessionUpserted`；证明 `HistoryList` |
+| `GET /session/{sessionID}` + `GET /session/{sessionID}/message` | REST snapshot 归约 Project/Session/Turn/Item；证明 `HistoryRead` / `HistoryResume`，但不证明 live |
+| `POST /session` | 在当前 shared server 创建 `ownership = SharedRuntime` 的 Session；raw session id 只进入私有 binding。只有 hostd 还拥有 server 进程生命周期时才可另证 `BrokerManaged` |
+| `GET /event` 实际收到并解码首条 SSE | 证明 `LiveObserve`；对应 Session 从 `NotBound` 进入 `Observing` |
+| `server.connected` | 只确认结构化 stream 已连接；不产生 transcript item |
+| `session.created` / `session.updated` | `SessionUpserted`；scope 必须匹配已选 project directory |
+| `session.status` / `session.idle` | busy/retry/idle 映射为 Session/Turn 运行状态；未知 status fail-closed |
+| `message.updated` | user/assistant message 映射 Turn 与 UserMessage/AgentMessage 生命周期 |
+| `message.part.updated` / `message.part.delta` | text/reasoning/tool/file part 映射现有 `ItemBody`；delta 追加到同一 item，不覆盖先前正文 |
+| `permission.asked` / `permission.replied` 及 v2 同构事件 | `AttentionUpserted { Approval }` / `AttentionState::Answered`；无本地 command association 的结果使用 `ObservedExternal` |
+| `question.asked` / `question.replied` 及 v2 同构事件 | `AttentionUpserted { Question }`（QuestionSet shape）/ 逐题 `QuestionAnswer`；保持问题顺序、single/multi/free-form 约束 |
+| `POST /api/session/{sessionID}/prompt` admission receipt | 与本地 `CommandId` 和目标 `SessionId` 的唯一 RemoteCommand Turn 关联后产生 `AcceptedByRuntime { acceptance_kind = PromptTurn }`；delivery 为 queue 时另证明 `QueueWrite` |
+| legacy `prompt_async` 无 receipt | 可以发送兼容请求，但不产生 runtime ack，也不提升 prompt/queue capability |
+| `POST /session/{sessionID}/abort` 成功 | 仅对该 Session 当前 active Turn 产生 `AcceptedByRuntime { acceptance_kind = SessionControl }`，并证明 `TurnInterrupt`；不得伪造新 Turn |
+| 未知 event/已知 event 的未知 shape 或 scope | `DiagnosticRecorded` 或 `RuntimeProtocolViolation`；不得猜成已知 item |
+
+`step-start` / `step-finish` 是 provider 边界事件，本版不凭空制造 canonical Item。
+`session.diff` 只有生成类型验证且 shape 可表达时才消费；不支持的非空 shape fail-closed。
+
+OpenCode `/event` 没有公开 replay cursor。provider reconnect 必须先取新 REST snapshot，再开新
+SSE tail，并明确返回 `lossless_replay = false`。payload event id 去重与 raw entity identity
+收敛可以阻止重复 effect，但不能证明 snapshot 与 tail 之间无 gap。移动端 projection cursor 的精确恢复与该
+provider 输入边界是两件事。
+
+### 11.5 Claude Agent SDK managed session
+
+本映射只适用于钉定的公开 Claude Agent SDK。TypeScript sidecar 消费官方类型并输出本项目
+闭合 frame；Rust 不定义 Claude SDK 上游 DTO。SDK managed session 不等于独立原生 Claude
+CLI/GUI 第三方 attach。决策见
+[ADR-0027](adr/0027-claude-sdk-sidecar-provisional-session.md)。
+
+| sidecar/SDK 结构化事实 | canonical 效果 |
+|---|---|
+| `ready { cwd }` | 创建 stable provisional `BrokerManaged` Session：`history = None`、`live = NotBound(NeverStarted)`、无 provider binding；不证明任何 Claude 会话能力 |
+| official `listSessions({ dir })` → `session_list` | 发现 `ownership = ProviderManaged` 的离线 Session metadata，只证明公开 SDK 管理持久化与 `HistoryList`；不证明 `HistoryRead`、live 或原生 CLI/GUI attach |
+| official `getSessionMessages(sessionID, { dir })` | 只有真实 typed message 结果成功归约为 Turn/Item 后才证明 `HistoryRead`；未调用/失败时保持 `NotVerified` |
+| `session_started` | 为 provisional Session 绑定真实 raw Claude session id，更新 `HistorySource::ProviderApi` 与 live observation |
+| `session_resumed` | 同上，并在真实 resume frame 后证明 `HistoryResume` |
+| SDK input 被 `query()` 消费 → `prompt_accepted` | 与本地 `CommandId` 和目标 `SessionId` 的唯一 RemoteCommand Turn 关联后产生 `AcceptedByRuntime { acceptance_kind = PromptTurn }`；仅写入 sidecar stdin/queue 不够 |
+| SDK init/assistant/user/result message | 归约 Turn、Item 与 Session 状态；assistant API/auth error 保留为失败，不冒充成功文本 |
+| `canUseTool` permission callback | `AttentionUpserted { Approval }`；等待 canonical reply 后返回 SDK `PermissionResult` |
+| official typed `AskUserQuestionInput` | 逐题映射 `QuestionRequest.questions`；回答按 key 映回 SDK `updatedInput`，不压扁多题/多选 |
+| `activeQuery.interrupt()` → `interrupt_result` | 只有结构化结果与本地命令/目标 Session 关联后产生 `AcceptedByRuntime { acceptance_kind = SessionControl }` 并证明 `TurnInterrupt`；不得伪造新 Turn |
+| malformed/unknown sidecar frame | `DiagnosticRecorded` 或 `RuntimeProtocolViolation`；不得穿透未定型 JSON |
+
+provisional Session 只是 hostd 在第一条 prompt 前的稳定路由身份。它没有 raw provider binding，
+不能用于声称 history、live、resume、原生表面 attach 或控制成功。raw Claude
+session/message/tool/request ID 只存在 adapter 私有绑定与受控 fixture。
+
 ---
 
-## 12. v0.3 明确不含
+## 12. v0.5 明确不含
 
 | 项 | 归属 |
 |---|---|
 | 公网 rendezvous、relay 路由与 push | R4；R3 LAN 的 TLS、分帧、配对、认证与吊销由 [TRANSPORT 0.1](TRANSPORT.md) 定义 |
 | Workflow 自动调度与自动质量评估 | ADR-0010 D-4 允许后做 |
 | 文件树、代码预览、Git 命令投影 | R9 |
-| OpenCode / Claude / ACP 映射附录 | R5，各自接入时追加 §11 同构章节 |
+| ACP 映射附录 | R5/R7 的额外兼容路径；接入时追加 §11 同构章节 |
 | 外部原生 CLI/GUI 附着的发现与绑定合同 | R7，当前为 `CapabilityState::UpstreamBlocked` |
 | 多用户与团队权限 | REQUIREMENTS §7.3 明确不做 |
 

@@ -34,12 +34,15 @@ import uniffi.kaleido_core.ConnectionStatusCallback
 import uniffi.kaleido_core.MobileClient
 import uniffi.kaleido_core.MobileClientException
 import uniffi.kaleido_core.MobileConnectionStatus
+import uniffi.kaleido_core.MobileQuestionAnswer
+import uniffi.kaleido_core.MobileResumeContext
 import uniffi.kaleido_core.MobileSessionAction
 import uniffi.kaleido_core.ProjectionCallback
 import uniffi.kaleido_core.ProjectionSubscription
 import uniffi.kaleido_core.mobileAttentionActionAvailability
 import uniffi.kaleido_core.mobileSessionActionAvailability
 import uniffi.kaleido_proto.AttentionItem
+import uniffi.kaleido_proto.AttentionSubject
 import uniffi.kaleido_proto.CanonicalError
 import uniffi.kaleido_proto.CommandAck
 import uniffi.kaleido_proto.CommandOutcome
@@ -59,6 +62,7 @@ import uniffi.kaleido_proto.SessionId
 import uniffi.kaleido_proto.SessionIndexView
 import uniffi.kaleido_proto.SessionSummary
 import uniffi.kaleido_proto.TranscriptView
+import uniffi.kaleido_proto.TurnId
 
 /**
  * Android lifecycle adapter around the Rust mobile core.
@@ -89,12 +93,15 @@ internal class MobileRepository(
     private var projectIndexFreshness = DataFreshness.CachedOffline
     private val projectNames = mutableMapOf<String, String>()
     private val projectRuntimes = mutableMapOf<String, String>()
+    private val projectBindingRuntimes = mutableMapOf<String, String>()
     private val hostRuntimeIds = linkedSetOf<String>()
 
     private val sessionViews = mutableMapOf<String, SessionIndexView>()
     private val sessionFreshness = mutableMapOf<String, DataFreshness>()
     private val sessionsByProject = mutableMapOf<String, Map<String, SessionSummary>>()
     private val sessionsById = mutableMapOf<String, SessionSummary>()
+    private val historySessionIdsByProject = mutableMapOf<String, Set<String>>()
+    private val historySessionIds = mutableSetOf<String>()
 
     private val transcriptViews = mutableMapOf<String, TranscriptView>()
     private val transcriptFreshness = mutableMapOf<String, DataFreshness>()
@@ -107,6 +114,7 @@ internal class MobileRepository(
     private val capabilities = mutableMapOf<String, RuntimeCapabilityView>()
     private val capabilityFreshness = mutableMapOf<String, DataFreshness>()
     private var attentionItems: List<AttentionItem> = emptyList()
+    private val questionRequestIdentities = mutableMapOf<String, String>()
     private var attentionFreshness = DataFreshness.CachedOffline
     private val ephemeralText = mutableMapOf<String, TextResult>()
 
@@ -275,11 +283,23 @@ internal class MobileRepository(
             is UiAction.SelectRuntime -> selectRuntime(action.runtimeId)
             is UiAction.UpdateDraft -> mutableState.update { it.copy(draft = action.value) }
             UiAction.SubmitPrompt -> submitPrompt()
+            UiAction.ResumeSession -> resumeSession()
+            UiAction.InterruptTurn -> interruptTurn()
             is UiAction.EnqueueInput -> enqueue(action.intent)
             is UiAction.UpdateAttentionDraft -> mutableState.update {
                 it.copy(attentionDrafts = it.attentionDrafts + (action.attentionId to action.value))
             }
+            is UiAction.UpdateQuestionDraft -> mutableState.update { state ->
+                val current = state.questionDrafts[action.attentionId].orEmpty()
+                val next = current.filterNot {
+                    it.questionKey == action.answer.questionKey
+                } + action.answer.copy(optionIds = action.answer.optionIds.toList())
+                state.copy(
+                    questionDrafts = state.questionDrafts + (action.attentionId to next),
+                )
+            }
             is UiAction.RespondAttention -> respondAttention(action)
+            is UiAction.RespondQuestion -> respondQuestion(action)
             is UiAction.ForgetHost -> showMessage("请先在 hostd 撤销此设备；本版本不在本地静默遗忘凭据")
             UiAction.DismissMessage -> mutableState.update { it.copy(message = null) }
             UiAction.MessageAction, is UiAction.Navigate -> Unit
@@ -463,7 +483,9 @@ internal class MobileRepository(
 
     private fun selectSession(sessionId: String) {
         val session = sessionsById[sessionId]
-        val runtimeId = liveRuntimeId(session?.liveBinding) ?: mutableState.value.selectedRuntimeId
+        val runtimeId = liveRuntimeId(session?.liveBinding)
+            ?: session?.projectBindingId?.value?.let(projectBindingRuntimes::get)
+            ?: mutableState.value.selectedRuntimeId
         mutableState.update {
             it.copy(
                 selectedSessionId = sessionId,
@@ -645,6 +667,10 @@ internal class MobileRepository(
                 projects.forEach { projectNames[it.id] = it.displayName }
                 projectRuntimes.clear()
                 projectRuntimes.putAll(ProjectionMapper.projectRuntimeIds(payload.view))
+                projectBindingRuntimes.clear()
+                projectBindingRuntimes.putAll(
+                    ProjectionMapper.projectBindingRuntimeIds(payload.view),
+                )
                 hostRuntimeIds.clear()
                 hostRuntimeIds += payload.view.groups.flatMap { it.runtimeIds }.map { it.value }
                 renderProjectIndex()
@@ -657,6 +683,8 @@ internal class MobileRepository(
                 sessionFreshness[projectId] = freshness
                 val (_, raw) = ProjectionMapper.sessions(payload.view)
                 sessionsByProject[projectId] = raw
+                historySessionIdsByProject[projectId] =
+                    payload.view.history.mapTo(mutableSetOf()) { it.sessionId.value }
                 rebuildSessionIndex()
                 if (mutableState.value.selectedProjectId == projectId) renderSelectedSessions()
                 renderAttention()
@@ -677,6 +705,7 @@ internal class MobileRepository(
                 liveViews[sessionId] = payload.view
                 liveFreshness[sessionId] = freshness
                 if (mutableState.value.selectedSessionId == sessionId) renderLive(sessionId)
+                refreshActionAvailability()
             }
             is ProjectionPayload.InputQueue -> {
                 val sessionId = payload.view.sessionId.value
@@ -687,6 +716,28 @@ internal class MobileRepository(
             }
             is ProjectionPayload.AttentionInbox -> {
                 attentionItems = payload.view.entries
+                val nextRequestIdentities = attentionItems.mapNotNull { item ->
+                    val requestKey = when (val subject = item.subject) {
+                        is AttentionSubject.Question -> subject.request.requestKey
+                        else -> null
+                    }
+                    requestKey?.let { item.id.value to it }
+                }.toMap()
+                val unchangedRequestIds = nextRequestIdentities
+                    .filter { (attentionId, requestKey) ->
+                        questionRequestIdentities[attentionId] == requestKey
+                    }
+                    .keys
+                questionRequestIdentities.clear()
+                questionRequestIdentities.putAll(nextRequestIdentities)
+                mutableState.update { state ->
+                    state.copy(
+                        attentionDrafts = state.attentionDrafts.filterKeys { attentionId ->
+                            attentionItems.any { it.id.value == attentionId }
+                        },
+                        questionDrafts = state.questionDrafts.filterKeys(unchangedRequestIds::contains),
+                    )
+                }
                 pendingActions.retainResolvedAttention(
                     payload.view.entries.mapTo(mutableSetOf()) { it.id.value },
                 )
@@ -787,6 +838,7 @@ internal class MobileRepository(
         val mapped = attentionItems.map { item ->
             val session = item.sessionId?.value?.let(sessionsById::get)
             val runtimeId = liveRuntimeId(session?.liveBinding)
+                ?: session?.projectBindingId?.value?.let(projectBindingRuntimes::get)
             val capability = runtimeId?.let(capabilities::get)
             val slot = PendingActionSlot.Attention(item.id.value)
             val availability = when {
@@ -814,6 +866,8 @@ internal class MobileRepository(
     private fun rebuildSessionIndex() {
         sessionsById.clear()
         sessionsByProject.values.forEach { sessionsById.putAll(it) }
+        historySessionIds.clear()
+        historySessionIdsByProject.values.forEach(historySessionIds::addAll)
     }
 
     private fun renderAllSelected() {
@@ -842,14 +896,29 @@ internal class MobileRepository(
             return
         }
         val runtimeId = liveRuntimeId(session.liveBinding)
+            ?: projectBindingRuntimes[session.projectBindingId.value]
         val capability = runtimeId?.let(capabilities::get)
         val queue = queueViews[sessionId]
+        val live = liveViews[sessionId]
+        val resumeContext = runtimeId?.let {
+            MobileResumeContext(
+                projectBindingId = session.projectBindingId,
+                runtimeId = ProviderRuntimeId(it),
+                historyEligible = sessionId in historySessionIds,
+            )
+        }
         mutableState.update {
             it.copy(
                 promptAction = if (runtimeId != null && capabilityFreshness[runtimeId] == DataFreshness.Live) {
                     availabilityUnlessInFlight(
                         PendingActionSlot.Prompt,
-                        mobileSessionActionAvailability(session, queue, capability, MobileSessionAction.SUBMIT_PROMPT),
+                        mobileSessionActionAvailability(
+                            session,
+                            queue,
+                            capability,
+                            MobileSessionAction.SUBMIT_PROMPT,
+                            null,
+                        ),
                     )
                 } else {
                     ActionAvailability.disabled("等待实时能力投影确认")
@@ -857,7 +926,13 @@ internal class MobileRepository(
                 enqueueNewTurnAction = if (queueFreshness[sessionId] == DataFreshness.Live) {
                     availabilityUnlessInFlight(
                         PendingActionSlot.EnqueueNewTurn,
-                        mobileSessionActionAvailability(session, queue, capability, MobileSessionAction.ENQUEUE_NEW_TURN),
+                        mobileSessionActionAvailability(
+                            session,
+                            queue,
+                            capability,
+                            MobileSessionAction.ENQUEUE_NEW_TURN,
+                            null,
+                        ),
                     )
                 } else {
                     ActionAvailability.disabled("等待实时队列投影确认")
@@ -865,10 +940,48 @@ internal class MobileRepository(
                 enqueueSteerAction = if (queueFreshness[sessionId] == DataFreshness.Live) {
                     availabilityUnlessInFlight(
                         PendingActionSlot.EnqueueSteer,
-                        mobileSessionActionAvailability(session, queue, capability, MobileSessionAction.ENQUEUE_STEER),
+                        mobileSessionActionAvailability(
+                            session,
+                            queue,
+                            capability,
+                            MobileSessionAction.ENQUEUE_STEER,
+                            null,
+                        ),
                     )
                 } else {
                     ActionAvailability.disabled("等待实时队列投影确认")
+                },
+                resumeAction = if (runtimeId != null && capabilityFreshness[runtimeId] == DataFreshness.Live) {
+                    availabilityUnlessInFlight(
+                        PendingActionSlot.Resume,
+                        mobileSessionActionAvailability(
+                            session,
+                            queue,
+                            capability,
+                            MobileSessionAction.RESUME_SESSION,
+                            resumeContext,
+                        ),
+                    )
+                } else {
+                    ActionAvailability.disabled("等待运行时恢复能力投影确认")
+                },
+                interruptAction = if (
+                    hasFreshActiveTurn(live?.activeTurnId != null, liveFreshness[sessionId]) &&
+                    runtimeId != null &&
+                    capabilityFreshness[runtimeId] == DataFreshness.Live
+                ) {
+                    availabilityUnlessInFlight(
+                        PendingActionSlot.Interrupt,
+                        mobileSessionActionAvailability(
+                            session,
+                            queue,
+                            capability,
+                            MobileSessionAction.INTERRUPT_TURN,
+                            null,
+                        ),
+                    )
+                } else {
+                    ActionAvailability.disabled("当前没有可中断的活动回合")
                 },
             )
         }
@@ -889,6 +1002,8 @@ internal class MobileRepository(
                 promptAction = ActionAvailability.disabled(reason),
                 enqueueNewTurnAction = ActionAvailability.disabled(reason),
                 enqueueSteerAction = ActionAvailability.disabled(reason),
+                resumeAction = ActionAvailability.disabled(reason),
+                interruptAction = ActionAvailability.disabled(reason),
             )
         }
         renderAttention()
@@ -906,6 +1021,34 @@ internal class MobileRepository(
             active.submitPromptText(SessionId(sessionId), text, key)
         }.onDefiniteSuccess {
             mutableState.update { state -> if (state.draft == text) state.copy(draft = "") else state }
+        }
+    }
+
+    private fun resumeSession() {
+        val active = client ?: return
+        val snapshot = mutableState.value
+        val sessionId = snapshot.selectedSessionId ?: return showMessage("请先选择会话")
+        if (!snapshot.resumeAction.enabled) {
+            return showMessage(snapshot.resumeAction.disabledReason ?: "当前会话不可恢复")
+        }
+        val signature = PendingActionSignature(PendingActionKind.Resume, sessionId, "", null)
+        performCommand(active, PendingActionSlot.Resume, signature) { key ->
+            active.resumeSession(SessionId(sessionId), key)
+        }
+    }
+
+    private fun interruptTurn() {
+        val active = client ?: return
+        val snapshot = mutableState.value
+        val sessionId = snapshot.selectedSessionId ?: return showMessage("请先选择会话")
+        val turnId = liveViews[sessionId]?.activeTurnId?.value
+            ?: return showMessage("当前没有可中断的活动回合")
+        if (!snapshot.interruptAction.enabled) {
+            return showMessage(snapshot.interruptAction.disabledReason ?: "当前回合不可中断")
+        }
+        val signature = PendingActionSignature(PendingActionKind.Interrupt, sessionId, "", turnId)
+        performCommand(active, PendingActionSlot.Interrupt, signature) { key ->
+            active.interruptTurn(SessionId(sessionId), TurnId(turnId), key)
         }
     }
 
@@ -953,6 +1096,43 @@ internal class MobileRepository(
         }.onDefiniteSuccess {
             mutableState.update { state ->
                 state.copy(attentionDrafts = state.attentionDrafts - action.attentionId)
+            }
+        }
+    }
+
+    private fun respondQuestion(action: UiAction.RespondQuestion) {
+        val active = client ?: return
+        val item = attentionItems.firstOrNull { it.id.value == action.attentionId }
+            ?: return showMessage("提醒已变化，请刷新")
+        val slot = PendingActionSlot.Attention(action.attentionId)
+        val signature = PendingActionSignature(
+            kind = PendingActionKind.Attention,
+            targetId = action.attentionId,
+            text = "",
+            optionId = null,
+            questionAnswers = action.answers.map { answer ->
+                PendingQuestionAnswerSignature(
+                    questionKey = answer.questionKey,
+                    optionIds = answer.optionIds.toList(),
+                    freeForm = answer.freeForm,
+                )
+            },
+        )
+        performCommand(active, slot, signature, retainDefiniteSuccess = true) { key ->
+            active.respondQuestionText(
+                item,
+                action.answers.map { answer ->
+                    MobileQuestionAnswer(
+                        questionKey = answer.questionKey,
+                        optionIds = answer.optionIds,
+                        freeForm = answer.freeForm,
+                    )
+                },
+                key,
+            )
+        }.onDefiniteSuccess {
+            mutableState.update { state ->
+                state.copy(questionDrafts = state.questionDrafts - action.attentionId)
             }
         }
     }
@@ -1123,12 +1303,14 @@ internal class ProjectionCursorHighWater<K> {
     }
 }
 
-internal enum class PendingActionKind { Prompt, EnqueueNewTurn, EnqueueSteer, Attention }
+internal enum class PendingActionKind { Prompt, EnqueueNewTurn, EnqueueSteer, Resume, Interrupt, Attention }
 
 internal sealed interface PendingActionSlot {
     data object Prompt : PendingActionSlot
     data object EnqueueNewTurn : PendingActionSlot
     data object EnqueueSteer : PendingActionSlot
+    data object Resume : PendingActionSlot
+    data object Interrupt : PendingActionSlot
     data class Attention(val attentionId: String) : PendingActionSlot
 }
 
@@ -1137,7 +1319,19 @@ internal data class PendingActionSignature(
     val targetId: String,
     val text: String,
     val optionId: String?,
+    val questionAnswers: List<PendingQuestionAnswerSignature> = emptyList(),
 )
+
+internal data class PendingQuestionAnswerSignature(
+    val questionKey: String,
+    val optionIds: List<String>,
+    val freeForm: String?,
+)
+
+internal fun hasFreshActiveTurn(
+    activeTurnPresent: Boolean,
+    freshness: DataFreshness?,
+): Boolean = activeTurnPresent && freshness == DataFreshness.Live
 
 internal data class PendingMobileAction(
     val signature: PendingActionSignature,

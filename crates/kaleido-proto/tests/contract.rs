@@ -1,5 +1,5 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
-//! Executable contract checks for UACP v0.3.
+//! Executable contract checks for UACP v0.5.
 //!
 //! These tests intentionally exercise both success and rejection paths. The
 //! Codex evidence checks read the committed recorder fixtures; they do not
@@ -13,7 +13,8 @@ use std::path::PathBuf;
 use kaleido_proto::attention::{
     ApprovalRequest, AttentionAnswerEvidence, AttentionAnswerEvidenceSource, AttentionAnswerSource,
     AttentionItem, AttentionResponse, AttentionState, AttentionSubject, DecisionOption,
-    DecisionSemantics, JoinFailureReason, JoinState, ReplyRejection, WorkflowGateRequest,
+    DecisionSemantics, JoinFailureReason, JoinState, QuestionAnswer, QuestionPrompt,
+    QuestionRequest, ReplyRejection, WorkflowGateRequest,
 };
 use kaleido_proto::capability::{
     Capability, CapabilityEntry, CapabilityEvidence, CapabilityState, CapabilityUnavailableReason,
@@ -21,7 +22,7 @@ use kaleido_proto::capability::{
 };
 use kaleido_proto::command::{
     Actor, Command, CommandAck, CommandEnvelope, CommandOutcome, DeviceCommandRequest,
-    MAX_DEVICE_COMMAND_TTL_MS, MAX_IDEMPOTENCY_KEY_BYTES,
+    RuntimeAcceptanceKind, MAX_DEVICE_COMMAND_TTL_MS, MAX_IDEMPOTENCY_KEY_BYTES,
 };
 use kaleido_proto::content::{
     ContentAvailability, ContentKind, ContentReadChunk, ContentReadRequest, ContentReadResponse,
@@ -399,6 +400,7 @@ fn attention_reply_binds_target_session_key_state_expiry_and_offered_option() {
     answered.state = AttentionState::Answered {
         option_id: Some("accept".to_owned()),
         free_form_ref: None,
+        question_answers: Vec::new(),
         decided_at_ms: NOW,
         answer_source: AttentionAnswerSource::LocalCommand {
             command_id: CommandId::new("command-answered"),
@@ -411,6 +413,171 @@ fn attention_reply_binds_target_session_key_state_expiry_and_offered_option() {
 }
 
 #[test]
+fn question_set_requires_exact_keyed_answers_and_preserves_each_body_ref() {
+    let item = question_attention();
+    let first = sensitive_content("content-question-first-answer", ContentKind::PlainText);
+    let valid = AttentionResponse {
+        attention_id: item.id.clone(),
+        session_id: item.session_id.clone(),
+        request_key: "question-request".to_owned(),
+        expected_expires_at_ms: item.expires_at_ms,
+        option_id: None,
+        free_form_ref: None,
+        question_answers: vec![
+            QuestionAnswer {
+                question_key: "language".to_owned(),
+                option_ids: vec!["rust".to_owned()],
+                free_form_ref: None,
+            },
+            QuestionAnswer {
+                question_key: "details".to_owned(),
+                option_ids: vec!["short".to_owned(), "tests".to_owned()],
+                free_form_ref: Some(first.clone()),
+            },
+        ],
+    };
+    assert!(item.validate().is_ok());
+    assert!(valid.validate().is_ok());
+    assert!(item.check_reply(&valid, NOW).is_ok());
+    let first_answer = valid
+        .question_answers
+        .first()
+        .cloned()
+        .expect("first question answer");
+    let second_answer = valid
+        .question_answers
+        .get(1)
+        .cloned()
+        .expect("second question answer");
+
+    let missing = AttentionResponse {
+        question_answers: vec![first_answer.clone()],
+        ..valid.clone()
+    };
+    assert_eq!(
+        item.check_reply(&missing, NOW),
+        Err(ReplyRejection::QuestionAnswerMissing)
+    );
+
+    let unknown_option = AttentionResponse {
+        question_answers: vec![
+            first_answer.clone(),
+            QuestionAnswer {
+                option_ids: vec!["invented".to_owned()],
+                ..second_answer.clone()
+            },
+        ],
+        ..valid.clone()
+    };
+    assert_eq!(
+        item.check_reply(&unknown_option, NOW),
+        Err(ReplyRejection::QuestionAnswerUnknownOption)
+    );
+
+    let unknown_key = AttentionResponse {
+        question_answers: vec![
+            first_answer.clone(),
+            QuestionAnswer {
+                question_key: "missing".to_owned(),
+                ..second_answer.clone()
+            },
+        ],
+        ..valid.clone()
+    };
+    assert_eq!(
+        item.check_reply(&unknown_key, NOW),
+        Err(ReplyRejection::QuestionAnswerUnknownKey)
+    );
+
+    let duplicate_option = AttentionResponse {
+        question_answers: vec![
+            QuestionAnswer {
+                option_ids: vec!["rust".to_owned(), "rust".to_owned()],
+                ..first_answer.clone()
+            },
+            second_answer.clone(),
+        ],
+        ..valid.clone()
+    };
+    assert_eq!(
+        item.check_reply(&duplicate_option, NOW),
+        Err(ReplyRejection::QuestionAnswerDuplicateOption)
+    );
+
+    let single_select_many = AttentionResponse {
+        question_answers: vec![
+            QuestionAnswer {
+                option_ids: vec!["rust".to_owned(), "python".to_owned()],
+                ..first_answer.clone()
+            },
+            second_answer.clone(),
+        ],
+        ..valid.clone()
+    };
+    assert_eq!(
+        item.check_reply(&single_select_many, NOW),
+        Err(ReplyRejection::QuestionAnswerTooManyOptions)
+    );
+
+    let empty_answer = AttentionResponse {
+        question_answers: vec![
+            QuestionAnswer {
+                option_ids: Vec::new(),
+                free_form_ref: None,
+                ..first_answer.clone()
+            },
+            second_answer.clone(),
+        ],
+        ..valid.clone()
+    };
+    assert_eq!(
+        item.check_reply(&empty_answer, NOW),
+        Err(ReplyRejection::QuestionAnswerEmpty)
+    );
+
+    let disallowed_free_form = AttentionResponse {
+        question_answers: vec![
+            QuestionAnswer {
+                free_form_ref: Some(first),
+                ..first_answer.clone()
+            },
+            second_answer.clone(),
+        ],
+        ..valid.clone()
+    };
+    assert_eq!(
+        item.check_reply(&disallowed_free_form, NOW),
+        Err(ReplyRejection::FreeFormNotAllowed)
+    );
+
+    let top_level = AttentionResponse {
+        option_id: Some("rust".to_owned()),
+        ..valid.clone()
+    };
+    assert_eq!(
+        item.check_reply(&top_level, NOW),
+        Err(ReplyRejection::QuestionTopLevelDecision)
+    );
+
+    let approval_item = approval(JoinState::Joined {
+        item_id: ItemId::new("item-approval"),
+    });
+    let approval_with_questions = AttentionResponse {
+        question_answers: valid.question_answers.clone(),
+        attention_id: approval_item.id.clone(),
+        session_id: approval_item.session_id.clone(),
+        request_key: "approval-request".to_owned(),
+        expected_expires_at_ms: approval_item.expires_at_ms,
+        option_id: None,
+        free_form_ref: None,
+    };
+    assert_eq!(
+        approval_item.check_reply(&approval_with_questions, NOW),
+        Err(ReplyRejection::QuestionAnswersUnexpected)
+    );
+}
+
+#[test]
 fn answered_attention_distinguishes_local_commands_from_external_observations() {
     let response = approval_response();
 
@@ -418,6 +585,7 @@ fn answered_attention_distinguishes_local_commands_from_external_observations() 
     local.state = AttentionState::Answered {
         option_id: Some("accept".to_owned()),
         free_form_ref: None,
+        question_answers: Vec::new(),
         decided_at_ms: NOW,
         answer_source: AttentionAnswerSource::LocalCommand {
             command_id: CommandId::new("command-local"),
@@ -442,6 +610,7 @@ fn answered_attention_distinguishes_local_commands_from_external_observations() 
     external.state = AttentionState::Answered {
         option_id: Some("decline".to_owned()),
         free_form_ref: None,
+        question_answers: Vec::new(),
         decided_at_ms: NOW,
         answer_source: AttentionAnswerSource::ObservedExternal {
             evidence: AttentionAnswerEvidence {
@@ -477,6 +646,7 @@ fn attention_answer_source_rejects_empty_or_cross_host_evidence_and_old_wire_sha
     empty_command.state = AttentionState::Answered {
         option_id: Some("accept".to_owned()),
         free_form_ref: None,
+        question_answers: Vec::new(),
         decided_at_ms: NOW,
         answer_source: AttentionAnswerSource::LocalCommand {
             command_id: CommandId::new(""),
@@ -493,6 +663,7 @@ fn attention_answer_source_rejects_empty_or_cross_host_evidence_and_old_wire_sha
     empty_observer.state = AttentionState::Answered {
         option_id: Some("accept".to_owned()),
         free_form_ref: None,
+        question_answers: Vec::new(),
         decided_at_ms: NOW,
         answer_source: AttentionAnswerSource::ObservedExternal {
             evidence: AttentionAnswerEvidence {
@@ -513,6 +684,7 @@ fn attention_answer_source_rejects_empty_or_cross_host_evidence_and_old_wire_sha
     wrong_observer.state = AttentionState::Answered {
         option_id: Some("accept".to_owned()),
         free_form_ref: None,
+        question_answers: Vec::new(),
         decided_at_ms: NOW,
         answer_source: AttentionAnswerSource::ObservedExternal {
             evidence: AttentionAnswerEvidence {
@@ -553,6 +725,7 @@ fn workflow_gate_is_structured_and_answerable() {
         expected_expires_at_ms: gate.expires_at_ms,
         option_id: Some("accept".to_owned()),
         free_form_ref: None,
+        question_answers: Vec::new(),
     };
     assert!(gate.validate().is_ok());
     assert!(gate.check_reply(&response, NOW).is_ok());
@@ -754,6 +927,8 @@ fn delivered_steer_requires_matching_runtime_session_turn_binding_and_active_tur
 fn local_acceptance_and_runtime_acceptance_are_distinct() {
     let local = CommandOutcome::AcceptedLocally { note_ref: None };
     let runtime = CommandOutcome::AcceptedByRuntime {
+        session_id: session_id(),
+        acceptance_kind: RuntimeAcceptanceKind::PromptTurn,
         binding_handle: binding_handle(ProviderBindingKind::RuntimeAcknowledgement),
     };
     let queued = CommandOutcome::Enqueued {
@@ -1209,6 +1384,8 @@ fn binding_handles_cannot_cross_canonical_entity_kinds() {
     );
 
     let wrong_runtime_ack = CommandOutcome::AcceptedByRuntime {
+        session_id: session_id(),
+        acceptance_kind: RuntimeAcceptanceKind::PromptTurn,
         binding_handle: binding_handle(ProviderBindingKind::Turn),
     };
     assert_eq!(
@@ -1671,10 +1848,10 @@ fn unknown_provider_message_becomes_diagnostic_without_fabricating_support() {
 // --- Version boundary and projection refresh -----------------------------
 
 #[test]
-fn pre_one_compatibility_is_limited_to_the_zero_three_line() {
-    assert_eq!(PROTOCOL_VERSION, "0.3.0");
-    assert!(version_is_compatible("0.3.0"));
-    assert!(version_is_compatible("0.3.999"));
+fn pre_one_compatibility_is_limited_to_the_zero_four_line() {
+    assert_eq!(PROTOCOL_VERSION, "0.5.0");
+    assert!(version_is_compatible("0.5.0"));
+    assert!(version_is_compatible("0.5.999"));
     assert!(!version_is_compatible("0.0.9"));
     assert!(!version_is_compatible("0.1.999"));
     assert!(!version_is_compatible("0.2.999"));
@@ -2395,6 +2572,70 @@ fn approval(join: JoinState) -> AttentionItem {
     }
 }
 
+fn question_attention() -> AttentionItem {
+    AttentionItem {
+        id: AttentionId::new("attention-question"),
+        host_id: host_id(),
+        project_id: project_id(),
+        session_id: Some(session_id()),
+        turn_id: Some(turn_id()),
+        workflow_id: None,
+        subject: AttentionSubject::Question {
+            request: QuestionRequest {
+                request_key: "question-request".to_owned(),
+                questions: vec![
+                    QuestionPrompt {
+                        question_key: "language".to_owned(),
+                        prompt_ref: sensitive_content(
+                            "content-question-language",
+                            ContentKind::PlainText,
+                        ),
+                        options: vec![
+                            DecisionOption {
+                                option_id: "rust".to_owned(),
+                                label: "Rust".to_owned(),
+                                semantics: DecisionSemantics::Choose,
+                            },
+                            DecisionOption {
+                                option_id: "python".to_owned(),
+                                label: "Python".to_owned(),
+                                semantics: DecisionSemantics::Choose,
+                            },
+                        ],
+                        multi_select: false,
+                        free_form_allowed: false,
+                    },
+                    QuestionPrompt {
+                        question_key: "details".to_owned(),
+                        prompt_ref: sensitive_content(
+                            "content-question-details",
+                            ContentKind::PlainText,
+                        ),
+                        options: vec![
+                            DecisionOption {
+                                option_id: "short".to_owned(),
+                                label: "Short".to_owned(),
+                                semantics: DecisionSemantics::Choose,
+                            },
+                            DecisionOption {
+                                option_id: "tests".to_owned(),
+                                label: "Tests".to_owned(),
+                                semantics: DecisionSemantics::Choose,
+                            },
+                        ],
+                        multi_select: true,
+                        free_form_allowed: true,
+                    },
+                ],
+                binding_handle: binding_handle(ProviderBindingKind::InteractionRequest),
+            },
+        },
+        state: AttentionState::Open,
+        created_at_ms: NOW,
+        expires_at_ms: Some(NOW + 1_000),
+    }
+}
+
 fn approval_join(item: &AttentionItem) -> Option<&JoinState> {
     match &item.subject {
         AttentionSubject::Approval { request } => Some(&request.join),
@@ -2412,6 +2653,7 @@ fn approval_response() -> AttentionResponse {
         expected_expires_at_ms: Some(NOW + 1_000),
         option_id: Some("decline".to_owned()),
         free_form_ref: None,
+        question_answers: Vec::new(),
     }
 }
 

@@ -1016,6 +1016,10 @@ fn business_loop(
             )?;
             break;
         }
+        if let Some(runtime) = &shared.runtime {
+            let _ = runtime.pump_pending_queue();
+            runtime.drain_all();
+        }
         publish_subscription_events(stream, session, &mut business.subscriptions)?;
         match session.poll(now_ms()) {
             Some(ConnectionAction::SendPing) => {

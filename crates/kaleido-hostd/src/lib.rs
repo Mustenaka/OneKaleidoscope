@@ -21,9 +21,14 @@ pub mod slice;
 pub use broker::{Broker, BrokerError, BrokerSubscription, SubscriptionEvent};
 pub use content::StoreContentAccess;
 pub use error::HostdError;
-pub use lan::{CodexLanConfig, CodexLanError, CodexLanHost, CodexRemoteConfig};
+pub use lan::{
+    CodexLanConfig, CodexLanError, CodexLanHost, CodexRemoteConfig, RuntimeBootstrap,
+    RuntimeBootstrapContext, RuntimeBootstrapFactory, StructuredLanConfig, StructuredLanHost,
+    StructuredRemoteConfig,
+};
 pub use runtime::{
-    ReadyRecoveryOutcome, RuntimeDispatchReport, RuntimeSupervisor, RuntimeSupervisorError,
+    ReadyRecoveryOutcome, RuntimeDispatchReport, RuntimeFailureClass, RuntimeLifecycleReport,
+    RuntimeLifecycleStage, RuntimeSupervisor, RuntimeSupervisorError,
 };
 pub use server::{LanServer, LanServerError};
 pub use slice::{

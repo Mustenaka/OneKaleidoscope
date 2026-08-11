@@ -1,0 +1,21 @@
+# NOTE: keep crate metadata in inline workspace tables; cargo xtask check-deps
+# parses crate manifests with a deliberately small TOML reader.
+[package]
+name = "kaleido-adapter-claude"
+version = "0.1.0"
+edition = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+publish = false
+
+[dependencies]
+kaleido-adapter = { path = "../kaleido-adapter" }
+kaleido-proto = { path = "../kaleido-proto" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

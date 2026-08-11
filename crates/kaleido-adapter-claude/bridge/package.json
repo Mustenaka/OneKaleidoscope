@@ -1,0 +1,19 @@
+{
+  "name": "onekaleidoscope-claude-sidecar",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.226"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.0",
+    "typescript": "5.8.3"
+  },
+  "scripts": {
+    "record:real": "node record-real-fixture.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  }
+}

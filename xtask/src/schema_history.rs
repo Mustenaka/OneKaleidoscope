@@ -102,18 +102,13 @@ pub fn append_observations(
     let mut records = read_history(path)?;
     let mut by_key = records
         .iter()
-        .map(|record| {
-            (
-                (record.tool.clone(), record.version.clone()),
-                record.surface_digests.clone(),
-            )
-        })
+        .map(|record| (record_key(record), record.surface_digests.clone()))
         .collect::<HashMap<_, _>>();
     let mut summary = AppendSummary::default();
 
     for (index, observation) in observations.iter().enumerate() {
         validate_record(observation, &format!("observation {}", index + 1))?;
-        let key = (observation.tool.clone(), observation.version.clone());
+        let key = record_key(observation);
         match by_key.get(&key) {
             Some(digests) if digests == &observation.surface_digests => {
                 summary.deduplicated += 1;
@@ -192,15 +187,23 @@ pub fn format_timeline(tool: &str, entry: &str, entries: &[TimelineEntry]) -> St
 fn validate_existing_keys(records: &[SurfaceHistoryRecord]) -> Result<(), SurfaceHistoryError> {
     let mut keys = HashMap::new();
     for record in records {
-        let key = (record.tool.as_str(), record.version.as_str());
+        let key = record_key(record);
         if keys.insert(key, &record.surface_digests).is_some() {
             return Err(SurfaceHistoryError::InvalidRecord {
                 location: format!("tool `{}` version `{}`", record.tool, record.version),
-                detail: "duplicate tool+version record".to_owned(),
+                detail: "duplicate tool+version+required-surface record".to_owned(),
             });
         }
     }
     Ok(())
+}
+
+fn record_key(record: &SurfaceHistoryRecord) -> (String, String, Vec<String>) {
+    (
+        record.tool.clone(),
+        record.version.clone(),
+        record.surface_digests.keys().cloned().collect(),
+    )
 }
 
 fn validate_record(
@@ -418,6 +421,41 @@ mod tests {
         assert_eq!(
             fs::read(&path).expect("history must remain readable"),
             before
+        );
+    }
+
+    #[test]
+    fn same_tool_version_with_an_expanded_required_surface_appends_a_new_revision() {
+        let directory = tempdir().expect("temporary directory must be created");
+        let path = directory.path().join("surface-history.jsonl");
+        let original = record(
+            "2026-07-30T10:00:00Z",
+            "opencode",
+            "1.18.16",
+            "opencode-event",
+            DIGEST_A,
+        );
+        append_observations(&path, std::slice::from_ref(&original))
+            .expect("initial append must succeed");
+        let mut expanded = original.clone();
+        expanded.observed_at = "2026-07-30T11:00:00Z".to_owned();
+        expanded
+            .surface_digests
+            .insert("opencode-heartbeat".to_owned(), DIGEST_B.to_owned());
+
+        let summary = append_observations(&path, std::slice::from_ref(&expanded))
+            .expect("a reviewed required-surface expansion must be retained separately");
+
+        assert_eq!(
+            summary,
+            AppendSummary {
+                appended: 1,
+                deduplicated: 0,
+            }
+        );
+        assert_eq!(
+            read_history(&path).expect("expanded history must parse"),
+            vec![original, expanded]
         );
     }
 

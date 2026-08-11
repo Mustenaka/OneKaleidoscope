@@ -485,6 +485,7 @@ fn answer_first_approval(
         expected_expires_at_ms: entry.expires_at_ms,
         option_id: Some(option_id),
         free_form_ref: None,
+        question_answers: Vec::new(),
     };
     let command_id = IdentityMint::new("kaleido-host")
         .command_id(&format!("slice-run-attention|{}", system_time_ms()));

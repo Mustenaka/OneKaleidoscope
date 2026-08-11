@@ -38,6 +38,9 @@ pub struct Session {
 pub enum OwnershipMode {
     /// The broker created and owns the runtime.
     BrokerManaged,
+    /// A public provider SDK owns persistence and exposes structured
+    /// list/resume. This does not claim attachment to a native CLI or GUI.
+    ProviderManaged,
     /// A native surface and the broker are both clients of one public server.
     SharedRuntime,
     /// A native surface created the session independently.

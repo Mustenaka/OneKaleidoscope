@@ -28,7 +28,8 @@ pub use mobile::{
     MobileConnectionStatus, ProjectionCallback, ProjectionSubscription,
 };
 pub use product::{
-    MobileActionAvailability, MobileActionBlocker, MobileSessionAction, MobileTextContent,
+    MobileActionAvailability, MobileActionBlocker, MobileQuestionAnswer, MobileResumeContext,
+    MobileSessionAction, MobileTextContent,
 };
 pub use signer::{DeviceSigner, DeviceSignerError};
 

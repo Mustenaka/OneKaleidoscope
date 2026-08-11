@@ -5,6 +5,8 @@
 - 决策人：用户（项目主管）
 - 任务：[T-104](../tasks/T-104.md)
 - 触发：D-B1；`Capability::LiveControl` 与 `LiveBinding::Controlling` 当前结构性不可达
+- R5 修订：UACP `0.5.0` 为 runtime ack 增加 mandatory Session scope 与
+  `RuntimeAcceptanceKind`；不改变“只有结构化 runtime acceptance 才能证明控制”的原决策
 
 ## 背景
 
@@ -33,8 +35,9 @@ prompt、回答审批并继续收到 runtime 状态，Session 仍只能是 `Obse
 
 ### D-2 唯一合格证据是 `AcceptedByRuntime`
 
-只有与本地 `CommandEnvelope.command_id` 相关联的
-`CommandOutcome::AcceptedByRuntime { binding_handle }` 可以证明 `LiveControl`。
+只有与本地 `CommandEnvelope.command_id` 相关联且 scope 完整的
+`CommandOutcome::AcceptedByRuntime { session_id, acceptance_kind, binding_handle }`
+可以证明 `LiveControl`。
 
 以下均不合格：
 
@@ -46,8 +49,9 @@ prompt、回答审批并继续收到 runtime 状态，Session 仍只能是 `Obse
 - 观察到一个无法关联到本地命令的外部状态变化。
 
 具体 adapter 必须先收到能够证明 runtime 接受的结构化响应或通知，再构造
-`AcceptedByRuntime`。该 outcome 的 `RuntimeAcknowledgement` binding handle 由 Broker
-铸造；上游原始 ID 不进入 canonical state。
+`AcceptedByRuntime`。该 outcome 的 canonical `SessionId` 与 `RuntimeAcknowledgement`
+binding handle 由 Broker 解析/铸造；上游原始 ID 不进入 canonical state。write path 必须验证
+Session 与 handle 指向同一 runtime。
 
 Codex 当前纵切使用 `turn/start` 的结构化 response 作为 `SubmitPrompt` 被 runtime 接受的
 证据。仅发送 request 不够；response 必须成功解码出钉定的 turn ID 与 status。未来其他
@@ -58,12 +62,15 @@ canonical state 还必须校验这条证据的历史关联：`AcceptedByRuntime`
 `command_id` 的 `AcceptedLocally`，同一命令的第二条 runtime acceptance 必须拒绝。这样即使
 adapter 出错，也不能把一条无本地来源或重复的 runtime ack 写进 durable log。
 
-本卡唯一启用的 `SubmitPrompt` 路径还必须把该命令关联到唯一的
+`RuntimeAcceptanceKind::PromptTurn` 必须把该命令关联到唯一的
 `TurnOrigin::RemoteCommand { command_id }`：Turn 的 Session 所属 runtime 必须与
 `RuntimeAcknowledgement` handle 一致。`Controlling` write path 反向检查这条
 Session → Turn → command → runtime ack 链；只有 capability、另一个 Session 的 ack、跨 runtime
-handle，或经通用 effect ingestion 伪造的 `AcceptedLocally` 都不够。未来若为不产生 Turn 的命令
-增加 runtime acceptance，必须先定义同等级的 canonical 归属关联，不能绕开这条检查。
+handle，或经通用 effect ingestion 伪造的 `AcceptedLocally` 都不够。
+
+`RuntimeAcceptanceKind::SessionControl` 用于 interrupt 等不创建 Turn 的结构化控制 receipt；
+它仍必须携带目标 canonical Session、同 runtime acknowledgement handle 与本地 command
+correlation，但不得伪造一个 RemoteCommand Turn 来通过 `PromptTurn` 守卫。两种 kind 不能互换。
 
 该关联一旦写入即不可被后续 effect 改写：同一 remote command 不能创建第二个 Turn，既有
 Turn 不能更换 Session、origin 或 provider binding identity。live Session 的更新也必须使用候选
@@ -130,6 +137,11 @@ Replay 只证明录制报文可以解码。它没有当前 live connection，也
 - hostd 记录本地 ack 与 runtime ack，并在诊断报告中锁存 `Controlling` 瞬间；
 - state write path 拒绝无前序本地接受或重复的 runtime ack；
 - 不修改 proto wire shape、schema、fixture、queue/steer 状态机或移动端代码。
+
+R5 后续在 UACP `0.5.0` 扩展了该既有语义：`AcceptedByRuntime` wire shape 增加 mandatory
+`session_id` / `acceptance_kind`；Codex 原 `SubmitPrompt` 使用 `PromptTurn`，OpenCode/Claude
+prompt 同样使用 `PromptTurn`，两家的 structured interrupt 使用 `SessionControl`。这是对跨
+Session 防伪造守卫的闭合，不授权任何未获 runtime receipt 的乐观提升。
 
 ## 拒绝的方案
 

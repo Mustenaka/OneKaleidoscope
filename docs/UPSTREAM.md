@@ -15,7 +15,7 @@ back into those directories.
 | Upstream | Snapshot version | Snapshot |
 |---|---|---|
 | Codex app-server | `codex-cli 0.147.0` / `@openai/codex@0.147.0` | `schemas/codex/` |
-| OpenCode | `opencode 1.18.8` / `opencode-ai@1.18.8` | `schemas/opencode/openapi.json` |
+| OpenCode | `opencode 1.18.16` / `opencode-ai@1.18.16` | `schemas/opencode/openapi.json` |
 | Agent Client Protocol | crate `1.3.0`, wire v1, schema artifact `1.18.0` | `schemas/acp/` |
 
 The ACP tags `v1.3.0` and `schema-v1.18.0` both resolve to commit
@@ -23,6 +23,11 @@ The ACP tags `v1.3.0` and `schema-v1.18.0` both resolve to commit
 `schema/v1/schema.json` and `schema/v1/meta.json` from that immutable commit.
 Exact installation and capture commands are recorded in
 `schemas/VERSIONS.md`.
+
+On 2026-08-10, both `npm view opencode-ai version` and
+`npm view @opencode-ai/sdk version` returned `1.18.16`. This confirms the CLI,
+published SDK and pinned `/doc` use the same public version label; it does not
+erase the runtime contract drift recorded below.
 
 Snapshot version, observed version, and supported range are deliberately
 different concepts:
@@ -76,13 +81,19 @@ feature switches or schema-diff gates.
 | Upstream | Snapshot version | Supported range | Evidence |
 |---|---|---|---|
 | Codex app-server | `0.147.0` | `>=0.146.0, <=0.147.0` | T-100 recorded real `0.146.0` simple-turn and approval evidence. T-105 reviewed all 58 required-surface changes, resolved all 41 pinned paths / 47 schema anchors, and completed real structured app-server simple turns on `0.146.1` and `0.147.0`; exact `0.146.1` schema diff against `0.146.0` had 0 in-surface drift. |
-| OpenCode | `1.18.8` | `=1.18.8` | T-003 captured the OpenAPI document and T-004/T-006 validated real session and event traffic against `1.18.8`. |
+| OpenCode | `1.18.16` | `=1.18.16` warning candidate; live acceptance blocked | T-111 aligns the raw `/doc`, required surface, CLI and SDK version label, but the latest real `/event` violates that same schema. Earlier `1.18.8` / `1.18.11` fixtures remain historical regressions, not current support claims. |
 | ACP v1 schema artifact | `1.18.0` | `=1.18.0` | T-003 pinned the immutable artifact and T-004/T-006 validated ACP v1 lifecycle, filesystem, and terminal messages against it. |
 
-OpenCode `1.18.9` and later versions have been observed but are not yet in the
-supported range. No compatibility claim is made for them yet. Under ADR-0008,
-`schema diff` must still run normally and print a prominent
-`unverified version` warning.
+OpenCode's configured warning candidate is deliberately exact at `1.18.16`; it
+is not currently an accepted realtime support claim because the live contract
+gate below fails. The historical surface
+ledger contains observations for `1.18.8`, `1.18.15` and `1.18.16`; the
+committed `1.18.11` fixture supplies an additional real runtime regression.
+Those artifacts remain useful drift/history evidence but do not justify a
+continuous range with untested patch members. Versions outside `1.18.16`
+remain inspectable and print the ADR-0008 `unverified version` warning. Adapter
+behavior is still selected from structured runtime evidence, never from
+`if version >= ...`.
 
 ### Codex 0.147.0 review
 
@@ -129,9 +140,13 @@ The schema-diff exit-code contract is:
 | `2` | A required tool does not exist or cannot be executed; version mismatch is not this condition |
 
 Object key order and whitespace do not count as drift. Added, removed, or
-changed values are reported as escaped JSON paths. When an observed version is
-new, its required-surface digests are appended once to
+changed values are reported as escaped JSON paths. When an observed version or
+reviewed required-surface entry set is new, its digests are appended once to
 `schemas/surface-history.jsonl`; full snapshots are not retained per version.
+The same public version may therefore have multiple ordered observations only
+when the declared entry set changed. The same version and same entry set
+producing different digests remains a hard conflict, so a mutable upstream
+publication cannot be hidden by surface expansion.
 
 Inspect one required-surface entry across observed versions with:
 
@@ -188,10 +203,60 @@ access.
 
 ## Schema normalization
 
-Schema normalization and Rust type generation are intentionally outside this
-workflow. ADR-0005 requires generated and normalized artifacts to live outside
-`schemas/`. The required surface must be derived from `PROTOCOL.md`, never from
+ADR-0005 requires generated and normalized artifacts to live outside
+`schemas/`. The required surface is derived from `PROTOCOL.md`, never from
 which types a particular generator happens to accept.
+
+### OpenCode OpenAPI 3.1
+
+R5 implements the chain selected by [ADR-0026](adr/0026-opencode-generated-rest-sse.md):
+
+```text
+schemas/opencode/openapi.json (read-only OpenAPI 3.1)
+  -> deterministic normalization
+  -> protocol-derived operation/type closure
+  -> build-directory Rust generation
+```
+
+The `1.18.16` source document currently needs no normalization rule. An earlier
+R5 implementation rewrote numeric `exclusiveMinimum`, but numeric form is
+already the valid OpenAPI 3.1 / JSON Schema draft-07 spelling; converting it to
+the old boolean spelling was not mechanically equivalent. That rule and the
+OpenAPI 3.0 parser that could not model the 3.1 schema were removed. The
+generated closure currently contains 125 schemas. `EventPluginAdded` and
+`EventSessionNextPromptAdmitted` are generated specifically so real stream
+hygiene remains checked by upstream types. No zero-hit rule is retained. Normalized and
+generated files are build artifacts and are not committed.
+
+The latest real `opencode serve --pure` `1.18.16` probe found that `/event`
+sends `session.next.prompt.admitted.properties.timestamp` as a string while the
+pinned `/doc` `EventSessionNextPromptAdmitted` requires a number. The same
+stream sends `server.heartbeat`, which `/doc` does not declare at all. The
+adapter rejects the generated-type mismatch instead of adding a handwritten or
+untyped escape hatch. Consequently D-B11 and the realtime/recovery live gate
+remain blocked even though the raw snapshot, CLI and SDK all say `1.18.16`.
+
+### Claude Agent SDK bridge
+
+Claude has no schema snapshot in `schemas/`. R5 instead pins
+`@anthropic-ai/claude-agent-sdk@0.3.226` and its lockfile inside
+`crates/kaleido-adapter-claude/bridge`. The TypeScript sidecar consumes official
+SDK types (including `AskUserQuestionInput`) and emits a closed, versioned
+OneKaleidoscope frame; Rust does not hand-write Claude SDK DTOs. Exact ownership,
+provisional-session and evidence semantics are defined by
+[ADR-0027](adr/0027-claude-sdk-sidecar-provisional-session.md).
+
+`cargo xtask claude-sidecar` runs platform-correct `npm` / `npm.cmd`,
+`npm ci --ignore-scripts`, then strict typecheck. It is part of
+`cargo xtask ci`; the Windows/macOS/Linux workflow installs Node 22 before the
+shared gate. Ignoring package scripts prevents install-time provider execution;
+the actual SDK bridge still runs only in explicit runtime/fixture commands.
+
+The committed Claude fixture is a real SDK run whose OAuth refresh failed. It
+is valid failure-path evidence, not a successful turn or permission/question
+acceptance claim. Its metadata fixes `expected_outcome = authentication_failure`
+and `acceptance_eligible = false`; fixture verification rejects any attempt to
+present it as success. See `docs/gates/T-112-evidence.md`.
 
 ## Temporary offline Rust vendoring
 

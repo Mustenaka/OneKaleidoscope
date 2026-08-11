@@ -224,6 +224,14 @@ fn a_lost_connection_is_reported_as_a_connection_fault() {
 }
 
 #[test]
+fn a_protocol_violation_invalidates_the_connection_before_recovery() {
+    let error = RuntimeSessionError::ProtocolViolation {
+        detail: "generated provider type rejected the structured frame".to_owned(),
+    };
+    assert!(error.ends_the_connection());
+}
+
+#[test]
 fn an_unprobed_capability_is_never_reported_as_supported() {
     let mint = IdentityMint::new("test");
     let session = StandInSession::new(&mint);
