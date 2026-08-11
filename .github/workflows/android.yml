@@ -84,6 +84,21 @@ jobs:
             'system-images;android-35;google_apis;x86_64'
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/28.2.13676358" >> "$GITHUB_ENV"
 
+      - name: Inject Firebase Android config when the protected secret is available
+        shell: bash
+        env:
+          FIREBASE_ANDROID_CONFIG_B64: ${{ secrets.FIREBASE_ANDROID_CONFIG_B64 }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${FIREBASE_ANDROID_CONFIG_B64:-}" ]]; then
+            printf '%s' "$FIREBASE_ANDROID_CONFIG_B64" \
+              | base64 --decode > apps/android/app/google-services.json
+            chmod 0600 apps/android/app/google-services.json
+            echo "Firebase build configuration injected from protected secret."
+          else
+            echo "Firebase config absent; compile-time FCM adapter tests run, real delivery remains an external gate."
+          fi
+
       - name: Build AAR, APK, lint and JVM tests
         working-directory: apps/android
         run: >-

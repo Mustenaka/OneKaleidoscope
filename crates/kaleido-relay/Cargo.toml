@@ -1,0 +1,40 @@
+[package]
+name = "kaleido-relay"
+version = "0.1.0"
+edition = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+publish = false
+
+[features]
+default = []
+# The iroh server adapter is optional so the service kernel can be exercised on
+# hosts that do not install the QUIC server runtime.  When enabled, the version
+# is pinned to the R4 contract below.
+iroh-server = ["dep:iroh", "dep:iroh-base", "dep:iroh-relay"]
+
+[dependencies]
+base64 = { workspace = true }
+kaleido-transport = { path = "../kaleido-transport" }
+rand_core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "net"] }
+google-cloud-auth = { version = "=1.15.0" }
+reqwest = { version = "=0.13.4", default-features = false, features = ["json", "rustls"] }
+
+iroh-relay = { version = "=1.0.3", optional = true, features = ["server"] }
+iroh-base = { version = "=1.0.3", optional = true, default-features = false, features = ["relay"] }
+iroh = { version = "=1.0.3", optional = true, default-features = false, features = ["tls-ring"] }
+rustls = { workspace = true }
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+n0-future = "=0.3.2"
+
+[lints]
+workspace = true

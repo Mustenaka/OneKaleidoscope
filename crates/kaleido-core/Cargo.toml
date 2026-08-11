@@ -16,6 +16,7 @@ name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
 
 [dependencies]
+iroh = { version = "=1.0.3", default-features = false, features = ["tls-ring"] }
 kaleido-proto = { path = "../kaleido-proto", features = ["uniffi"] }
 kaleido-transport = { path = "../kaleido-transport" }
 rand_core = { workspace = true }
@@ -24,8 +25,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 uniffi = { workspace = true, features = ["cli"] }
 zeroize = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "=0.22.4"
 
 [dev-dependencies]
 tempfile = "=3.27.0"

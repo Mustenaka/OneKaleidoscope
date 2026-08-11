@@ -25,6 +25,9 @@ thiserror = { workspace = true }
 x509-cert = { workspace = true }
 zeroize = { workspace = true }
 
+[dev-dependencies]
+tempfile = "=3.27.0"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
 

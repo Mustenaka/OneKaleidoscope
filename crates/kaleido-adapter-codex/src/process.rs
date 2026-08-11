@@ -21,6 +21,7 @@ enum ReaderEvent {
 #[derive(Debug)]
 pub(crate) struct ChildTransport {
     child: Child,
+    process_tree: platform::ProcessTree,
     stdin: Option<ChildStdin>,
     receiver: Receiver<ReaderEvent>,
     reader: Option<JoinHandle<()>>,
@@ -38,6 +39,14 @@ impl ChildTransport {
         platform::configure(&mut command);
 
         let mut child = command.spawn()?;
+        let process_tree = match platform::attach_tree(&child) {
+            Ok(tree) => tree,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
         let stdin = child
             .stdin
             .take()
@@ -70,6 +79,7 @@ impl ChildTransport {
 
         Ok(Self {
             child,
+            process_tree,
             stdin: Some(stdin),
             receiver,
             reader: Some(reader),
@@ -113,7 +123,7 @@ impl ChildTransport {
     }
 
     pub(crate) fn terminate(&mut self) -> io::Result<()> {
-        platform::terminate_tree(&mut self.child)?;
+        platform::terminate_tree(&self.process_tree, &mut self.child)?;
         self.stdin.take();
         if let Some(reader) = self.reader.take() {
             reader
@@ -133,7 +143,7 @@ impl ChildTransport {
 
 impl Drop for ChildTransport {
     fn drop(&mut self) {
-        let _ = platform::terminate_tree(&mut self.child);
+        let _ = platform::terminate_tree(&self.process_tree, &mut self.child);
         self.stdin.take();
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();

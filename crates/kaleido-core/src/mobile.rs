@@ -23,13 +23,25 @@ use kaleido_transport::auth::{
 use kaleido_transport::bootstrap::decode_uri;
 use kaleido_transport::control::{ControlFrame, PairRequest};
 use kaleido_transport::frame::Frame;
+use kaleido_transport::remote::{generate_remote_id, ExpectedRemoteResponse, RemoteControlFrame};
+use kaleido_transport::remote_client::RemoteControlClient;
 use kaleido_transport::{FRAME_IO_TIMEOUT_MS, MAX_FRAME_LENGTH, TRANSPORT_VERSION};
 use zeroize::Zeroize;
 
 use crate::cache::{CacheApply, ProjectionCache};
-use crate::connection::WireConnection;
-use crate::credential::{CredentialStore, PairedHost, PairedHostInfo, SecureCredentialVault};
+use crate::connection::{SelectedRemotePath, WireConnection};
+use crate::credential::{
+    CredentialStore, PairedHost, PairedHostInfo, RemoteAccess, SecureCredentialVault,
+};
 use crate::signer::DeviceSigner;
+
+#[path = "path.rs"]
+mod path;
+#[path = "reconnect.rs"]
+mod reconnect;
+
+use path::{PathAttempt, PathMachine};
+use reconnect::ReconnectBackoff;
 
 const WORKER_POLL: Duration = Duration::from_millis(100);
 
@@ -49,10 +61,73 @@ pub enum MobileClientError {
     Contract,
     #[error("mobile request was rejected")]
     RemoteRejected,
+    #[error("mobile remote control service is unavailable")]
+    RemoteUnavailable,
     #[error("mobile connection worker stopped")]
     WorkerStopped,
     #[error("mobile request identifier space is exhausted")]
     IdentifierExhausted,
+}
+
+/// A connection path is online only after the inner TLS/device-authenticated
+/// wire has completed.  Connecting deliberately has no online reachability.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum MobileConnectionPath {
+    Offline,
+    Connecting,
+    LanDirect,
+    PeerToPeer,
+    Relayed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MobileConnectionStatus {
+    pub path: MobileConnectionPath,
+    pub at_ms: i64,
+}
+
+#[uniffi::export(callback_interface)]
+pub trait ConnectionStatusCallback: Send + Sync {
+    fn on_status(&self, status: MobileConnectionStatus);
+}
+
+struct ConnectionStatusSink {
+    current: Mutex<MobileConnectionStatus>,
+    callback: Mutex<Option<Arc<dyn ConnectionStatusCallback>>>,
+}
+
+impl ConnectionStatusSink {
+    fn new(now_ms: i64) -> Self {
+        Self {
+            current: Mutex::new(MobileConnectionStatus {
+                path: MobileConnectionPath::Offline,
+                at_ms: now_ms,
+            }),
+            callback: Mutex::new(None),
+        }
+    }
+
+    fn current(&self) -> MobileConnectionStatus {
+        lock(&self.current).clone()
+    }
+
+    fn set_callback(&self, callback: Box<dyn ConnectionStatusCallback>) {
+        let callback: Arc<dyn ConnectionStatusCallback> = Arc::from(callback);
+        *lock(&self.callback) = Some(Arc::clone(&callback));
+    }
+
+    fn clear_callback(&self) {
+        *lock(&self.callback) = None;
+    }
+
+    fn publish(&self, path: MobileConnectionPath, at_ms: i64) {
+        let status = MobileConnectionStatus { path, at_ms };
+        *lock(&self.current) = status.clone();
+        let callback = lock(&self.callback).as_ref().map(Arc::clone);
+        if let Some(callback) = callback {
+            callback.on_status(status);
+        }
+    }
 }
 
 #[uniffi::export(callback_interface)]
@@ -115,6 +190,8 @@ pub struct MobileClient {
     cache: Arc<Mutex<ProjectionCache>>,
     worker: Mutex<Option<WorkerHandle>>,
     next_subscription_id: AtomicU64,
+    network_epoch: Arc<AtomicU64>,
+    status: Arc<ConnectionStatusSink>,
 }
 
 impl std::fmt::Debug for MobileClient {
@@ -151,6 +228,8 @@ impl MobileClient {
             cache: Arc::new(Mutex::new(cache)),
             worker: Mutex::new(None),
             next_subscription_id: AtomicU64::new(1),
+            network_epoch: Arc::new(AtomicU64::new(0)),
+            status: Arc::new(ConnectionStatusSink::new(system_time_ms())),
         }))
     }
 }
@@ -225,6 +304,7 @@ impl MobileClient {
             device_id: response.device_id.clone(),
             endpoint: bootstrap.endpoint,
             host_public_key_pin: bootstrap.host_public_key_pin,
+            remote: None,
         };
         self.credentials
             .store(&paired)
@@ -233,22 +313,160 @@ impl MobileClient {
         Ok(response.device_id)
     }
 
+    pub fn configure_remote(&self, mut bootstrap_uri: String) -> Result<(), MobileClientError> {
+        if lock(&self.worker).is_some() {
+            return Err(MobileClientError::AlreadyConnected);
+        }
+        let decoded = kaleido_transport::remote::decode_remote_bootstrap(&bootstrap_uri);
+        bootstrap_uri.zeroize();
+        let mut bootstrap = decoded.map_err(|_| MobileClientError::Contract)?;
+        if system_time_ms() >= bootstrap.expires_at_ms {
+            bootstrap.access_token.zeroize();
+            return Err(MobileClientError::Authentication);
+        }
+        let mut paired = lock(&self.paired);
+        let host = paired.as_mut().ok_or(MobileClientError::NotPaired)?;
+        host.remote = Some(RemoteAccess {
+            route_id: bootstrap.route_id.clone(),
+            route_hint: bootstrap.route_hint.clone(),
+            device_slot_id: bootstrap.device_slot_id.clone(),
+            access_token: std::mem::take(&mut bootstrap.access_token),
+            host_endpoint_id: bootstrap.host_endpoint_id.clone(),
+            relay_url: bootstrap.relay_url.clone(),
+            service_endpoint: bootstrap.service_endpoint.clone(),
+            service_public_key_pin: bootstrap.service_public_key_pin.clone(),
+            pending_push: None,
+        });
+        if self.credentials.store(host).is_err() {
+            host.remote = None;
+            return Err(MobileClientError::Storage);
+        }
+        Ok(())
+    }
+
+    pub fn remote_is_configured(&self) -> bool {
+        lock(&self.paired)
+            .as_ref()
+            .is_some_and(|host| host.remote.is_some())
+    }
+
+    /// Durably replaces the device's opaque FCM address, then waits for the
+    /// pinned self-hosted control service to acknowledge it. A network or
+    /// service failure leaves the operation in the secure-vault outbox.
+    pub fn replace_push_address(
+        &self,
+        opaque_address: String,
+        registered_at_ms: i64,
+        expires_at_ms: i64,
+    ) -> Result<(), MobileClientError> {
+        let mut paired = lock(&self.paired);
+        let host = paired.as_mut().ok_or(MobileClientError::NotPaired)?;
+        crate::remote_push::queue_replace(
+            &self.credentials,
+            host,
+            opaque_address,
+            registered_at_ms,
+            expires_at_ms,
+        )
+        .map_err(map_remote_push_error)?;
+        crate::remote_push::flush(&self.credentials, host, system_time_ms())
+            .map(|_| ())
+            .map_err(map_remote_push_error)
+    }
+
+    /// Durably tombstones the current opaque push address, then waits for the
+    /// pinned service acknowledgement before reporting success.
+    pub fn delete_push_address(&self) -> Result<(), MobileClientError> {
+        let mut paired = lock(&self.paired);
+        let host = paired.as_mut().ok_or(MobileClientError::NotPaired)?;
+        crate::remote_push::queue_delete(&self.credentials, host).map_err(map_remote_push_error)?;
+        crate::remote_push::flush(&self.credentials, host, system_time_ms())
+            .map(|_| ())
+            .map_err(map_remote_push_error)
+    }
+
+    /// Retries the secure-vault push outbox without changing its operation ID.
+    pub fn flush_remote_push_outbox(&self) -> Result<(), MobileClientError> {
+        let mut paired = lock(&self.paired);
+        let host = paired.as_mut().ok_or(MobileClientError::NotPaired)?;
+        crate::remote_push::flush(&self.credentials, host, system_time_ms())
+            .map(|_| ())
+            .map_err(map_remote_push_error)
+    }
+
+    /// Notifies the worker that the platform network generation changed.
+    ///
+    /// The generation is deliberately supplied by the platform instead of
+    /// inferred from a socket error: a stale dial result must never publish
+    /// an online path after Wi-Fi/cellular handover.  Existing subscription
+    /// intents remain owned by the worker and are resumed from the durable
+    /// projection cache after the new authenticated connection is ready.
+    pub fn network_epoch_changed(&self, epoch: u64) -> Result<(), MobileClientError> {
+        self.network_epoch.store(epoch, Ordering::SeqCst);
+        let commands = worker_sender(&self.worker)?;
+        commands
+            .send(WorkerCommand::NetworkEpoch { epoch })
+            .map_err(|_| MobileClientError::WorkerStopped)
+    }
+
+    pub fn connection_status(&self) -> MobileConnectionStatus {
+        self.status.current()
+    }
+
+    pub fn set_connection_status_callback(&self, callback: Box<dyn ConnectionStatusCallback>) {
+        self.status.set_callback(callback);
+    }
+
+    pub fn clear_connection_status_callback(&self) {
+        self.status.clear_callback();
+    }
+
     pub fn connect(&self) -> Result<(), MobileClientError> {
         let mut worker = lock(&self.worker);
+        if worker
+            .as_ref()
+            .is_some_and(|existing| existing.join.is_finished())
+        {
+            if let Some(stale) = worker.take() {
+                drop(stale.join.join());
+            }
+        }
         if worker.is_some() {
             return Err(MobileClientError::AlreadyConnected);
         }
-        let paired = lock(&self.paired)
-            .clone()
-            .ok_or(MobileClientError::NotPaired)?;
+        self.status
+            .publish(MobileConnectionPath::Connecting, system_time_ms());
+        let Some(paired) = lock(&self.paired).clone() else {
+            self.status
+                .publish(MobileConnectionPath::Offline, system_time_ms());
+            return Err(MobileClientError::NotPaired);
+        };
         let (commands, receiver) = mpsc::channel();
         let (ready, readiness) = mpsc::sync_channel(1);
         let signer = Arc::clone(&self.signer);
         let cache = Arc::clone(&self.cache);
+        let network_epoch = self.network_epoch.load(Ordering::SeqCst);
+        let epoch_source = Arc::clone(&self.network_epoch);
+        let status = Arc::clone(&self.status);
         let join = std::thread::Builder::new()
             .name("kaleido-mobile-connection".to_owned())
-            .spawn(move || run_worker(paired, signer, cache, receiver, ready))
-            .map_err(|_| MobileClientError::WorkerStopped)?;
+            .spawn(move || {
+                run_worker(
+                    paired,
+                    signer,
+                    cache,
+                    receiver,
+                    ready,
+                    network_epoch,
+                    epoch_source,
+                    status,
+                )
+            })
+            .map_err(|_| {
+                self.status
+                    .publish(MobileConnectionPath::Offline, system_time_ms());
+                MobileClientError::WorkerStopped
+            })?;
         match readiness.recv() {
             Ok(Ok(())) => {
                 *worker = Some(WorkerHandle { commands, join });
@@ -256,18 +474,31 @@ impl MobileClient {
             }
             Ok(Err(error)) => {
                 drop(join.join());
+                self.status
+                    .publish(MobileConnectionPath::Offline, system_time_ms());
                 Err(error)
             }
             Err(_) => {
                 drop(join.join());
+                self.status
+                    .publish(MobileConnectionPath::Offline, system_time_ms());
                 Err(MobileClientError::WorkerStopped)
             }
         }
     }
 
     pub fn reconnect(&self) -> Result<(), MobileClientError> {
-        self.disconnect()?;
-        self.connect()
+        if lock(&self.worker).is_some() {
+            let epoch = self
+                .network_epoch
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                    current.checked_add(1)
+                })
+                .map_err(|_| MobileClientError::IdentifierExhausted)?;
+            self.network_epoch_changed(epoch.saturating_add(1))
+        } else {
+            self.connect()
+        }
     }
 
     pub fn disconnect(&self) -> Result<(), MobileClientError> {
@@ -362,6 +593,16 @@ impl Drop for MobileClient {
     }
 }
 
+fn map_remote_push_error(error: crate::remote_push::RemotePushError) -> MobileClientError {
+    match error {
+        crate::remote_push::RemotePushError::NotConfigured => MobileClientError::NotPaired,
+        crate::remote_push::RemotePushError::Storage => MobileClientError::Storage,
+        crate::remote_push::RemotePushError::Unavailable => MobileClientError::RemoteUnavailable,
+        crate::remote_push::RemotePushError::Rejected => MobileClientError::RemoteRejected,
+        crate::remote_push::RemotePushError::Contract => MobileClientError::Contract,
+    }
+}
+
 enum WorkerCommand {
     Subscribe {
         subscription_id: u64,
@@ -386,37 +627,105 @@ enum WorkerCommand {
         request: ContentReadRequest,
         reply: SyncSender<Result<ContentReadResponse, MobileClientError>>,
     },
+    NetworkEpoch {
+        epoch: u64,
+    },
     Shutdown,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_worker(
     paired: PairedHost,
     signer: Arc<dyn DeviceSigner>,
     cache: Arc<Mutex<ProjectionCache>>,
     commands: Receiver<WorkerCommand>,
     ready: SyncSender<Result<(), MobileClientError>>,
+    initial_epoch: u64,
+    epoch_source: Arc<AtomicU64>,
+    status: Arc<ConnectionStatusSink>,
 ) {
-    let mut wire = match authenticated_wire(&paired, signer.as_ref()) {
-        Ok(wire) => wire,
+    let mut path = PathMachine::new(system_time_ms());
+    path.start(initial_epoch, system_time_ms());
+    let connected = match authenticated_wire(&paired, signer.as_ref()) {
+        Ok(connected) => connected,
         Err(error) => {
+            status.publish(MobileConnectionPath::Offline, system_time_ms());
             let _send_result = ready.send(Err(error));
             return;
         }
     };
-    if wire.set_poll_timeout(WORKER_POLL).is_err() {
+    if epoch_source.load(Ordering::SeqCst) != initial_epoch
+        || connected.wire.set_poll_timeout(WORKER_POLL).is_err()
+        || !publish_authenticated_path(connected.attempt, initial_epoch, &mut path, &status)
+    {
+        status.publish(MobileConnectionPath::Offline, system_time_ms());
         let _send_result = ready.send(Err(MobileClientError::Authentication));
         return;
     }
+    let mut wire = Some(connected.wire);
     let _send_result = ready.send(Ok(()));
     let mut next_request_id = 4_u64;
     let mut callbacks: BTreeMap<u64, ActiveSubscription> = BTreeMap::new();
     let mut current_snapshots: BTreeMap<u64, Cursor> = BTreeMap::new();
+    let mut backoff = ReconnectBackoff::default();
     loop {
+        let observed_epoch = epoch_source.load(Ordering::SeqCst);
+        if observed_epoch != path.epoch() {
+            if let Some(active_wire) = wire.as_ref() {
+                let _ = active_wire.notify_network_change();
+            }
+            path.network_changed(observed_epoch, system_time_ms());
+            status.publish(MobileConnectionPath::Connecting, system_time_ms());
+            current_snapshots.clear();
+            wire = None;
+            backoff.reset();
+            continue;
+        }
+        if let Some(active_wire) = wire.as_ref() {
+            publish_remote_path_if_changed(active_wire, &mut path, &status);
+        }
+        if wire.is_none() {
+            match reconnect_worker(
+                &paired,
+                signer.as_ref(),
+                &cache,
+                &commands,
+                &mut callbacks,
+                &mut current_snapshots,
+                &mut next_request_id,
+                &mut path,
+                &mut backoff,
+                &epoch_source,
+                &status,
+            ) {
+                ReconnectResult::Connected(reconnected) => {
+                    wire = Some(*reconnected);
+                    continue;
+                }
+                ReconnectResult::Shutdown => break,
+            }
+        }
+
         match commands.try_recv() {
             Ok(WorkerCommand::Shutdown) => break,
+            Ok(WorkerCommand::NetworkEpoch { epoch }) => {
+                if epoch != path.epoch() {
+                    if let Some(active_wire) = wire.as_ref() {
+                        let _ = active_wire.notify_network_change();
+                    }
+                    path.network_changed(epoch, system_time_ms());
+                    status.publish(MobileConnectionPath::Connecting, system_time_ms());
+                    current_snapshots.clear();
+                    wire = None;
+                    backoff.reset();
+                }
+            }
             Ok(command) => {
+                let Some(active_wire) = wire.as_mut() else {
+                    continue;
+                };
                 if execute_command(
-                    &mut wire,
+                    active_wire,
                     &mut next_request_id,
                     &mut callbacks,
                     &mut current_snapshots,
@@ -430,30 +739,262 @@ fn run_worker(
                 }
             }
             Err(mpsc::TryRecvError::Disconnected) => break,
-            Err(mpsc::TryRecvError::Empty) => match wire.try_receive() {
-                Ok(Some(frame)) => {
-                    if handle_unsolicited(
-                        &mut wire,
-                        frame,
-                        &mut callbacks,
-                        &mut current_snapshots,
-                        &cache,
-                    )
-                    .is_err()
-                    {
-                        close_callbacks(&mut callbacks, None);
-                        break;
+            Err(mpsc::TryRecvError::Empty) => {
+                let result = match wire.as_mut() {
+                    Some(active_wire) => active_wire.try_receive(),
+                    None => continue,
+                };
+                match result {
+                    Ok(Some(frame)) => {
+                        let Some(active_wire) = wire.as_mut() else {
+                            continue;
+                        };
+                        if handle_unsolicited(
+                            active_wire,
+                            frame,
+                            &mut callbacks,
+                            &mut current_snapshots,
+                            &cache,
+                        )
+                        .is_err()
+                        {
+                            path.offline(system_time_ms());
+                            status.publish(MobileConnectionPath::Offline, system_time_ms());
+                            current_snapshots.clear();
+                            wire = None;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        path.offline(system_time_ms());
+                        status.publish(MobileConnectionPath::Offline, system_time_ms());
+                        current_snapshots.clear();
+                        wire = None;
                     }
                 }
-                Ok(None) => {}
-                Err(_) => {
-                    close_callbacks(&mut callbacks, None);
-                    break;
-                }
-            },
+            }
         }
     }
     close_callbacks(&mut callbacks, None);
+}
+
+enum ReconnectResult {
+    Connected(Box<WireConnection>),
+    Shutdown,
+}
+
+/// Reconnects LAN or iroh without dropping subscription intents or cached
+/// cursors.  A path is published only after fresh inner TLS/device auth and
+/// cursor-aware resubscription complete for the current network epoch.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the reconnect loop must retain the authenticated worker state and each subscription map"
+)]
+fn reconnect_worker(
+    paired: &PairedHost,
+    signer: &dyn DeviceSigner,
+    cache: &Arc<Mutex<ProjectionCache>>,
+    commands: &Receiver<WorkerCommand>,
+    callbacks: &mut BTreeMap<u64, ActiveSubscription>,
+    current_snapshots: &mut BTreeMap<u64, Cursor>,
+    next_request_id: &mut u64,
+    path: &mut PathMachine,
+    backoff: &mut ReconnectBackoff,
+    epoch_source: &Arc<AtomicU64>,
+    status: &Arc<ConnectionStatusSink>,
+) -> ReconnectResult {
+    loop {
+        let observed_epoch = epoch_source.load(Ordering::SeqCst);
+        if observed_epoch != path.epoch() {
+            path.network_changed(observed_epoch, system_time_ms());
+        }
+        status.publish(MobileConnectionPath::Connecting, system_time_ms());
+        let delay = backoff.next_delay();
+        let deadline = Instant::now()
+            .checked_add(delay)
+            .unwrap_or_else(Instant::now);
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let wait = remaining.min(WORKER_POLL);
+            match commands.recv_timeout(wait) {
+                Ok(WorkerCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return ReconnectResult::Shutdown;
+                }
+                Ok(WorkerCommand::NetworkEpoch { epoch }) => {
+                    if epoch != path.epoch() {
+                        path.network_changed(epoch, system_time_ms());
+                        backoff.reset();
+                    }
+                }
+                Ok(command) => handle_disconnected_command(command, callbacks, current_snapshots),
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+            }
+        }
+
+        let attempt_epoch = epoch_source.load(Ordering::SeqCst);
+        let mut candidate = match authenticated_wire(paired, signer) {
+            Ok(candidate) => candidate,
+            Err(_) => {
+                path.offline(system_time_ms());
+                status.publish(MobileConnectionPath::Offline, system_time_ms());
+                continue;
+            }
+        };
+        if epoch_source.load(Ordering::SeqCst) != attempt_epoch {
+            continue;
+        }
+        if candidate.wire.set_poll_timeout(WORKER_POLL).is_err()
+            || resubscribe_all(
+                &mut candidate.wire,
+                callbacks,
+                current_snapshots,
+                cache,
+                next_request_id,
+            )
+            .is_err()
+        {
+            path.offline(system_time_ms());
+            status.publish(MobileConnectionPath::Offline, system_time_ms());
+            continue;
+        }
+        if epoch_source.load(Ordering::SeqCst) != attempt_epoch
+            || !publish_authenticated_path(candidate.attempt, attempt_epoch, path, status)
+        {
+            continue;
+        }
+        backoff.reset();
+        return ReconnectResult::Connected(Box::new(candidate.wire));
+    }
+}
+
+fn handle_disconnected_command(
+    command: WorkerCommand,
+    callbacks: &mut BTreeMap<u64, ActiveSubscription>,
+    current_snapshots: &mut BTreeMap<u64, Cursor>,
+) {
+    match command {
+        WorkerCommand::Subscribe {
+            subscription_id,
+            reply,
+            ..
+        } => {
+            // The caller can retry the subscription once the public worker is
+            // connected.  Existing intents are deliberately left untouched.
+            let _ = reply.send(Err(MobileClientError::NotConnected));
+            let _ = subscription_id;
+        }
+        WorkerCommand::Unsubscribe {
+            subscription_id,
+            reply,
+        } => {
+            if let Some(active) = callbacks.remove(&subscription_id) {
+                active.callback.on_closed(None);
+            }
+            current_snapshots.remove(&subscription_id);
+            let _ = reply.send(Ok(()));
+        }
+        WorkerCommand::SubmitCommand { reply, .. } => {
+            let _ = reply.send(Err(MobileClientError::NotConnected));
+        }
+        WorkerCommand::WriteContent {
+            mut bytes, reply, ..
+        } => {
+            bytes.fill(0);
+            let _ = reply.send(Err(MobileClientError::NotConnected));
+        }
+        WorkerCommand::ReadContent { reply, .. } => {
+            let _ = reply.send(Err(MobileClientError::NotConnected));
+        }
+        WorkerCommand::NetworkEpoch { .. } | WorkerCommand::Shutdown => {}
+    }
+}
+
+fn resubscribe_all(
+    wire: &mut WireConnection,
+    callbacks: &mut BTreeMap<u64, ActiveSubscription>,
+    current_snapshots: &mut BTreeMap<u64, Cursor>,
+    cache: &Arc<Mutex<ProjectionCache>>,
+    next_request_id: &mut u64,
+) -> Result<(), MobileClientError> {
+    let subscriptions = callbacks.keys().copied().collect::<Vec<_>>();
+    for subscription_id in subscriptions {
+        let Some(key) = callbacks
+            .get(&subscription_id)
+            .map(|active| active.key.clone())
+        else {
+            continue;
+        };
+        let subscribe = resume_subscription(key, cache);
+        let request_id = take_request_id(next_request_id)?;
+        wire.send_control(&ControlFrame::ProjectionSubscribeFrame {
+            request_id,
+            subscription_id,
+            subscribe: subscribe.clone(),
+        })
+        .map_err(|_| MobileClientError::WorkerStopped)?;
+        let ack = wait_for(
+            wire,
+            callbacks,
+            current_snapshots,
+            cache,
+            |frame| match frame {
+                ControlFrame::ProjectionSubscribeAckFrame {
+                    request_id: found,
+                    subscription_id: found_subscription,
+                    ack,
+                } if *found == request_id && *found_subscription == subscription_id => {
+                    Some(ack.clone())
+                }
+                _ => None,
+            },
+        )?;
+        ack.validate_for(&subscribe)
+            .map_err(|_| MobileClientError::Contract)?;
+        if let ProjectionSubscribeOutcome::Rejected { error } = ack.outcome.clone() {
+            if let Some(active) = callbacks.remove(&subscription_id) {
+                active.callback.on_error(error.clone());
+                active.callback.on_closed(Some(error));
+            }
+            current_snapshots.remove(&subscription_id);
+            continue;
+        }
+        if let ProjectionSubscribeOutcome::CurrentFollows { current_cursor } = ack.outcome {
+            current_snapshots.insert(subscription_id, current_cursor);
+        }
+        let barrier_request_id = take_request_id(next_request_id)?;
+        wire.send_control(&ControlFrame::Ping {
+            request_id: barrier_request_id,
+            nonce: barrier_request_id,
+        })
+        .map_err(|_| MobileClientError::WorkerStopped)?;
+        wait_for(
+            wire,
+            callbacks,
+            current_snapshots,
+            cache,
+            |frame| match frame {
+                ControlFrame::Pong { request_id, nonce }
+                    if *request_id == barrier_request_id && *nonce == barrier_request_id =>
+                {
+                    Some(())
+                }
+                _ => None,
+            },
+        )?;
+        let synchronized_cursor = lock(cache)
+            .since(&subscribe.key)
+            .ok_or(MobileClientError::Contract)?;
+        validate_synchronized_cursor(&ack.outcome, subscribe.since, synchronized_cursor)?;
+    }
+    Ok(())
+}
+
+fn resume_subscription(
+    key: ProjectionKey,
+    cache: &Arc<Mutex<ProjectionCache>>,
+) -> ProjectionSubscribe {
+    let since = lock(cache).since(&key);
+    ProjectionSubscribe { key, since }
 }
 
 fn execute_command(
@@ -674,6 +1215,7 @@ fn execute_command(
             })();
             let _send_result = reply.send(result);
         }
+        WorkerCommand::NetworkEpoch { .. } => {}
         WorkerCommand::Shutdown => return Err(MobileClientError::WorkerStopped),
     }
     Ok(())
@@ -829,12 +1371,163 @@ fn apply_projection(
     Ok(())
 }
 
+struct AuthenticatedWire {
+    wire: WireConnection,
+    attempt: PathAttempt,
+}
+
+fn publish_authenticated_path(
+    attempt: PathAttempt,
+    epoch: u64,
+    path: &mut PathMachine,
+    status: &ConnectionStatusSink,
+) -> bool {
+    path.start(epoch, system_time_ms());
+    match attempt {
+        PathAttempt::Lan => {}
+        PathAttempt::PeerToPeer => {
+            if path.failed(epoch, system_time_ms()) != Some(PathAttempt::PeerToPeer) {
+                return false;
+            }
+        }
+        PathAttempt::Relay => {
+            if path.failed(epoch, system_time_ms()) != Some(PathAttempt::PeerToPeer)
+                || path.failed(epoch, system_time_ms()) != Some(PathAttempt::Relay)
+            {
+                return false;
+            }
+        }
+    }
+    if !path.established(attempt, epoch, system_time_ms()) {
+        return false;
+    }
+    let mobile_path = match attempt {
+        PathAttempt::Lan => MobileConnectionPath::LanDirect,
+        PathAttempt::PeerToPeer => MobileConnectionPath::PeerToPeer,
+        PathAttempt::Relay => MobileConnectionPath::Relayed,
+    };
+    if status.current().path != mobile_path {
+        status.publish(mobile_path, system_time_ms());
+    }
+    true
+}
+
+fn publish_remote_path_if_changed(
+    wire: &WireConnection,
+    path: &mut PathMachine,
+    status: &ConnectionStatusSink,
+) {
+    let attempt = match wire.selected_remote_path() {
+        Ok(Some(SelectedRemotePath::PeerToPeer)) => PathAttempt::PeerToPeer,
+        Ok(Some(SelectedRemotePath::Relayed)) => PathAttempt::Relay,
+        Ok(None) | Err(_) => return,
+    };
+    let current = match attempt {
+        PathAttempt::PeerToPeer => MobileConnectionPath::PeerToPeer,
+        PathAttempt::Relay => MobileConnectionPath::Relayed,
+        PathAttempt::Lan => MobileConnectionPath::LanDirect,
+    };
+    if status.current().path != current {
+        let _ = publish_authenticated_path(attempt, path.epoch(), path, status);
+    }
+}
+
 fn authenticated_wire(
     paired: &PairedHost,
     signer: &dyn DeviceSigner,
+) -> Result<AuthenticatedWire, MobileClientError> {
+    if let Ok(wire) = WireConnection::connect(&paired.endpoint, &paired.host_public_key_pin) {
+        if let Ok(wire) = authenticate_over_wire(wire, paired, signer) {
+            return Ok(AuthenticatedWire {
+                wire,
+                attempt: PathAttempt::Lan,
+            });
+        }
+    }
+    let remote = paired
+        .remote
+        .as_ref()
+        .ok_or(MobileClientError::Authentication)?;
+    let resolved = resolve_remote_route(remote)?;
+    let wire = WireConnection::connect_remote(
+        &resolved.host_endpoint_id,
+        &resolved.relay_url,
+        &remote.access_token,
+        &paired.host_public_key_pin,
+    )
+    .map_err(|_| MobileClientError::Authentication)?;
+    let wire = authenticate_over_wire(wire, paired, signer)?;
+    let attempt = match wire
+        .selected_remote_path()
+        .map_err(|_| MobileClientError::Authentication)?
+    {
+        Some(SelectedRemotePath::PeerToPeer) => PathAttempt::PeerToPeer,
+        Some(SelectedRemotePath::Relayed) => PathAttempt::Relay,
+        None => return Err(MobileClientError::Authentication),
+    };
+    Ok(AuthenticatedWire { wire, attempt })
+}
+
+struct ResolvedRemoteRoute {
+    host_endpoint_id: String,
+    relay_url: String,
+}
+
+fn resolve_remote_route(remote: &RemoteAccess) -> Result<ResolvedRemoteRoute, MobileClientError> {
+    let issued_at_ms = system_time_ms();
+    let mut client =
+        RemoteControlClient::connect(&remote.service_endpoint, &remote.service_public_key_pin)
+            .map_err(|_| MobileClientError::Authentication)?;
+    let mut request = RemoteControlFrame::ResolveRoute {
+        request_id: 2,
+        operation_id: generate_remote_id(),
+        issued_at_ms,
+        route_id: remote.route_id.clone(),
+        device_slot_id: remote.device_slot_id.clone(),
+        access_token: remote.access_token.clone(),
+    };
+    let response = client.request(&request, ExpectedRemoteResponse::RouteResolved);
+    if let RemoteControlFrame::ResolveRoute { access_token, .. } = &mut request {
+        access_token.zeroize();
+    }
+    validate_resolved_route(
+        remote,
+        response.map_err(|_| MobileClientError::Authentication)?,
+        system_time_ms(),
+    )
+}
+
+fn validate_resolved_route(
+    remote: &RemoteAccess,
+    response: RemoteControlFrame,
+    now_ms: i64,
+) -> Result<ResolvedRemoteRoute, MobileClientError> {
+    let RemoteControlFrame::RouteResolved {
+        host_endpoint_id,
+        relay_url,
+        expires_at_ms,
+        ..
+    } = response
+    else {
+        return Err(MobileClientError::Authentication);
+    };
+    if expires_at_ms <= now_ms
+        || host_endpoint_id != remote.host_endpoint_id
+        || relay_url != remote.relay_url
+    {
+        return Err(MobileClientError::Authentication);
+    }
+    Ok(ResolvedRemoteRoute {
+        host_endpoint_id,
+        relay_url,
+    })
+}
+
+fn authenticate_over_wire(
+    mut wire: WireConnection,
+    paired: &PairedHost,
+    signer: &dyn DeviceSigner,
 ) -> Result<WireConnection, MobileClientError> {
-    let mut wire = WireConnection::connect(&paired.endpoint, &paired.host_public_key_pin)
-        .map_err(|_| MobileClientError::Authentication)?;
     hello(&mut wire)?;
     wire.send_control(&ControlFrame::ChallengeRequest {
         request_id: 3,
@@ -942,7 +1635,17 @@ fn hello(wire: &mut WireConnection) -> Result<(), MobileClientError> {
 fn worker_sender(
     worker: &Mutex<Option<WorkerHandle>>,
 ) -> Result<mpsc::Sender<WorkerCommand>, MobileClientError> {
-    lock(worker)
+    let mut guard = lock(worker);
+    if guard
+        .as_ref()
+        .is_some_and(|existing| existing.join.is_finished())
+    {
+        if let Some(stale) = guard.take() {
+            drop(stale.join.join());
+        }
+        return Err(MobileClientError::WorkerStopped);
+    }
+    guard
         .as_ref()
         .map(|worker| worker.commands.clone())
         .ok_or(MobileClientError::NotConnected)
@@ -1009,8 +1712,10 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use std::collections::BTreeMap;
+    use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::thread;
     use std::time::{Duration, Instant};
 
     use kaleido_proto::effect::Cursor;
@@ -1021,14 +1726,20 @@ mod tests {
         ProjectIndexView, ProjectionEnvelope, ProjectionKey, ProjectionPayload,
         ProjectionSubscribeOutcome, PROJECTION_VERSION,
     };
+    use kaleido_transport::remote::RemoteControlFrame;
+    use kaleido_transport::remote_client::{read_frame, write_frame};
+    use kaleido_transport::tls::{server_config, TlsIdentityStore};
+    use rustls::{ServerConnection, StreamOwned};
 
     use super::{
-        apply_projection, close_callbacks, poll_until, validate_synchronized_cursor,
-        ActiveSubscription, MobileClient, MobileClientError, ProjectionCallback,
+        apply_projection, close_callbacks, poll_until, resolve_remote_route, resume_subscription,
+        validate_resolved_route, validate_synchronized_cursor, worker_sender, ActiveSubscription,
+        MobileClient, MobileClientError, ProjectionCallback, WorkerHandle,
     };
     use crate::cache::ProjectionCache;
     use crate::credential::{
-        CredentialStore, PairedHost, SecureCredentialVault, SecureCredentialVaultError,
+        CredentialStore, PairedHost, RemoteAccess, SecureCredentialVault,
+        SecureCredentialVaultError,
     };
     use crate::signer::{DeviceSigner, DeviceSignerError};
 
@@ -1040,6 +1751,11 @@ mod tests {
     }
 
     struct TestCallback(Arc<CallbackEvents>);
+
+    #[derive(Default)]
+    struct StatusEvents(Mutex<Vec<super::MobileConnectionStatus>>);
+
+    struct TestStatusCallback(Arc<StatusEvents>);
 
     #[derive(Clone, Default)]
     struct TestVault {
@@ -1083,6 +1799,12 @@ mod tests {
         }
     }
 
+    impl super::ConnectionStatusCallback for TestStatusCallback {
+        fn on_status(&self, status: super::MobileConnectionStatus) {
+            self.0 .0.lock().expect("status lock").push(status);
+        }
+    }
+
     fn key(host: &str) -> ProjectionKey {
         ProjectionKey::ProjectIndex {
             host_id: HostId::new(host),
@@ -1114,6 +1836,141 @@ mod tests {
         }
     }
 
+    fn remote_access(service_endpoint: String, service_public_key_pin: String) -> RemoteAccess {
+        RemoteAccess {
+            route_id: "AQEBAQEBAQEBAQEBAQEBAQ".to_owned(),
+            route_hint: "AgICAgICAgICAgICAgICAg".to_owned(),
+            device_slot_id: "AwMDAwMDAwMDAwMDAwMDAw".to_owned(),
+            access_token: "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ".to_owned(),
+            host_endpoint_id: iroh::SecretKey::generate().public().to_string(),
+            relay_url: "https://relay.example.test".to_owned(),
+            service_endpoint,
+            service_public_key_pin,
+            pending_push: None,
+        }
+    }
+
+    #[test]
+    fn remote_route_is_resolved_over_pinned_tls_before_iroh_dial() {
+        let directory = tempfile::tempdir().expect("TLS identity directory");
+        let identity = TlsIdentityStore::new(directory.path().join("private").join("service.json"))
+            .expect("identity store")
+            .load_or_generate()
+            .expect("service identity");
+        let pin = identity.leaf_pin().expect("service pin").encode();
+        let tls = server_config(identity).expect("server TLS");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("control listener");
+        let endpoint = listener.local_addr().expect("control address").to_string();
+        let remote = remote_access(endpoint, pin);
+        let expected_endpoint = remote.host_endpoint_id.clone();
+        let expected_relay = remote.relay_url.clone();
+        let response_endpoint = expected_endpoint.clone();
+        let response_relay = expected_relay.clone();
+        let server = thread::spawn(move || {
+            let (socket, _) = listener.accept().expect("control connection");
+            let connection = ServerConnection::new(tls).expect("control TLS");
+            let mut stream = StreamOwned::new(connection, socket);
+            assert!(matches!(
+                read_frame(&mut stream).expect("remote hello"),
+                RemoteControlFrame::RemoteHello { request_id: 1, .. }
+            ));
+            write_frame(
+                &mut stream,
+                &RemoteControlFrame::RemoteHelloAck {
+                    request_id: 1,
+                    remote_control_version: "0.1.0".to_owned(),
+                    max_frame_length: 4_096,
+                },
+                false,
+            )
+            .expect("hello ack");
+            assert!(matches!(
+                read_frame(&mut stream).expect("resolve request"),
+                RemoteControlFrame::ResolveRoute {
+                    request_id: 2,
+                    ref route_id,
+                    ref device_slot_id,
+                    ref access_token,
+                    ..
+                } if route_id == "AQEBAQEBAQEBAQEBAQEBAQ"
+                    && device_slot_id == "AwMDAwMDAwMDAwMDAwMDAw"
+                    && access_token == "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ"
+            ));
+            write_frame(
+                &mut stream,
+                &RemoteControlFrame::RouteResolved {
+                    request_id: 2,
+                    host_endpoint_id: response_endpoint,
+                    relay_url: response_relay,
+                    expires_at_ms: i64::MAX,
+                },
+                false,
+            )
+            .expect("route response");
+        });
+
+        let resolved = resolve_remote_route(&remote).expect("pinned route resolution");
+        assert_eq!(resolved.host_endpoint_id, expected_endpoint);
+        assert_eq!(resolved.relay_url, expected_relay);
+        server.join().expect("control server");
+    }
+
+    #[test]
+    fn route_resolution_rejects_cache_mismatch_and_expiry() {
+        let remote = remote_access(
+            "127.0.0.1:7444".to_owned(),
+            format!("sha256:{}", "A".repeat(43)),
+        );
+        let response = |host_endpoint_id: String, relay_url: String, expires_at_ms| {
+            RemoteControlFrame::RouteResolved {
+                request_id: 2,
+                host_endpoint_id,
+                relay_url,
+                expires_at_ms,
+            }
+        };
+        assert!(validate_resolved_route(
+            &remote,
+            response(
+                remote.host_endpoint_id.clone(),
+                remote.relay_url.clone(),
+                101,
+            ),
+            100,
+        )
+        .is_ok());
+        assert!(validate_resolved_route(
+            &remote,
+            response(
+                iroh::SecretKey::generate().public().to_string(),
+                remote.relay_url.clone(),
+                101,
+            ),
+            100,
+        )
+        .is_err());
+        assert!(validate_resolved_route(
+            &remote,
+            response(
+                remote.host_endpoint_id.clone(),
+                "https://different-relay.example.test".to_owned(),
+                101,
+            ),
+            100,
+        )
+        .is_err());
+        assert!(validate_resolved_route(
+            &remote,
+            response(
+                remote.host_endpoint_id.clone(),
+                remote.relay_url.clone(),
+                100,
+            ),
+            100,
+        )
+        .is_err());
+    }
+
     #[test]
     fn secure_constructor_cold_loads_only_paired_host_identity() {
         let directory = tempfile::tempdir().expect("cache directory");
@@ -1123,6 +1980,7 @@ mod tests {
             device_id: kaleido_proto::ids::DeviceId::new("device-secure-cold"),
             endpoint: "127.0.0.1:7443".to_owned(),
             host_public_key_pin: format!("sha256:{}", "A".repeat(43)),
+            remote: None,
         };
         CredentialStore::secure(Arc::new(vault.clone()))
             .store(&host)
@@ -1231,5 +2089,59 @@ mod tests {
         drop(cache);
         let cold = ProjectionCache::open(directory.path()).expect("cold cache");
         assert_eq!(cold.since(&key("host-a")), None);
+    }
+
+    #[test]
+    fn a_finished_worker_handle_is_reaped_instead_of_reported_as_connected() {
+        let (commands, _receiver) = mpsc::channel();
+        let join = std::thread::spawn(|| {});
+        while !join.is_finished() {
+            std::thread::yield_now();
+        }
+        // A finished JoinHandle still occupies the public slot until the
+        // sender path observes it.  The next operation must clear it so a
+        // subsequent connect can create a fresh worker.
+        let worker = Mutex::new(Some(WorkerHandle { commands, join }));
+        assert!(matches!(
+            worker_sender(&worker),
+            Err(MobileClientError::WorkerStopped)
+        ));
+        assert!(worker.lock().expect("worker lock").is_none());
+    }
+
+    #[test]
+    fn status_callback_reports_connecting_and_offline_without_claiming_online() {
+        let events = Arc::new(StatusEvents::default());
+        let sink = super::ConnectionStatusSink::new(10);
+        sink.set_callback(Box::new(TestStatusCallback(Arc::clone(&events))));
+        sink.publish(super::MobileConnectionPath::Connecting, 11);
+        sink.publish(super::MobileConnectionPath::Offline, 12);
+
+        let statuses = events.0.lock().expect("status lock").clone();
+        assert_eq!(statuses.len(), 2);
+        let mut statuses = statuses.into_iter();
+        assert_eq!(
+            statuses.next().expect("initial status").path,
+            super::MobileConnectionPath::Connecting
+        );
+        assert_eq!(
+            statuses.next().expect("offline status").path,
+            super::MobileConnectionPath::Offline
+        );
+        assert_eq!(sink.current().at_ms, 12);
+    }
+
+    #[test]
+    fn reconnect_resume_uses_each_projection_keys_last_good_cursor() {
+        let directory = tempfile::tempdir().expect("cache directory");
+        let mut cache = ProjectionCache::open(directory.path()).expect("cache");
+        cache.apply(envelope("host-a", 9)).expect("host a");
+        cache.apply(envelope("host-b", 4)).expect("host b");
+        let cache = Arc::new(Mutex::new(cache));
+
+        let first = resume_subscription(key("host-a"), &cache);
+        let second = resume_subscription(key("host-b"), &cache);
+        assert_eq!(first.since, Some(Cursor { seq: 9 }));
+        assert_eq!(second.since, Some(Cursor { seq: 4 }));
     }
 }

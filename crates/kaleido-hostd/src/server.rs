@@ -1,15 +1,16 @@
-//! TLS 1.3 LAN listener and authenticated TRANSPORT 0.1 state machine.
+//! TLS 1.3 TCP/iroh listener and authenticated TRANSPORT 0.1 state machine.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kaleido_proto::content::ContentWriteRequest;
+use kaleido_proto::host::HostReachability;
 use kaleido_proto::ids::DeviceId;
 use kaleido_proto::projection::ProjectionSubscribeOutcome;
 use kaleido_transport::auth::{ChallengeProof, ChallengeStore, IssueChallenge};
@@ -31,6 +32,12 @@ use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use crate::broker::{Broker, BrokerSubscription, SubscriptionEvent};
 use crate::gateway::{AuthenticatedGateway, GatewayError};
 use crate::runtime::RuntimeSupervisor;
+
+#[path = "remote_tunnel.rs"]
+mod remote_tunnel;
+
+use remote_tunnel::{RemoteAccepted, RemoteTunnelServer, RemoteTunnelStream};
+pub use remote_tunnel::{RemoteTunnelConfig, RemoteTunnelError, SelectedRemotePath};
 
 const BUSINESS_POLL: Duration = Duration::from_millis(50);
 const AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(60);
@@ -111,6 +118,74 @@ pub enum LanServerError {
     Broker,
     #[error("the listener worker stopped")]
     WorkerStopped,
+    #[error("the remote tunnel could not start")]
+    Remote,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionProvenance {
+    Lan,
+    Remote,
+}
+
+enum ServerSocket {
+    Tcp(TcpStream),
+    Remote(Box<RemoteTunnelStream>),
+}
+
+impl ServerSocket {
+    fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(socket) => socket.set_nonblocking(nonblocking),
+            Self::Remote(stream) => stream.set_nonblocking(nonblocking),
+        }
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(socket) => socket.set_read_timeout(timeout),
+            Self::Remote(stream) => stream.set_read_timeout(timeout),
+        }
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(socket) => socket.set_write_timeout(timeout),
+            Self::Remote(stream) => stream.set_write_timeout(timeout),
+        }
+    }
+
+    fn selected_remote_path(&self) -> Option<SelectedRemotePath> {
+        match self {
+            Self::Tcp(_) => None,
+            Self::Remote(stream) => stream.selected_path(),
+        }
+    }
+}
+
+impl Read for ServerSocket {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Tcp(socket) => socket.read(buffer),
+            Self::Remote(stream) => stream.read(buffer),
+        }
+    }
+}
+
+impl Write for ServerSocket {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Tcp(socket) => socket.write(buffer),
+            Self::Remote(stream) => stream.write(buffer),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(socket) => socket.flush(),
+            Self::Remote(stream) => stream.flush(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -125,9 +200,10 @@ struct ServerShared {
     auth_failures: Arc<Mutex<AuthFailureLimiter>>,
     shutdown: Arc<AtomicBool>,
     next_connection: Arc<AtomicU64>,
+    authenticated_connections: AtomicUsize,
+    authenticated_remote_paths: Arc<Mutex<BTreeMap<String, SelectedRemotePath>>>,
 }
 
-#[derive(Debug)]
 pub struct LanServer {
     local_addr: SocketAddr,
     endpoint: String,
@@ -137,6 +213,21 @@ pub struct LanServer {
     revoked: Arc<Mutex<BTreeSet<DeviceId>>>,
     shutdown: Arc<AtomicBool>,
     listener: Option<JoinHandle<()>>,
+    remote: Option<RemoteTunnelServer>,
+    authenticated_remote_paths: Arc<Mutex<BTreeMap<String, SelectedRemotePath>>>,
+}
+
+impl std::fmt::Debug for LanServer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LanServer")
+            .field("local_addr", &"[redacted]")
+            .field("endpoint", &"[redacted]")
+            .field("host_pin", &"[redacted]")
+            .field("listener_running", &self.listener.is_some())
+            .field("remote_running", &self.remote.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl LanServer {
@@ -145,6 +236,26 @@ impl LanServer {
         storage_root: &Path,
         broker: Broker,
         runtime: Option<Arc<RuntimeSupervisor>>,
+    ) -> Result<Self, LanServerError> {
+        Self::bind_inner(address, storage_root, broker, runtime, None)
+    }
+
+    pub fn bind_with_remote(
+        address: SocketAddr,
+        storage_root: &Path,
+        broker: Broker,
+        runtime: Option<Arc<RuntimeSupervisor>>,
+        remote_config: RemoteTunnelConfig,
+    ) -> Result<Self, LanServerError> {
+        Self::bind_inner(address, storage_root, broker, runtime, Some(remote_config))
+    }
+
+    fn bind_inner(
+        address: SocketAddr,
+        storage_root: &Path,
+        broker: Broker,
+        runtime: Option<Arc<RuntimeSupervisor>>,
+        remote_config: Option<RemoteTunnelConfig>,
     ) -> Result<Self, LanServerError> {
         let identity = TlsIdentityStore::new(storage_root.join("tls-identity.json"))
             .map_err(map_transport)?
@@ -165,6 +276,7 @@ impl LanServer {
         let endpoint = endpoint_for(local_addr);
         let shutdown = Arc::new(AtomicBool::new(false));
         let revoked = Arc::new(Mutex::new(BTreeSet::new()));
+        let authenticated_remote_paths = Arc::new(Mutex::new(BTreeMap::new()));
         let shared = Arc::new(ServerShared {
             broker: broker.clone(),
             runtime,
@@ -176,17 +288,23 @@ impl LanServer {
             auth_failures: Arc::new(Mutex::new(AuthFailureLimiter::default())),
             shutdown: Arc::clone(&shutdown),
             next_connection: Arc::new(AtomicU64::new(1)),
+            authenticated_connections: AtomicUsize::new(0),
+            authenticated_remote_paths: Arc::clone(&authenticated_remote_paths),
         });
+        let (remote, remote_receiver) = match remote_config {
+            Some(config) => {
+                let (server, receiver) =
+                    RemoteTunnelServer::start(storage_root.join("remote"), config)
+                        .map_err(|_| LanServerError::Remote)?;
+                (Some(server), Some(receiver))
+            }
+            None => (None, None),
+        };
         let listener_shared = Arc::clone(&shared);
         let worker = thread::Builder::new()
             .name("kaleido-lan-listener".to_owned())
-            .spawn(move || listener_loop(listener, listener_shared))
+            .spawn(move || listener_loop(listener, remote_receiver, listener_shared))
             .map_err(|_| LanServerError::WorkerStopped)?;
-        if broker.set_lan_ready(true, now_ms()).is_err() {
-            shutdown.store(true, Ordering::Release);
-            let _ = worker.join();
-            return Err(LanServerError::Broker);
-        }
         Ok(Self {
             local_addr,
             endpoint,
@@ -196,11 +314,38 @@ impl LanServer {
             revoked,
             shutdown,
             listener: Some(worker),
+            remote,
+            authenticated_remote_paths,
         })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    pub fn remote_endpoint_id(&self) -> Option<String> {
+        self.remote
+            .as_ref()
+            .map(|remote| remote.endpoint_id().to_owned())
+    }
+
+    /// Returns the best currently authenticated iroh path. Unauthenticated
+    /// QUIC/TLS connections are deliberately absent from this view.
+    pub fn selected_remote_path(&self) -> Option<SelectedRemotePath> {
+        let paths = lock(&self.authenticated_remote_paths);
+        if paths
+            .values()
+            .any(|path| matches!(path, SelectedRemotePath::PeerToPeer))
+        {
+            Some(SelectedRemotePath::PeerToPeer)
+        } else if paths
+            .values()
+            .any(|path| matches!(path, SelectedRemotePath::Relayed))
+        {
+            Some(SelectedRemotePath::Relayed)
+        } else {
+            None
+        }
     }
 
     pub fn issue_pairing(&self, at_ms: i64) -> Result<PairingBootstrap, LanServerError> {
@@ -217,11 +362,34 @@ impl LanServer {
     /// Persists revocation first; live connections observe the durable marker
     /// and emit `DeviceRevoked` before closing on their next bounded poll.
     pub fn revoke_device(&self, device_id: &DeviceId, at_ms: i64) -> Result<(), LanServerError> {
-        let revoked = Arc::clone(&self.revoked);
+        self.revoke_device_durable(device_id, at_ms)?;
+        self.disconnect_revoked_device(device_id);
+        Ok(())
+    }
+
+    pub(crate) fn revoke_device_durable(
+        &self,
+        device_id: &DeviceId,
+        at_ms: i64,
+    ) -> Result<(), LanServerError> {
+        match lock(&self.registry).revoke_and_then(device_id, at_ms, |_| {}) {
+            Ok(()) | Err(TransportError::DeviceRevoked) => Ok(()),
+            Err(error) => Err(map_transport(error)),
+        }
+    }
+
+    pub(crate) fn disconnect_revoked_device(&self, device_id: &DeviceId) {
+        lock(&self.revoked).insert(device_id.clone());
+    }
+
+    pub(crate) fn revoked_device_ids(&self) -> Vec<DeviceId> {
+        lock(&self.registry).revoked_device_ids()
+    }
+
+    pub(crate) fn require_active_device(&self, device_id: &DeviceId) -> Result<(), LanServerError> {
         lock(&self.registry)
-            .revoke_and_then(device_id, at_ms, move |durable_device| {
-                lock(&revoked).insert(durable_device.clone());
-            })
+            .device_for_auth(device_id)
+            .map(|_| ())
             .map_err(map_transport)
     }
 
@@ -237,11 +405,20 @@ impl LanServer {
         if let Some(listener) = self.listener.take() {
             listener.join().map_err(|_| LanServerError::WorkerStopped)?;
         }
+        if let Some(mut remote) = self.remote.take() {
+            remote.stop().map_err(|_| LanServerError::Remote)?;
+        }
         self.broker
             .set_lan_ready(false, now_ms())
             .map_err(|_| LanServerError::Broker)?;
         Ok(())
     }
+}
+
+pub(crate) fn persistent_remote_endpoint_id(
+    security_root: &Path,
+) -> Result<String, RemoteTunnelError> {
+    remote_tunnel::persistent_endpoint_id(&security_root.join("remote"))
 }
 
 impl Drop for LanServer {
@@ -250,37 +427,37 @@ impl Drop for LanServer {
     }
 }
 
-fn listener_loop(listener: TcpListener, shared: Arc<ServerShared>) {
+fn listener_loop(
+    listener: TcpListener,
+    remote: Option<std::sync::mpsc::Receiver<RemoteAccepted>>,
+    shared: Arc<ServerShared>,
+) {
     let mut workers = Vec::new();
     while !shared.shutdown.load(Ordering::Acquire) {
+        if let Some(receiver) = &remote {
+            loop {
+                match receiver.try_recv() {
+                    Ok(accepted) => spawn_connection(
+                        ServerSocket::Remote(Box::new(accepted.stream)),
+                        accepted.source_ip,
+                        ConnectionProvenance::Remote,
+                        &shared,
+                        &mut workers,
+                    ),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                }
+            }
+        }
         match listener.accept() {
             Ok((socket, peer)) => {
-                let connection = next_connection_id(&shared.next_connection);
-                let accepted = lock(&shared.limiter).accept(&connection, peer.ip());
-                if accepted.is_err() {
-                    continue;
-                }
-                let connection_shared = Arc::clone(&shared);
-                let worker_connection = connection.clone();
-                if let Ok(worker) = thread::Builder::new()
-                    .name("kaleido-lan-connection".to_owned())
-                    .spawn(move || {
-                        if let Err(error) = handle_connection(
-                            socket,
-                            peer.ip(),
-                            &worker_connection,
-                            &connection_shared,
-                        ) {
-                            tracing::debug!(?error, "LAN connection closed");
-                        }
-                        lock(&connection_shared.challenges).cancel_connection(&worker_connection);
-                        let _ = lock(&connection_shared.limiter).close(&worker_connection);
-                    })
-                {
-                    workers.push(worker);
-                } else {
-                    let _ = lock(&shared.limiter).close(&connection);
-                }
+                spawn_connection(
+                    ServerSocket::Tcp(socket),
+                    peer.ip(),
+                    ConnectionProvenance::Lan,
+                    &shared,
+                    &mut workers,
+                );
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(10));
@@ -302,9 +479,52 @@ fn listener_loop(listener: TcpListener, shared: Arc<ServerShared>) {
     }
 }
 
-fn handle_connection(
-    socket: TcpStream,
+fn spawn_connection(
+    socket: ServerSocket,
     source_ip: IpAddr,
+    provenance: ConnectionProvenance,
+    shared: &Arc<ServerShared>,
+    workers: &mut Vec<JoinHandle<()>>,
+) {
+    let connection = next_connection_id(&shared.next_connection);
+    if lock(&shared.limiter)
+        .accept(&connection, source_ip)
+        .is_err()
+    {
+        return;
+    }
+    let connection_shared = Arc::clone(shared);
+    let worker_connection = connection.clone();
+    let worker_name = match provenance {
+        ConnectionProvenance::Lan => "kaleido-lan-connection",
+        ConnectionProvenance::Remote => "kaleido-remote-connection",
+    };
+    if let Ok(worker) = thread::Builder::new()
+        .name(worker_name.to_owned())
+        .spawn(move || {
+            if let Err(error) = handle_connection(
+                socket,
+                source_ip,
+                provenance,
+                &worker_connection,
+                &connection_shared,
+            ) {
+                tracing::debug!(?error, "transport connection closed");
+            }
+            lock(&connection_shared.challenges).cancel_connection(&worker_connection);
+            let _ = lock(&connection_shared.limiter).close(&worker_connection);
+        })
+    {
+        workers.push(worker);
+    } else {
+        let _ = lock(&shared.limiter).close(&connection);
+    }
+}
+
+fn handle_connection(
+    socket: ServerSocket,
+    source_ip: IpAddr,
+    provenance: ConnectionProvenance,
     connection_scope: &str,
     shared: &ServerShared,
 ) -> Result<(), LanServerError> {
@@ -400,6 +620,20 @@ fn handle_connection(
         auth_deadline,
         shared,
     )?;
+    let _lan_reachability = if provenance == ConnectionProvenance::Lan {
+        Some(AuthenticatedReachability::acquire(shared)?)
+    } else {
+        None
+    };
+    let remote_path = if provenance == ConnectionProvenance::Remote {
+        Some(AuthenticatedRemotePath::acquire(
+            shared,
+            connection_scope,
+            &stream.sock,
+        )?)
+    } else {
+        None
+    };
     stream
         .sock
         .set_nonblocking(false)
@@ -424,12 +658,121 @@ fn handle_connection(
         ),
         shared,
         &mut last_request_id,
+        remote_path.as_ref(),
     )
+}
+
+struct AuthenticatedReachability<'a> {
+    shared: &'a ServerShared,
+}
+
+impl<'a> AuthenticatedReachability<'a> {
+    fn acquire(shared: &'a ServerShared) -> Result<Self, LanServerError> {
+        shared
+            .authenticated_connections
+            .fetch_add(1, Ordering::AcqRel);
+        if publish_authenticated_reachability(shared).is_err() {
+            shared
+                .authenticated_connections
+                .fetch_sub(1, Ordering::AcqRel);
+            return Err(LanServerError::Broker);
+        }
+        Ok(Self { shared })
+    }
+}
+
+impl Drop for AuthenticatedReachability<'_> {
+    fn drop(&mut self) {
+        let previous = self
+            .shared
+            .authenticated_connections
+            .fetch_sub(1, Ordering::AcqRel);
+        if previous == 1 {
+            let _ = publish_authenticated_reachability(self.shared);
+        }
+    }
+}
+
+struct AuthenticatedRemotePath<'a> {
+    shared: &'a ServerShared,
+    connection_scope: &'a str,
+}
+
+impl<'a> AuthenticatedRemotePath<'a> {
+    fn acquire(
+        shared: &'a ServerShared,
+        connection_scope: &'a str,
+        socket: &ServerSocket,
+    ) -> Result<Self, LanServerError> {
+        let guard = Self {
+            shared,
+            connection_scope,
+        };
+        guard.refresh(socket)?;
+        Ok(guard)
+    }
+
+    fn refresh(&self, socket: &ServerSocket) -> Result<(), LanServerError> {
+        let selected = socket.selected_remote_path();
+        let changed = {
+            let mut paths = lock(&self.shared.authenticated_remote_paths);
+            match selected {
+                Some(path) => paths.insert(self.connection_scope.to_owned(), path) != Some(path),
+                None => paths.remove(self.connection_scope).is_some(),
+            }
+        };
+        if changed {
+            publish_authenticated_reachability(self.shared)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AuthenticatedRemotePath<'_> {
+    fn drop(&mut self) {
+        let removed = lock(&self.shared.authenticated_remote_paths).remove(self.connection_scope);
+        if removed.is_some() {
+            let _ = publish_authenticated_reachability(self.shared);
+        }
+    }
+}
+
+fn authenticated_reachability(
+    lan_connections: usize,
+    remote_paths: &BTreeMap<String, SelectedRemotePath>,
+) -> HostReachability {
+    if lan_connections > 0 {
+        HostReachability::LanDirect
+    } else if remote_paths
+        .values()
+        .any(|path| matches!(path, SelectedRemotePath::PeerToPeer))
+    {
+        HostReachability::PeerToPeer
+    } else if remote_paths
+        .values()
+        .any(|path| matches!(path, SelectedRemotePath::Relayed))
+    {
+        HostReachability::Relayed
+    } else {
+        HostReachability::Offline
+    }
+}
+
+fn publish_authenticated_reachability(shared: &ServerShared) -> Result<(), LanServerError> {
+    let reachability = authenticated_reachability(
+        shared.authenticated_connections.load(Ordering::Acquire),
+        &lock(&shared.authenticated_remote_paths),
+    );
+    shared
+        .broker
+        .set_authenticated_reachability(reachability, now_ms())
+        .map(|_| ())
+        .map_err(|_| LanServerError::Broker)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn authenticate(
-    stream: &mut StreamOwned<ServerConnection, TcpStream>,
+    stream: &mut StreamOwned<ServerConnection, ServerSocket>,
     session: &mut ConnectionSession,
     auth: ControlFrame,
     last_request_id: &mut u64,
@@ -621,7 +964,7 @@ fn authenticate(
 }
 
 fn authentication_failed(
-    stream: &mut StreamOwned<ServerConnection, TcpStream>,
+    stream: &mut StreamOwned<ServerConnection, ServerSocket>,
     source_ip: IpAddr,
     request_id: u64,
     not_before: Instant,
@@ -638,11 +981,12 @@ fn authentication_failed(
 }
 
 fn business_loop(
-    stream: &mut StreamOwned<ServerConnection, TcpStream>,
+    stream: &mut StreamOwned<ServerConnection, ServerSocket>,
     session: &mut ConnectionSession,
     gateway: AuthenticatedGateway,
     shared: &ServerShared,
     last_request_id: &mut u64,
+    remote_path: Option<&AuthenticatedRemotePath<'_>>,
 ) -> Result<(), LanServerError> {
     let mut decoder = FrameDecoder::new();
     let mut boundaries = FrameBoundaryTracker::default();
@@ -655,6 +999,9 @@ fn business_loop(
     let mut partial_since: Option<Instant> = None;
     let mut next_server_request_id = 1_u64;
     loop {
+        if let Some(remote_path) = remote_path {
+            remote_path.refresh(&stream.sock)?;
+        }
         if shared.shutdown.load(Ordering::Acquire) {
             break;
         }
@@ -790,7 +1137,7 @@ struct BusinessState {
 }
 
 fn handle_business_frame(
-    stream: &mut StreamOwned<ServerConnection, TcpStream>,
+    stream: &mut StreamOwned<ServerConnection, ServerSocket>,
     session: &mut ConnectionSession,
     gateway: &AuthenticatedGateway,
     shared: &ServerShared,
@@ -961,7 +1308,7 @@ fn handle_business_frame(
 }
 
 fn publish_subscription_events(
-    stream: &mut StreamOwned<ServerConnection, TcpStream>,
+    stream: &mut StreamOwned<ServerConnection, ServerSocket>,
     session: &mut ConnectionSession,
     subscriptions: &mut BTreeMap<u64, BrokerSubscription>,
 ) -> Result<(), LanServerError> {
@@ -1002,7 +1349,7 @@ fn publish_subscription_events(
 }
 
 fn begin_request(
-    stream: &mut StreamOwned<ServerConnection, TcpStream>,
+    stream: &mut StreamOwned<ServerConnection, ServerSocket>,
     session: &mut ConnectionSession,
     last_request_id: &mut u64,
     request_id: u64,
@@ -1015,7 +1362,7 @@ fn begin_request(
 }
 
 fn business_transport_error(
-    stream: &mut StreamOwned<ServerConnection, TcpStream>,
+    stream: &mut StreamOwned<ServerConnection, ServerSocket>,
     request_id: Option<u64>,
     error: TransportError,
 ) -> LanServerError {
@@ -1039,7 +1386,7 @@ fn complete_request(
 }
 
 fn read_control_until(
-    stream: &mut StreamOwned<ServerConnection, TcpStream>,
+    stream: &mut StreamOwned<ServerConnection, ServerSocket>,
     deadline: Instant,
 ) -> Result<ControlFrame, LanServerError> {
     let mut header = [0_u8; 5];
@@ -1072,7 +1419,7 @@ fn read_control_until(
 }
 
 fn read_exact_until(
-    stream: &mut StreamOwned<ServerConnection, TcpStream>,
+    stream: &mut StreamOwned<ServerConnection, ServerSocket>,
     bytes: &mut [u8],
     deadline: Instant,
 ) -> Result<(), LanServerError> {
@@ -1100,7 +1447,7 @@ fn read_exact_until(
 }
 
 fn write_control_until(
-    stream: &mut StreamOwned<ServerConnection, TcpStream>,
+    stream: &mut StreamOwned<ServerConnection, ServerSocket>,
     frame: &ControlFrame,
     deadline: Instant,
 ) -> Result<(), LanServerError> {
@@ -1175,14 +1522,14 @@ fn remaining_duration(deadline: Instant) -> Result<Duration, LanServerError> {
 }
 
 fn write_control(
-    stream: &mut StreamOwned<ServerConnection, TcpStream>,
+    stream: &mut StreamOwned<ServerConnection, ServerSocket>,
     frame: &ControlFrame,
 ) -> Result<(), LanServerError> {
     write_control_until(stream, frame, phase_deadline(FRAME_IO_TIMEOUT_MS)?)
 }
 
 fn write_transport_error(
-    stream: &mut StreamOwned<ServerConnection, TcpStream>,
+    stream: &mut StreamOwned<ServerConnection, ServerSocket>,
     request_id: Option<u64>,
     error: &TransportError,
     retriable: bool,
@@ -1198,7 +1545,7 @@ fn write_transport_error(
 }
 
 fn write_transport_error_until(
-    stream: &mut StreamOwned<ServerConnection, TcpStream>,
+    stream: &mut StreamOwned<ServerConnection, ServerSocket>,
     request_id: Option<u64>,
     error: &TransportError,
     retriable: bool,
@@ -1285,7 +1632,7 @@ fn map_transport(_error: TransportError) -> LanServerError {
 }
 
 fn map_gateway(
-    stream: &mut StreamOwned<ServerConnection, TcpStream>,
+    stream: &mut StreamOwned<ServerConnection, ServerSocket>,
     error: GatewayError,
 ) -> LanServerError {
     match error {
@@ -1318,7 +1665,9 @@ mod tests {
     use kaleido_transport::control::ControlFrame;
     use kaleido_transport::frame::encode_control;
 
-    use super::FrameBoundaryTracker;
+    use kaleido_proto::host::HostReachability;
+
+    use super::{authenticated_reachability, FrameBoundaryTracker, SelectedRemotePath};
 
     #[test]
     fn a_complete_frame_followed_by_a_partial_frame_remains_timed() {
@@ -1339,5 +1688,28 @@ mod tests {
         assert!(!boundaries
             .push(second.get(2..).expect("rest of frame"))
             .expect("complete second frame"));
+    }
+
+    #[test]
+    fn authenticated_path_priority_is_lan_then_peer_then_relay() {
+        let mut paths = std::collections::BTreeMap::new();
+        assert_eq!(
+            authenticated_reachability(0, &paths),
+            HostReachability::Offline
+        );
+        paths.insert("relay".to_owned(), SelectedRemotePath::Relayed);
+        assert_eq!(
+            authenticated_reachability(0, &paths),
+            HostReachability::Relayed
+        );
+        paths.insert("peer".to_owned(), SelectedRemotePath::PeerToPeer);
+        assert_eq!(
+            authenticated_reachability(0, &paths),
+            HostReachability::PeerToPeer
+        );
+        assert_eq!(
+            authenticated_reachability(1, &paths),
+            HostReachability::LanDirect
+        );
     }
 }

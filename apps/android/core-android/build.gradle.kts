@@ -149,6 +149,18 @@ val buildRustAndroid by tasks.registering(Exec::class) {
     doFirst {
         delete(outputDirectory)
     }
+    doLast {
+        // cargo-ndk also copies cdylib artifacts emitted by transitive Rust crates. kaleido-core
+        // statically links those crates, so keep only the JNI library Android actually loads.
+        val unrelatedLibraries = outputDirectory.walkTopDown()
+            .filter { it.isFile && it.extension == "so" && it.name != "libkaleido_core.so" }
+            .toList()
+        unrelatedLibraries.forEach { library ->
+            check(library.delete()) {
+                "failed to remove unrelated cargo-ndk artifact: ${library.name}"
+            }
+        }
+    }
 }
 
 val verifyCoreAndroidInputs by tasks.registering {
@@ -179,11 +191,19 @@ val verifyCoreAndroidAar by tasks.registering {
         check(aar.isFile && aar.length() > 0L) { "release AAR was not produced" }
         ZipFile(aar).use { archive ->
             val expectedAbis = setOf("arm64-v8a", "x86_64")
-            val packagedAbis = archive.entries().asSequence()
+            val packagedNativeEntries = archive.entries().asSequence()
                 .map { it.name }
-                .filter { it.startsWith("jni/") }
+                .filter { it.startsWith("jni/") && it.endsWith(".so") }
+                .toSet()
+            val expectedNativeEntries = expectedAbis.mapTo(mutableSetOf()) {
+                "jni/$it/libkaleido_core.so"
+            }
+            check(packagedNativeEntries == expectedNativeEntries) {
+                "release AAR native libraries must be exactly $expectedNativeEntries, " +
+                    "found $packagedNativeEntries"
+            }
+            val packagedAbis = packagedNativeEntries.asSequence()
                 .map { it.substringAfter("jni/").substringBefore('/') }
-                .filter { it.isNotEmpty() }
                 .toSet()
             check(packagedAbis == expectedAbis) {
                 "release AAR must contain exactly $expectedAbis, found $packagedAbis"

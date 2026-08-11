@@ -1,11 +1,14 @@
-# OneKaleidoscope TRANSPORT 0.1
+# OneKaleidoscope TRANSPORT 0.1 / REMOTE CONTROL 0.1
 
 > 状态：R3 LAN 合同，2026-08-09  
 > `TRANSPORT_VERSION = "0.1.0"`  
-> 决策来源：[ADR-0021](adr/0021-r3-lan-security.md)
+> `REMOTE_CONTROL_VERSION = "0.1.0"`
+> 决策来源：[ADR-0021](adr/0021-r3-lan-security.md)、
+> [ADR-0024](adr/0024-r4-self-hosted-remote-transport.md)
 
-本文只定义 PC hostd ↔ mobile core 的安全连接、frame、配对和设备认证。canonical 业务类型
-仍由 [PROTOCOL.md](PROTOCOL.md) / `kaleido-proto` 定义。
+本文定义 PC hostd ↔ mobile core 的安全连接、frame、配对和设备认证，以及 R4 自有 Ubuntu
+服务的独立 remote-control 控制面。canonical 业务类型仍由 [PROTOCOL.md](PROTOCOL.md) /
+`kaleido-proto` 定义；remote-control 不增加 UACP 业务类型。
 
 ## 1. 连接顺序
 
@@ -340,3 +343,92 @@ canonical 业务拒绝仍使用 UACP `CanonicalError`，不得伪装成 provider
 - pairing invalid/expired/used 返回不同 wire code、先断连后持久化吊销、或在签名 transcript
   漏掉任一字段的变异也必须让测试变红；
 - transport 不读取终端、PTY、ANSI 或 provider transcript 文件。
+
+## 10. REMOTE CONTROL 0.1
+
+REMOTE CONTROL 是 Ubuntu rendezvous、presence、route grant、push address 与 relay admission
+的独立协议，版本为 `0.1.0`，只接受 `0.1.x`。它不修改 TRANSPORT 0.1；公网数据连接在 iroh
+双向 stream 上重新运行本文第 1～8 节的完整 TLS/hello/device-auth 流程。产品 endpoint 只能使用
+`RelayMode::Custom`，map 中只能出现部署时 pin 的自有 relay；公共/default/staging relay、0-RTT
+和 insecure verifier 一律禁止。
+
+控制连接使用 TLS 1.3 和 exact Ubuntu service SPKI pin。每帧先写 4-byte big-endian JSON byte
+length，再写 UTF-8 JSON；length 必须在 `1..=4,096`，超限必须在分配 body 前拒绝。JSON 使用
+`kind` tagged object 且拒绝未知字段。连接第一组 frame 必须为：
+
+```text
+RemoteHello {
+  request_id, remote_control_version, max_frame_length
+}
+RemoteHelloAck {
+  request_id, remote_control_version, max_frame_length
+}
+```
+
+`max_frame_length` 必须精确为 4,096。request ID 非零、由请求方从 1 严格递增且不得复用；response
+逐字回显并与请求 kind 匹配。计数器耗尽时关闭连接。未知 version/kind/字段、错序、重复或错配
+response ID 均为 `MalformedFrame` 或 `VersionMismatch` 并关闭。
+
+鉴权 mutation 只允许以下 request/response 对：
+
+```text
+RegisterRoute / RouteRegistered
+RegisterPresence / PresenceRegistered
+RegisterDeviceGrant / DeviceGrantRegistered
+ResolveRoute / RouteResolved
+ReplacePushAddress / PushAddressReplaced
+DeletePushAddress / PushAddressDeleted
+WakeDevice / WakeAccepted
+RevokeDeviceGrant / DeviceGrantRevoked
+```
+
+每个 request 都带 16-byte canonical base64url `operation_id` 与 `issued_at_ms`；服务只接受时钟差
+`<= 60s`，并以 credential digest + operation ID 保存 120 秒有界 replay cache。cache 满时拒绝新
+operation，不得提前淘汰窗口内项。`RouteId`、`DeviceSlotId`、route hint 和 wake ID 均为 16-byte
+canonical base64url（22 字符）；admin/access token 为 32-byte canonical base64url（43 字符）。
+token 只在 TLS request 中出现，服务持久化 SHA-256 digest，普通 Debug/error/tracing 永不显示。
+首次 `RegisterRoute` 以不可猜的 route/admin token 原子创建无 presence 的 durable route；Host 仅在
+自有 relay 完成鉴权连接、iroh endpoint 已可达后发送 `RegisterPresence`，后续两者都只允许同一
+admin 与固定 Host EndpointId/relay URL。这样 relay 可先鉴权 Host，但 connecting candidate 不会被
+resolve 为 online。`RegisterDeviceGrant` 由 Host 为明确的本地 DeviceId 生成独立 slot/access token 并持久化
+digest；Ubuntu 永不取得 DeviceId↔slot 映射。`WakeDevice` 只接受 admin token，服务从持久化
+address 发送白名单 payload；FCM 返回 404/UNREGISTERED 时原子删除 address。
+
+presence TTL 请求范围 `15..=90s`，默认 30 秒，Host 每 10 秒刷新；过期或不存在统一返回
+`RouteUnavailable`。resolve 只能返回已配对固定的 Host EndpointId、自有 relay URL 与 expiry，
+客户端必须再与本地 pin 比较，服务响应不能更新 pin。relay admission 将 Host EndpointId 绑定
+route admin grant；device 的临时 EndpointId 绑定 device access grant，最终授权仍取决于内层
+P-256 challenge。
+
+remote revoke 必须在本地 registry fsync 后写入独立 durable FIFO outbox；Ubuntu 删除 grant 与
+push address 并 fsync 后才 ack。若进程恰在这两次本地提交之间崩溃，Host 重启必须把本地 revoked
+集合与持久 DeviceId→slot 映射对账，幂等补写 outbox，并在发布 presence 前冲刷；运行期维护循环
+也必须持续重试全部 pending 项。未知于 remote 映射的 LAN-only DeviceId 不创建虚假 slot。
+
+闭合 remote error code 为：
+
+```text
+VersionMismatch | MalformedFrame | AuthenticationFailed | RouteUnavailable
+Expired | Replay | RateLimited | LimitExceeded | Revoked | Internal
+```
+
+error 只有 `request_id: Option<u64>`、code、retriable，无 detail/source/string。不存在、过期、
+错误或已吊销 credential 不得通过 wire 细分其存在性。
+
+push address 是平台无关 `{ provider, opaque_address, registered_at_ms, expires_at_ms }`；provider
+闭合为 `FcmFid | ApnsToken`，R4 只消费 `FcmFid`。FCM 只发送如下 data-only JSON，exact key set，
+最大 256 bytes：
+
+```json
+{"v":"1","kind":"wake","route":"<22-char route hint>","wake":"<22-char random id>"}
+```
+
+payload 不含 HostId、DeviceId、endpoint、cursor、projection key、正文、ContentRef 或错误详情；
+它只是非可信唤醒提示，Android 必须重新完成 E2EE/auth 并按每个 ProjectionKey 的 last-good cursor
+恢复。FID 使用 Firebase Messaging 25.1.1 / BoM 34.16.0 的 `onRegistered`/`onUnregistered` 与
+HTTP v1 `message.fid`，弃用的 registration-token API 禁止进入产品代码。
+
+默认 relay 限额为全局 1,024、每 route 8、每 device slot 2、每来源 pre-auth 4；单连接入站
+1 MiB/s、burst 256 KiB，30 秒无合法活动探测、90 秒 idle 断链。Ubuntu 只转发 iroh 加密 packet，
+不得依赖、构造或解析 `kaleido-proto`/UACP。安全日志只含闭合事件/错误码、进程内短期 route/slot
+哈希、计数、持续时间和时间戳。

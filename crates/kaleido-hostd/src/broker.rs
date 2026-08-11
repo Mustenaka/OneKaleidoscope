@@ -114,7 +114,7 @@ struct BrokerState {
     subscribers: BTreeMap<u64, Subscriber>,
     next_subscription_token: u64,
     host_id: HostId,
-    lan_ready: bool,
+    authenticated_reachability: HostReachability,
 }
 
 #[derive(Debug, Clone)]
@@ -180,7 +180,7 @@ impl Broker {
                 subscribers: BTreeMap::new(),
                 next_subscription_token: 1,
                 host_id,
-                lan_ready: false,
+                authenticated_reachability: HostReachability::Offline,
             })),
             mint,
         })
@@ -204,7 +204,7 @@ impl Broker {
                 subscribers: BTreeMap::new(),
                 next_subscription_token: 1,
                 host_id,
-                lan_ready: false,
+                authenticated_reachability: HostReachability::Offline,
             })),
             mint,
         })
@@ -223,11 +223,7 @@ impl Broker {
                     return Err(BrokerError::HostIdentityMismatch);
                 }
                 let mut host = host.clone();
-                host.reachability = if state.lan_ready {
-                    HostReachability::LanDirect
-                } else {
-                    HostReachability::Offline
-                };
+                host.reachability = state.authenticated_reachability.clone();
                 owned = StateEffect::HostUpserted { host };
                 &owned
             }
@@ -350,15 +346,37 @@ impl Broker {
         Ok(projections)
     }
 
-    /// Latches listener readiness and publishes the matching canonical host
-    /// reachability if the provider has already bootstrapped the host record.
+    /// Latches authenticated-path readiness and publishes the matching
+    /// canonical host reachability if the provider has bootstrapped the host.
+    /// Merely binding or accepting a socket must never call this with `true`.
     pub fn set_lan_ready(
         &self,
         ready: bool,
         at_ms: i64,
     ) -> Result<Vec<ProjectionEnvelope>, BrokerError> {
+        self.set_authenticated_reachability(
+            if ready {
+                HostReachability::LanDirect
+            } else {
+                HostReachability::Offline
+            },
+            at_ms,
+        )
+    }
+
+    /// Publishes the path selected by a fully device-authenticated connection.
+    /// Callers must publish `Offline` after the last authenticated path closes;
+    /// listener, QUIC and inner-TLS handshakes are not sufficient.
+    pub fn set_authenticated_reachability(
+        &self,
+        reachability: HostReachability,
+        at_ms: i64,
+    ) -> Result<Vec<ProjectionEnvelope>, BrokerError> {
         let mut state = lock(&self.inner);
-        state.lan_ready = ready;
+        if state.authenticated_reachability == reachability {
+            return Ok(Vec::new());
+        }
+        state.authenticated_reachability = reachability.clone();
         let host = state
             .store
             .state()
@@ -368,11 +386,7 @@ impl Broker {
         let Some(mut host) = host else {
             return Ok(Vec::new());
         };
-        host.reachability = if ready {
-            HostReachability::LanDirect
-        } else {
-            HostReachability::Offline
-        };
+        host.reachability = reachability;
         host.last_seen_at_ms = at_ms;
         let commit = state
             .store
