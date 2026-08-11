@@ -3,8 +3,19 @@ $ErrorActionPreference = 'Stop'
 function Invoke-AdbText {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
 
-    $output = & adb @Arguments 2>&1
-    if ($LASTEXITCODE -ne 0) {
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        # Windows PowerShell promotes native stderr to an ErrorRecord.  ADB
+        # legitimately writes its first daemon-start notice there, so capture
+        # it without turning a successful cold start into a terminating error.
+        $ErrorActionPreference = 'Continue'
+        $output = & adb @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($exitCode -ne 0) {
         throw "adb command failed"
     }
     return ($output -join "`n").Trim()
