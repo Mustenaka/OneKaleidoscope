@@ -1,5 +1,21 @@
 $ErrorActionPreference = 'Stop'
 
+$sdkRoot = if ($env:ANDROID_SDK_ROOT) {
+    $env:ANDROID_SDK_ROOT
+} elseif ($env:ANDROID_HOME) {
+    $env:ANDROID_HOME
+} else {
+    Join-Path $env:LOCALAPPDATA 'Android\Sdk'
+}
+$script:adb = Join-Path $sdkRoot 'platform-tools\adb.exe'
+if (-not (Test-Path -LiteralPath $script:adb -PathType Leaf)) {
+    $adbCommand = Get-Command adb -CommandType Application -ErrorAction SilentlyContinue
+    if (-not $adbCommand) {
+        throw 'Android platform-tools adb.exe is unavailable'
+    }
+    $script:adb = $adbCommand.Source
+}
+
 function Invoke-AdbText {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
 
@@ -9,7 +25,7 @@ function Invoke-AdbText {
         # legitimately writes its first daemon-start notice there, so capture
         # it without turning a successful cold start into a terminating error.
         $ErrorActionPreference = 'Continue'
-        $output = & adb @Arguments 2>&1
+        $output = & $script:adb @Arguments 2>&1
         $exitCode = $LASTEXITCODE
     }
     finally {
