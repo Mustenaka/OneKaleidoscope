@@ -1,8 +1,7 @@
 # Development
 
-> Current phase: R2 is complete (`docs/gates/T-100-result.md`). The active task is
-> `docs/tasks/T-102.md`, which must land before R3. See `docs/STATUS.md` and
-> `docs/tasks/README.md` before using the instructions below.
+> Current phase: R5 is active. See `docs/STATUS.md` and `docs/tasks/README.md`
+> before using the instructions below.
 
 ## Rust toolchain
 
@@ -19,6 +18,47 @@ opt in with workspace-inherited package fields and:
 [lints]
 workspace = true
 ```
+
+## External Windows build artifacts
+
+On Windows, Rust and Gradle build artifacts must stay outside every C: worktree.
+Before running Cargo or Gradle in a new PowerShell session, dot-source the
+repository activation script:
+
+```powershell
+. .\scripts\use-external-build-root.ps1
+cargo xtask ci
+```
+
+It defaults to `D:\OneKaleidoscope\build`, creates only that explicit external
+root, and sets `KALEIDO_BUILD_ROOT`, `CARGO_TARGET_DIR` and `GRADLE_USER_HOME`.
+After activation, `cargo xtask ci`, `cargo xtask test`, `cargo xtask clippy`,
+and schema staging all use the same Cargo target directory; they no longer make
+separate `target/debug`, `target/xtask-ci`, or `target/xtask-test` trees. An explicit
+`CARGO_TARGET_DIR` takes precedence, but xtask rejects a relative path or any
+Windows path outside D:. The Android Windows wrapper applies the same D: default
+when it is invoked directly.
+
+To use a different external root, it must be an absolute D: directory:
+
+```powershell
+. .\scripts\use-external-build-root.ps1 -BuildRoot D:\OneKaleidoscope\alternative-build
+```
+
+Run the artifact audit before costly gates. It is an audit/dry run by default
+and never deletes files unless both `-Mode Clean` and `-Execute` are supplied after
+explicit user authorization. It warns when external artifacts reach 120 GiB or
+when D: has less than 80 GiB free; both thresholds are configurable.
+
+```powershell
+powershell -NoProfile -File .\scripts\audit-build-artifacts.ps1
+powershell -NoProfile -File .\scripts\audit-build-artifacts.ps1 -Mode Clean
+```
+
+The cleanup path resolves and validates absolute targets, refuses reparse
+points, and is limited to `cargo-target` and `gradle-user-home` under the
+selected external root. Do not clean existing user targets or caches with this
+script without their authorization.
 
 ## Local checks
 

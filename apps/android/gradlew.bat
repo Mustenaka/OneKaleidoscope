@@ -32,6 +32,11 @@ if "%DIRNAME%"=="" set DIRNAME=.
 set APP_BASE_NAME=%~n0
 set APP_HOME=%DIRNAME%
 
+@rem Keep Windows Gradle caches out of the C: worktree unless the caller selected an external root.
+if not defined KALEIDO_BUILD_ROOT set KALEIDO_BUILD_ROOT=D:\OneKaleidoscope\build
+if not "%KALEIDO_BUILD_ROOT:~0,3%"=="D:\" goto invalidExternalBuildRoot
+if not defined GRADLE_USER_HOME set GRADLE_USER_HOME=%KALEIDO_BUILD_ROOT%\gradle-user-home
+
 @rem Resolve any "." and ".." in APP_HOME to make it shorter.
 for %%i in ("%APP_HOME%") do set APP_HOME=%%~fi
 
@@ -51,6 +56,12 @@ echo. 1>&2
 echo Please set the JAVA_HOME variable in your environment to match the 1>&2
 echo location of your Java installation. 1>&2
 
+goto fail
+
+:invalidExternalBuildRoot
+echo. 1>&2
+echo ERROR: KALEIDO_BUILD_ROOT must be an absolute path on D:. 1>&2
+echo. 1>&2
 goto fail
 
 :findJavaFromJavaHome

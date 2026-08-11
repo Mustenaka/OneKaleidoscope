@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus};
 
 use xtask::antipattern::{self, scan_repository};
+use xtask::build::{self, BuildRootError};
 use xtask::schema::{self, SchemaCommand};
 use xtask::{deps, fixtures, sidecar};
 
@@ -26,6 +27,7 @@ enum Task {
 enum XtaskError {
     Usage,
     WorkspaceRoot,
+    BuildRoot(BuildRootError),
     Io(io::Error),
     StepFailed {
         step: &'static str,
@@ -47,6 +49,7 @@ impl fmt::Display for XtaskError {
                 "usage: cargo xtask <ci|fmt|clippy|test|check-deps|lint-forbidden|claude-sidecar|fixtures verify|schema <refresh|diff|history <tool> <entry-id>>>"
             ),
             Self::WorkspaceRoot => write!(formatter, "could not resolve the workspace root"),
+            Self::BuildRoot(error) => write!(formatter, "build artifact root: {error}"),
             Self::Io(error) => write!(formatter, "I/O failure: {error}"),
             Self::StepFailed { step, status } => {
                 write!(formatter, "step `{step}` failed with status {status}")
@@ -67,6 +70,7 @@ impl std::error::Error for XtaskError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
+            Self::BuildRoot(error) => Some(error),
             Self::Dependencies(error) => Some(error),
             Self::Antipattern(error) => Some(error),
             Self::Fixtures(error) => Some(error),
@@ -80,6 +84,12 @@ impl std::error::Error for XtaskError {
 impl From<io::Error> for XtaskError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
+    }
+}
+
+impl From<BuildRootError> for XtaskError {
+    fn from(error: BuildRootError) -> Self {
+        Self::BuildRoot(error)
     }
 }
 
@@ -138,8 +148,8 @@ fn run() -> Result<(), XtaskError> {
 
     match task {
         Task::Ci => {
-            let target = root.join("target").join("xtask-ci");
-            run_cargo_step_in_target(
+            let target = build::cargo_target_dir(&root)?;
+            run_cargo_step_with_target(
                 &root,
                 &target,
                 "fmt-check",
@@ -147,31 +157,46 @@ fn run() -> Result<(), XtaskError> {
             )?;
             run_deps_step(&root)?;
             run_forbidden_step(&root)?;
-            run_cargo_step_in_target(
+            run_cargo_step_with_target(
                 &root,
                 &target,
                 "clippy",
                 &["clippy", "--all-targets", "--", "-D", "warnings"],
             )?;
             run_claude_sidecar_step(&root)?;
-            run_test_step(&root, Some(&target))?;
+            run_test_step(&root, &target)?;
             run_fixtures_step(&root)
         }
-        Task::Fmt => run_cargo_step(&root, "fmt-check", &["fmt", "--all", "--", "--check"]),
-        Task::Clippy => run_cargo_step(
-            &root,
-            "clippy",
-            &["clippy", "--all-targets", "--", "-D", "warnings"],
-        ),
+        Task::Fmt => {
+            let target = build::cargo_target_dir(&root)?;
+            run_cargo_step_with_target(
+                &root,
+                &target,
+                "fmt-check",
+                &["fmt", "--all", "--", "--check"],
+            )
+        }
+        Task::Clippy => {
+            let target = build::cargo_target_dir(&root)?;
+            run_cargo_step_with_target(
+                &root,
+                &target,
+                "clippy",
+                &["clippy", "--all-targets", "--", "-D", "warnings"],
+            )
+        }
         Task::Test => {
-            let target = root.join("target").join("xtask-test");
-            run_test_step(&root, Some(&target))
+            let target = build::cargo_target_dir(&root)?;
+            run_test_step(&root, &target)
         }
         Task::CheckDeps => run_deps_step(&root),
         Task::LintForbidden => run_forbidden_step(&root),
         Task::ClaudeSidecar => run_claude_sidecar_step(&root),
         Task::FixturesVerify => run_fixtures_step(&root),
-        Task::Schema(command) => schema::run(command, &root).map_err(Into::into),
+        Task::Schema(command) => {
+            let target = build::cargo_target_dir(&root)?;
+            schema::run(command, &root, &target).map_err(Into::into)
+        }
     }
 }
 
@@ -249,19 +274,6 @@ fn workspace_root() -> Result<PathBuf, XtaskError> {
         .ok_or(XtaskError::WorkspaceRoot)
 }
 
-fn run_cargo_step(root: &Path, step: &'static str, arguments: &[&str]) -> Result<(), XtaskError> {
-    run_cargo_step_with_target(root, None, step, arguments)
-}
-
-fn run_cargo_step_in_target(
-    root: &Path,
-    target: &Path,
-    step: &'static str,
-    arguments: &[&str],
-) -> Result<(), XtaskError> {
-    run_cargo_step_with_target(root, Some(target), step, arguments)
-}
-
 #[derive(Debug, Eq, PartialEq)]
 struct TestScope {
     arguments: &'static [&'static str],
@@ -275,7 +287,7 @@ fn test_scope() -> TestScope {
     }
 }
 
-fn run_test_step(root: &Path, target: Option<&Path>) -> Result<(), XtaskError> {
+fn run_test_step(root: &Path, target: &Path) -> Result<(), XtaskError> {
     let scope = test_scope();
     println!("{}", scope.exclusion_notice);
     run_cargo_step_with_target(root, target, "test", scope.arguments)
@@ -283,7 +295,7 @@ fn run_test_step(root: &Path, target: Option<&Path>) -> Result<(), XtaskError> {
 
 fn run_cargo_step_with_target(
     root: &Path,
-    target: Option<&Path>,
+    target: &Path,
     step: &'static str,
     arguments: &[&str],
 ) -> Result<(), XtaskError> {
@@ -291,9 +303,7 @@ fn run_cargo_step_with_target(
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let mut command = Command::new(cargo);
     command.args(arguments).current_dir(root);
-    if let Some(target) = target {
-        command.env("CARGO_TARGET_DIR", target);
-    }
+    command.env("CARGO_TARGET_DIR", target);
     let status = command.status()?;
     if !status.success() {
         return Err(XtaskError::StepFailed { step, status });

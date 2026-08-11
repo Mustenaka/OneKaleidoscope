@@ -170,7 +170,11 @@ struct SnapshotStats {
     acp_files: usize,
 }
 
-pub fn run(command: SchemaCommand, workspace_root: &Path) -> Result<(), SchemaError> {
+pub fn run(
+    command: SchemaCommand,
+    workspace_root: &Path,
+    artifact_root: &Path,
+) -> Result<(), SchemaError> {
     if let SchemaCommand::History { tool, entry_id } = &command {
         return run_history(workspace_root, tool, entry_id);
     }
@@ -182,11 +186,10 @@ pub fn run(command: SchemaCommand, workspace_root: &Path) -> Result<(), SchemaEr
     let versions = verify_tool_versions(&snapshot_versions)?;
     print_version_report(&surface, &snapshot_versions, &versions);
 
-    let target = workspace_root.join("target");
-    fs::create_dir_all(&target)?;
+    fs::create_dir_all(artifact_root)?;
     let staging = TempDirBuilder::new()
         .prefix("schema-snapshot-")
-        .tempdir_in(&target)?;
+        .tempdir_in(artifact_root)?;
     let staged_schemas = staging.path().join("schemas");
 
     println!(
@@ -675,7 +678,12 @@ fn fetch_opencode(schemas_root: &Path, observed_version: &str) -> Result<usize, 
     let port = listener.local_addr()?.port();
     drop(listener);
 
-    let run_dir = TempDirBuilder::new().prefix("opencode-schema-").tempdir()?;
+    let artifact_root = schemas_root.parent().ok_or_else(|| {
+        SchemaError::InvalidSnapshot("staged schema directory has no artifact parent".to_owned())
+    })?;
+    let run_dir = TempDirBuilder::new()
+        .prefix("opencode-schema-")
+        .tempdir_in(artifact_root)?;
     let port_string = port.to_string();
     let mut server_command = child_command(tool_executable("opencode")?);
     configure_opencode_environment(&mut server_command, run_dir.path())?;

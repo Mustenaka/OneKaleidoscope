@@ -150,7 +150,7 @@ exact-commit 全量结果交由 PR CI，不能沿用父提交绿灯。
 | `cargo xtask ci` | **父提交 `d39b570` 本地通过** | `c929a85` 仅定向回归/Clippy/实体纵切；exact-commit 全量等待 PR CI |
 | `cargo xtask schema diff` | **最新集成候选本地通过** | 精确 Codex `0.147.0`；288 JSON files、in/out surface 0 drift；OpenCode live contract drift 仍另行阻塞 |
 | Android clean build/lint/API 35 | **`fc896be` 本地通过** | 双 ABI AAR/APK/JVM/lint；native smoke 1/1；全量 18 completed / 0 failed，2 physical-only skipped |
-| Windows/macOS/Linux CI + Android CI | **workflow 已接 Node 22/Claude sidecar gate；`c929a85` exact run 待完成** | 仍不能标绿 |
+| Windows/macOS/Linux CI + Android CI | **`9791c40` 的 PR #12 exact run 未通过总门禁** | Windows/macOS success；Ubuntu job 未完成且 workflow `31504076560` 已 cancelled；Android CI 未在该 SHA 运行，仍不能标绿 |
 | 实体 arm64 Android + 真实 Wi-Fi 三家纵切 | **Claude 子格通过；Codex/OpenCode/同驻未通过** | 真机、真 Wi-Fi、真 Claude SDK；无 emulator/mock/`adb reverse` |
 | R4 合并后蜂窝/relay 重跑 | **外部验收 pending** | R4 实现已进 `main`；T-115 的实体蜂窝/relay 门禁仍独立 pending |
 
@@ -168,7 +168,10 @@ exact-commit 全量结果交由 PR CI，不能沿用父提交绿灯。
 ## 6. 完成条件
 
 T-113 只有在 T-111 上游空缺闭合、三家同驻纵切、`cargo xtask ci`、跨平台
-CI exact commit runs 与实体 arm64 Android 真实 Wi-Fi 纵切全部通过后才能完成。R4 合并后还必须
+CI exact commit runs 与实体 arm64 Android 真实 Wi-Fi 纵切全部通过后才能完成。2026-08-12
+审计 PR #12 的 `9791c408b27b1ce211e9593c57679254d9e02391`：Windows/macOS success，Ubuntu
+job 未完成且 workflow `31504076560` 已 cancelled，所以不能把这次 run 记为 exact-SHA 三平台绿灯。
+R4 合并后还必须
 在最终 SHA 重跑蜂窝/relay；当前 LAN 证据不等于公网恢复。
 
 ## 7. 零构建外部预检
