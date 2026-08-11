@@ -30,6 +30,12 @@ minor line must be refused before decoding business messages. Old durable
 records are not silently migrated or guessed into the new shape; loading
 remains fail-loud.
 
+The QuestionSet shape also changes the cached `AttentionInbox` projection.
+`PROJECTION_VERSION` is therefore `3`; a mobile client reads the version header
+before decoding a cached payload and discards older derived projection files.
+Pairing credentials and command state are not part of that cache and remain
+intact. Treating a v2 single-question payload as v3 is forbidden.
+
 The initial R5 worktree used `0.4.0` while QuestionSet was the only new wire
 shape. That version was never merged, released or used as a durable production
 format. The same R5 branch subsequently made `AcceptedByRuntime.session_id` and

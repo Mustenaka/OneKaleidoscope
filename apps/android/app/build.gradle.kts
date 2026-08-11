@@ -4,6 +4,16 @@ plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.google.services) apply false
+}
+
+val firebaseConfig = layout.projectDirectory.file("google-services.json").asFile
+if (firebaseConfig.isFile) {
+    apply(plugin = "com.google.gms.google-services")
+} else if (providers.gradleProperty("requireFirebaseConfig").orNull == "true") {
+    throw GradleException(
+        "Firebase configuration is required but was not injected into the Android app module",
+    )
 }
 
 android {
@@ -68,7 +78,11 @@ dependencies {
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.navigation.compose)
     implementation(libs.androidx.security.crypto)
+    implementation(libs.androidx.work.runtime.ktx)
     implementation(libs.kotlinx.coroutines.android)
+
+    implementation(platform(libs.firebase.bom))
+    implementation(libs.firebase.messaging)
 
     implementation(platform(libs.compose.bom))
     implementation(libs.compose.ui)

@@ -1,8 +1,8 @@
 # T-114 QuestionSet evidence
 
 > 状态：**T-114 本地合同门禁完成；不代表 R5 完成**
-> 基线：`origin/main@893e930`
-> 记录日期：2026-08-10
+> 集成基线：`origin/main@c993d9f9bb115003e2ee69066c233ac47b7c52cc`
+> 记录日期：2026-08-11
 
 ## 1. 合同结果
 
@@ -39,18 +39,19 @@ command/session 的唯一 RemoteCommand Turn；`SessionControl` 用于 interrupt
 
 Android 验证使用本机已配置的 `<ANDROID_SDK>`；证据页不保存含用户名的绝对路径。
 本卡的 Android 要求是共享合同消费/编译；T-113 仍要求实体设备上的三 provider 产品纵切。
-最终 no-build-cache 命令包含 `:app:compileDebugKotlin`、
-`:app:compileDebugAndroidTestKotlin` 与 `:app:testDebugUnitTest`，结果 `BUILD SUCCESSFUL`，覆盖
-`arm64-v8a` + `x86_64` Rust/UniFFI。
+旧 R5 SHA 的 no-build-cache 命令包含 `:app:compileDebugKotlin`、
+`:app:compileDebugAndroidTestKotlin` 与 `:app:testDebugUnitTest`，结果 `BUILD SUCCESSFUL`。最新 R4/R5
+集成候选已再次执行相同受影响层，实际构建 `arm64-v8a` + `x86_64` Rust/UniFFI 后通过 Kotlin、
+androidTest source 与 JVM tests；冻结 SHA 的 clean Android 总门禁由 T-113 记录。
 
 ## 3. 变异验证
 
 答案覆盖校验曾被故意破坏，focused 测试实际变红；恢复实现后相同测试全绿。该记录证明
 “恰好覆盖每题”的测试能失败，而不是只执行 happy path。
 
-最终 DoD 把这条变异与 `cargo xtask ci` 绑定。第三次完整本地 `cargo xtask ci` 已 exit 0，依次
+最终 DoD 把这条变异与 `cargo xtask ci` 绑定。旧 R5 SHA 的第三次完整本地 `cargo xtask ci` 已 exit 0，依次
 通过 fmt、check-deps、lint-forbidden、clippy、Claude sidecar、workspace tests 与 fixtures verify，
-因此 T-114 的最后一项已闭合。
+因此 T-114 合同卡已闭合；最新 R4/R5 集成候选仍需一次冻结 SHA 总门禁，不能沿用旧 SHA 结果。
 
 ## 4. R5 仍未完成的外部门禁
 

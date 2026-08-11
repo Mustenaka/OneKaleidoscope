@@ -1259,7 +1259,7 @@ ErrorCode =
 `projection_version`，客户端据此判断是否需要全量刷新。
 
 ```
-PROJECTION_VERSION = 2
+PROJECTION_VERSION = 3
 ```
 
 | Projection | 内容 | 需求来源 |

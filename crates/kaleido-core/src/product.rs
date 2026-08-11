@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use kaleido_proto::attention::{
-    AttentionItem, AttentionResponse, AttentionSubject, QuestionAnswer,
+    AttentionItem, AttentionResponse, AttentionSubject, QuestionAnswer, QuestionRequest,
 };
 use kaleido_proto::capability::{Capability, CapabilityState};
 use kaleido_proto::command::{Command, CommandAck, DeviceCommandRequest};
@@ -11,7 +11,7 @@ use kaleido_proto::content::{
     ContentKind, ContentReadRequest, ContentReadResponse, ContentRef, ContentUnavailableReason,
     ContentWriteRequest, ContentWriteResponse, MAX_CONTENT_READ_BYTES, MAX_CONTENT_WRITE_BYTES,
 };
-use kaleido_proto::ids::{SessionId, TurnId};
+use kaleido_proto::ids::{ProjectBindingId, ProviderRuntimeId, SessionId, TurnId};
 use kaleido_proto::projection::{InputQueueView, RuntimeCapabilityView, SessionSummary};
 use kaleido_proto::queue::QueueIntent;
 use kaleido_proto::session::LiveBinding;
@@ -36,6 +36,7 @@ pub enum MobileSessionAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum MobileActionBlocker {
     SessionNotLive,
+    SessionNotResumable,
     RuntimeCapabilityMissing,
     CapabilityUnsupported,
     CapabilityUnavailable,
@@ -49,6 +50,18 @@ pub enum MobileActionBlocker {
 pub struct MobileActionAvailability {
     pub enabled: bool,
     pub blocker: Option<MobileActionBlocker>,
+}
+
+/// Canonical facts needed to offer history resume for one session.
+///
+/// Resume is intentionally not inferred from a provider-wide capability alone:
+/// the target must be in the `SessionIndexView::history` section and its exact
+/// project binding must select the same runtime whose capability is supplied.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MobileResumeContext {
+    pub project_binding_id: ProjectBindingId,
+    pub runtime_id: ProviderRuntimeId,
+    pub history_eligible: bool,
 }
 
 /// Body text is deliberately returned ephemerally and is never written to the
@@ -76,6 +89,7 @@ pub fn mobile_session_action_availability(
     queue: Option<InputQueueView>,
     capabilities: Option<RuntimeCapabilityView>,
     action: MobileSessionAction,
+    resume_context: Option<MobileResumeContext>,
 ) -> MobileActionAvailability {
     match action {
         MobileSessionAction::SubmitPrompt => {
@@ -95,7 +109,14 @@ pub fn mobile_session_action_availability(
             }
         }
         MobileSessionAction::ResumeSession => {
-            let Some(capabilities) = capabilities else {
+            let Some(context) = resume_context.filter(|context| {
+                context.history_eligible && context.project_binding_id == session.project_binding_id
+            }) else {
+                return blocked(MobileActionBlocker::SessionNotResumable);
+            };
+            let Some(capabilities) =
+                capabilities.filter(|view| view.runtime_id == context.runtime_id)
+            else {
                 return blocked(MobileActionBlocker::RuntimeCapabilityMissing);
             };
             capability_availability(&capabilities, Capability::HistoryResume)
@@ -271,47 +292,11 @@ impl MobileClient {
         let AttentionSubject::Question { request } = &attention.subject else {
             return Err(MobileClientError::Contract);
         };
-        if answers.len() != request.questions.len() {
-            return Err(MobileClientError::Contract);
-        }
-        let mut seen = HashSet::new();
+        let free_form_allowed = validate_mobile_question_answers(request, &answers)?;
         let mut question_answers = Vec::with_capacity(answers.len());
-        for answer in answers {
-            if !seen.insert(answer.question_key.clone()) {
-                return Err(MobileClientError::Contract);
-            }
-            let question = request
-                .questions
-                .iter()
-                .find(|question| question.question_key == answer.question_key)
-                .ok_or(MobileClientError::Contract)?;
-            if answer.option_ids.is_empty() && answer.free_form.is_none() {
-                return Err(MobileClientError::Contract);
-            }
-            if answer
-                .free_form
-                .as_deref()
-                .is_some_and(|text| text.trim().is_empty())
-            {
-                return Err(MobileClientError::Contract);
-            }
-            if !question.multi_select && answer.option_ids.len() > 1 {
-                return Err(MobileClientError::Contract);
-            }
-            let mut option_ids = HashSet::new();
-            for option_id in &answer.option_ids {
-                if option_id.is_empty()
-                    || !option_ids.insert(option_id)
-                    || !question
-                        .options
-                        .iter()
-                        .any(|option| &option.option_id == option_id)
-                {
-                    return Err(MobileClientError::Contract);
-                }
-            }
+        for (answer, free_form_allowed) in answers.into_iter().zip(free_form_allowed) {
             let free_form_ref = match answer.free_form {
-                Some(text) if question.free_form_allowed => Some(self.upload_sensitive_text(text)?),
+                Some(text) if free_form_allowed => Some(self.upload_sensitive_text(text)?),
                 Some(_) => return Err(MobileClientError::Contract),
                 None => None,
             };
@@ -418,6 +403,59 @@ impl MobileClient {
         let text = String::from_utf8(bytes).map_err(|_| MobileClientError::Contract)?;
         Ok(MobileTextContent::Available { text })
     }
+}
+
+/// Validates the complete question set before the first sensitive body is
+/// uploaded. This keeps an invalid later answer from leaking an earlier
+/// free-form answer into the broker content store.
+fn validate_mobile_question_answers(
+    request: &QuestionRequest,
+    answers: &[MobileQuestionAnswer],
+) -> Result<Vec<bool>, MobileClientError> {
+    if answers.len() != request.questions.len() {
+        return Err(MobileClientError::Contract);
+    }
+    let mut seen = HashSet::new();
+    let mut free_form_allowed = Vec::with_capacity(answers.len());
+    for answer in answers {
+        if !seen.insert(answer.question_key.clone()) {
+            return Err(MobileClientError::Contract);
+        }
+        let question = request
+            .questions
+            .iter()
+            .find(|question| question.question_key == answer.question_key)
+            .ok_or(MobileClientError::Contract)?;
+        if answer.option_ids.is_empty() && answer.free_form.is_none() {
+            return Err(MobileClientError::Contract);
+        }
+        if let Some(text) = answer.free_form.as_deref() {
+            let byte_len = u64::try_from(text.len()).map_err(|_| MobileClientError::Contract)?;
+            if text.trim().is_empty()
+                || !question.free_form_allowed
+                || !(1..=MAX_CONTENT_WRITE_BYTES).contains(&byte_len)
+            {
+                return Err(MobileClientError::Contract);
+            }
+        }
+        if !question.multi_select && answer.option_ids.len() > 1 {
+            return Err(MobileClientError::Contract);
+        }
+        let mut option_ids = HashSet::new();
+        for option_id in &answer.option_ids {
+            if option_id.is_empty()
+                || !option_ids.insert(option_id)
+                || !question
+                    .options
+                    .iter()
+                    .any(|option| &option.option_id == option_id)
+            {
+                return Err(MobileClientError::Contract);
+            }
+        }
+        free_form_allowed.push(question.free_form_allowed);
+    }
+    Ok(free_form_allowed)
 }
 
 impl MobileClient {
@@ -530,17 +568,24 @@ fn blocked(blocker: MobileActionBlocker) -> MobileActionAvailability {
 
 #[cfg(test)]
 mod tests {
+    use kaleido_proto::attention::{
+        DecisionOption, DecisionSemantics, QuestionPrompt, QuestionRequest,
+    };
     use kaleido_proto::capability::{
         CapabilityEntry, CapabilityEvidence, CapabilityState, EvidenceSource,
     };
     use kaleido_proto::content::{ContentAvailability, ContentKind, ContentRef, Sensitivity};
-    use kaleido_proto::ids::{ContentId, ProjectBindingId, ProviderRuntimeId, SessionId};
+    use kaleido_proto::ids::{
+        ContentId, ProjectBindingId, ProviderBindingHandle, ProviderBindingId, ProviderBindingKind,
+        ProviderRuntimeId, SessionId,
+    };
     use kaleido_proto::projection::{InputQueueView, RuntimeCapabilityView, SessionSummary};
     use kaleido_proto::session::{LiveBinding, OwnershipMode, SessionStatus};
 
     use super::{
-        checked_next_offset, digest, mobile_session_action_availability, MobileActionBlocker,
-        MobileClientError, MobileSessionAction,
+        checked_next_offset, digest, mobile_session_action_availability,
+        validate_mobile_question_answers, MobileActionBlocker, MobileClientError,
+        MobileQuestionAnswer, MobileResumeContext, MobileSessionAction,
     };
 
     fn session(live: bool) -> SessionSummary {
@@ -596,6 +641,68 @@ mod tests {
         }
     }
 
+    fn question_request() -> QuestionRequest {
+        let option = |id: &str| DecisionOption {
+            option_id: id.to_owned(),
+            label: id.to_owned(),
+            semantics: DecisionSemantics::Choose,
+        };
+        let prompt_ref = |id: &str| ContentRef {
+            content_id: ContentId::new(id),
+            kind: ContentKind::PlainText,
+            byte_len: 1,
+            digest: digest(b"x"),
+            preview: None,
+            sensitivity: Sensitivity::Sensitive,
+            availability: ContentAvailability::Stored,
+        };
+        QuestionRequest {
+            request_key: "question-request-a".to_owned(),
+            questions: vec![
+                QuestionPrompt {
+                    question_key: "language".to_owned(),
+                    prompt_ref: prompt_ref("content-language"),
+                    options: vec![option("rust")],
+                    multi_select: false,
+                    free_form_allowed: true,
+                },
+                QuestionPrompt {
+                    question_key: "details".to_owned(),
+                    prompt_ref: prompt_ref("content-details"),
+                    options: vec![option("tests")],
+                    multi_select: true,
+                    free_form_allowed: false,
+                },
+            ],
+            binding_handle: ProviderBindingHandle {
+                id: ProviderBindingId::new("bnd_question01"),
+                runtime_id: ProviderRuntimeId::new("runtime-a"),
+                kind: ProviderBindingKind::InteractionRequest,
+            },
+        }
+    }
+
+    #[test]
+    fn complete_question_set_is_validated_before_any_sensitive_upload() {
+        let answers = vec![
+            MobileQuestionAnswer {
+                question_key: "language".to_owned(),
+                option_ids: Vec::new(),
+                free_form: Some("private first answer".to_owned()),
+            },
+            MobileQuestionAnswer {
+                question_key: "details".to_owned(),
+                option_ids: vec!["unknown-option".to_owned()],
+                free_form: None,
+            },
+        ];
+
+        assert!(matches!(
+            validate_mobile_question_answers(&question_request(), &answers),
+            Err(MobileClientError::Contract)
+        ));
+    }
+
     #[test]
     fn prompt_requires_live_session_and_exact_supported_capability() {
         let enabled = mobile_session_action_availability(
@@ -603,6 +710,7 @@ mod tests {
             None,
             Some(capabilities(CapabilityState::Supported)),
             MobileSessionAction::SubmitPrompt,
+            None,
         );
         assert!(enabled.enabled);
 
@@ -611,6 +719,7 @@ mod tests {
             None,
             Some(capabilities(CapabilityState::NotVerified)),
             MobileSessionAction::SubmitPrompt,
+            None,
         );
         assert_eq!(
             unverified.blocker,
@@ -622,6 +731,7 @@ mod tests {
             None,
             Some(capabilities(CapabilityState::Supported)),
             MobileSessionAction::SubmitPrompt,
+            None,
         );
         assert_eq!(offline.blocker, Some(MobileActionBlocker::SessionNotLive));
     }
@@ -644,7 +754,8 @@ mod tests {
                     session.clone(),
                     Some(queue.clone()),
                     None,
-                    action
+                    action,
+                    None,
                 )
                 .enabled
             );
@@ -652,7 +763,12 @@ mod tests {
     }
 
     #[test]
-    fn resume_and_interrupt_are_driven_by_their_exact_capabilities() {
+    fn resume_requires_history_membership_and_the_exact_binding_runtime() {
+        let context = MobileResumeContext {
+            project_binding_id: ProjectBindingId::new("binding-a"),
+            runtime_id: ProviderRuntimeId::new("runtime-a"),
+            history_eligible: true,
+        };
         let resume = mobile_session_action_availability(
             session(false),
             None,
@@ -661,9 +777,66 @@ mod tests {
                 CapabilityState::Supported,
             )),
             MobileSessionAction::ResumeSession,
+            Some(context.clone()),
         );
         assert!(resume.enabled);
 
+        let active_section = mobile_session_action_availability(
+            session(false),
+            None,
+            Some(capability_view(
+                kaleido_proto::capability::Capability::HistoryResume,
+                CapabilityState::Supported,
+            )),
+            MobileSessionAction::ResumeSession,
+            Some(MobileResumeContext {
+                history_eligible: false,
+                ..context.clone()
+            }),
+        );
+        assert_eq!(
+            active_section.blocker,
+            Some(MobileActionBlocker::SessionNotResumable)
+        );
+
+        let wrong_binding = mobile_session_action_availability(
+            session(false),
+            None,
+            Some(capability_view(
+                kaleido_proto::capability::Capability::HistoryResume,
+                CapabilityState::Supported,
+            )),
+            MobileSessionAction::ResumeSession,
+            Some(MobileResumeContext {
+                project_binding_id: ProjectBindingId::new("binding-b"),
+                ..context.clone()
+            }),
+        );
+        assert_eq!(
+            wrong_binding.blocker,
+            Some(MobileActionBlocker::SessionNotResumable)
+        );
+
+        let mut wrong_runtime = capability_view(
+            kaleido_proto::capability::Capability::HistoryResume,
+            CapabilityState::Supported,
+        );
+        wrong_runtime.runtime_id = ProviderRuntimeId::new("runtime-b");
+        let mismatched_capability = mobile_session_action_availability(
+            session(false),
+            None,
+            Some(wrong_runtime),
+            MobileSessionAction::ResumeSession,
+            Some(context),
+        );
+        assert_eq!(
+            mismatched_capability.blocker,
+            Some(MobileActionBlocker::RuntimeCapabilityMissing)
+        );
+    }
+
+    #[test]
+    fn interrupt_requires_a_live_session_and_its_exact_capability() {
         let interrupt = mobile_session_action_availability(
             session(true),
             None,
@@ -672,6 +845,7 @@ mod tests {
                 CapabilityState::Supported,
             )),
             MobileSessionAction::InterruptTurn,
+            None,
         );
         assert!(interrupt.enabled);
 
@@ -683,6 +857,7 @@ mod tests {
                 CapabilityState::Supported,
             )),
             MobileSessionAction::InterruptTurn,
+            None,
         );
         assert_eq!(
             offline_interrupt.blocker,

@@ -1,8 +1,8 @@
 # T-113 multi-provider / mobile gate evidence
 
 > 状态：**active；composition bootstrap 通过，最终门禁未通过**
-> 基线：`origin/main@893e930`
-> 记录日期：2026-08-10
+> 集成基线：`origin/main@c993d9f9bb115003e2ee69066c233ac47b7c52cc`
+> 记录日期：2026-08-11
 
 ## 1. provider-neutral host composition
 
@@ -36,10 +36,10 @@ LAN sessions ses_aad3bcfecbad149a,ses_0177cdb6084b62b9 stopped cleanly
 未绑定 provisional Session，没有成功 prompt/auth 证据；Codex 未参加该命令，因此不能称为三家
 真实会话同驻。
 
-宿主编排另有 7 条 deterministic test 覆盖多 worker、scoped route、interrupt、discovered
+宿主编排现有 9 条 deterministic test 覆盖多 worker、scoped route、interrupt、discovered
 Session resume alias、Idle/NewTurn structured receipt delivery、无 receipt/Steer 保持 Pending、
-drain/reconnect lifecycle report 与错误分类；`kaleido-hostd` focused clippy、7/7 R5 tests、3/3 既有 supervisor
-回归通过。切断 InterruptTurn route 的变异曾实际变红，恢复后通过。这些测试使用明确标注的
+drain/reconnect lifecycle report、provider-neutral R4 remote path 与启动失败回滚；`kaleido-hostd`
+focused clippy、9/9 R5 tests 通过。切断 InterruptTurn route 的变异曾实际变红，恢复后通过。这些测试使用明确标注的
 test double，只证明宿主逻辑，不冒充 provider fixture 或实体运行。
 
 ## 2. 共享合同与移动消费面
@@ -51,14 +51,15 @@ test double，只证明宿主逻辑，不冒充 provider fixture 或实体运行
 - Android main/androidTest source 编译与 unit tests 已通过；
 - 当前没有 R5 实体 Android 运行，所以以上编译结果不能冒充设备纵切。
 
-最新 focused 结果：state store 44/44、core 24/24、workspace check PASS。最终本地 Android
-no-build-cache 命令包含 `:app:compileDebugKotlin`、`:app:compileDebugAndroidTestKotlin` 与
-`:app:testDebugUnitTest`，结果 `BUILD SUCCESSFUL`，覆盖 `arm64-v8a` + `x86_64` Rust/UniFFI。
+最新 focused 结果：proto 44/44、core 42/42、hostd R5 9/9，四个受影响 Rust crate 的 all-target
+clippy `-D warnings` 通过。最新集成候选的 Android 增量命令包含 `:app:compileDebugKotlin`、
+`:app:compileDebugAndroidTestKotlin` 与 `:app:testDebugUnitTest`，结果 `BUILD SUCCESSFUL`，并实际构建
+`arm64-v8a` + `x86_64` Rust/UniFFI；冻结 SHA 的 clean AAR/APK/lint/instrumentation 尚待最终一次运行。
 `adb devices -l` 为空，因此没有实体设备运行证据，不能标实体门禁通过。
 
 ## 3. 本地总门禁
 
-第三次完整 `cargo xtask ci` exit 0，包含 fmt、check-deps、lint-forbidden、clippy、
+旧 R5 SHA 的第三次完整 `cargo xtask ci` exit 0，包含 fmt、check-deps、lint-forbidden、clippy、
 `claude-sidecar`、workspace test 与 fixtures verify。fixture summary：
 
 ```text
@@ -85,23 +86,23 @@ canonical pump 尚需最终真实 provider 重跑；Claude 本地 SDK input queu
 | 三家 streaming/history/waiting-human/reconnect | **未通过** | OpenCode 部分通过；Claude success 缺失 |
 | Resume / queue / steer / interrupt contract | **focused 实现/测试通过** | canonical Resume alias、NewTurn receipt delivery、Steer Pending；需真实 provider + Android 纵切 |
 | host/provider crash 与 mobile cursor resume | **未通过 R5 最终纵切** | R3 Codex LAN 历史证据不能自动覆盖新 provider |
-| `cargo xtask ci` | **本地通过** | 第三次完整运行 exit 0；不替代 exact-commit remote CI |
+| `cargo xtask ci` | **旧 R5 SHA 本地通过** | 最新 R4/R5 集成候选待冻结 SHA 总门禁；不替代 exact-commit remote CI |
 | `cargo xtask schema diff` | **本地通过** | 288 JSON files、in/out surface 0 drift；OpenCode live contract drift 仍另行阻塞 |
-| Android compile/unit | **本地通过** | no-build-cache BUILD SUCCESSFUL；双 ABI/UniFFI |
+| Android compile/unit | **集成候选增量通过** | BUILD SUCCESSFUL；双 ABI/UniFFI；clean/lint/instrumentation 待冻结 SHA |
 | Windows/macOS/Linux CI + Android CI | **workflow 已接 Node 22/Claude sidecar gate；无 exact commit run** | 仍不能标绿 |
 | 实体 arm64 Android + 真实 Wi-Fi 三家纵切 | **未执行** | 禁止用 emulator/mock/`adb reverse` 替代 |
-| R4 合并后蜂窝/relay 重跑 | **被前置阻塞** | R4 未完成、未进 `main` |
+| R4 合并后蜂窝/relay 重跑 | **外部验收 pending** | R4 实现已进 `main`；T-115 的实体蜂窝/relay 门禁仍独立 pending |
 
 ## 5. 已知本地实现阻塞
 
 - `CapabilityProbe` 目前只能表达 `Supported` / `NotVerified`，尚未把断线、OAuth auth failure 与
   明确 upstream block 映射为 `UnavailableOnThisConnection` / `AuthenticationRequired` /
   `UpstreamBlocked`；
-- Claude typed history read 仍有 T-112 所列缺口；discovered Session 已改用 `ProviderManaged`，
-  不再冒充原生 CLI/GUI ownership；
+- Claude typed history read 已接入 exact-dir、discovered-session、有界分页守卫；无凭据探测没有非空
+  Session/message，故仍缺真实 `HistoryRead` 验收。discovered Session 使用 `ProviderManaged`，不冒充原生 CLI/GUI ownership；
 - OpenCode SSE 已按 event session 精确路由并按 event id 去重，但 provider reconnect 仍明确
-  `lossless_replay = false`；真实 gap/forced-disconnect 证据缺失；当前 blocking SSE drain 与 command
-  dispatch 共用 worker，空闲流量时仍可能把命令延迟到 request timeout，需在最终实时控制门禁前拆分。
+  `lossless_replay = false`；真实 gap/forced-disconnect 证据缺失。SSE reader 已与 command dispatch
+  解耦，Attention 只有精确 typed SSE 回执才完成；真实 OpenCode `/doc`/`/event` 漂移仍 fail-closed。
 
 ## 6. 完成条件
 

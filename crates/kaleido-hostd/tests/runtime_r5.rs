@@ -5,6 +5,7 @@
 //! ordering and routing only; it is not provider wire evidence and must never
 //! be copied into `tests/fixtures` or cited as real-provider acceptance.
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,8 +16,9 @@ use kaleido_adapter::{
 };
 use kaleido_hostd::slice::REPLAY_BASE_AT_MS;
 use kaleido_hostd::{
-    Broker, RuntimeFailureClass, RuntimeLifecycleReport, RuntimeLifecycleStage, RuntimeSupervisor,
-    RuntimeSupervisorError,
+    Broker, CodexLanError, RuntimeBootstrap, RuntimeBootstrapFactory, RuntimeFailureClass,
+    RuntimeLifecycleReport, RuntimeLifecycleStage, RuntimeSupervisor, RuntimeSupervisorError,
+    StructuredLanConfig, StructuredLanHost,
 };
 use kaleido_proto::attention::AttentionResponse;
 use kaleido_proto::capability::{Capability, EvidenceSource};
@@ -430,6 +432,97 @@ impl ProviderRuntimeSession for HostTestRuntime {
         probe.prove(Capability::HistoryResume);
         probe
     }
+}
+
+fn structured_factory(
+    label: &'static str,
+    calls: Arc<Mutex<Vec<RuntimeCall>>>,
+) -> RuntimeBootstrapFactory {
+    Box::new(move |context| {
+        let mint = IdentityMint::new(&context.identity_salt);
+        let mut runtime = HostTestRuntime::new(&mint, label, calls, DrainMode::Empty, false);
+        runtime.host_id = mint.host_id("kaleido-host");
+        Ok(RuntimeBootstrap {
+            project_id: runtime.project_id.clone(),
+            project_binding_id: runtime.project_binding_id.clone(),
+            runtime_id: runtime.runtime_id.clone(),
+            runtime: Box::new(runtime),
+        })
+    })
+}
+
+#[test]
+fn structured_product_host_runs_two_provider_neutral_runtimes_and_closes_both() {
+    let directory = tempfile::tempdir().expect("temporary host root");
+    let project_root = directory.path().join("project");
+    std::fs::create_dir(&project_root).expect("project root");
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let host = StructuredLanHost::start(StructuredLanConfig {
+        project_root,
+        data_directory: directory.path().join("host"),
+        bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        runtimes: vec![
+            structured_factory("alpha", Arc::clone(&calls)),
+            structured_factory("beta", Arc::clone(&calls)),
+        ],
+    })
+    .expect("start two structured runtimes");
+
+    assert_eq!(host.session_ids().len(), 2);
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.operation == "start")
+            .count(),
+        2
+    );
+    host.run_for(Duration::from_millis(10));
+    host.shutdown().expect("shutdown structured host");
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.operation == "close")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn structured_host_rolls_back_a_started_runtime_when_a_later_factory_fails() {
+    let directory = tempfile::tempdir().expect("temporary host root");
+    let project_root = directory.path().join("project");
+    std::fs::create_dir(&project_root).expect("project root");
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let result = StructuredLanHost::start(StructuredLanConfig {
+        project_root,
+        data_directory: directory.path().join("host"),
+        bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        runtimes: vec![
+            structured_factory("alpha", Arc::clone(&calls)),
+            Box::new(|_| Err(CodexLanError::Runtime)),
+        ],
+    });
+
+    assert!(matches!(result, Err(CodexLanError::Runtime)));
+    let calls = calls.lock().unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.operation == "start")
+            .count(),
+        1
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.operation == "close")
+            .count(),
+        1
+    );
 }
 
 #[test]

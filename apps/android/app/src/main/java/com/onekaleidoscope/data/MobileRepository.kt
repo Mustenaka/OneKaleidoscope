@@ -4,6 +4,7 @@ import android.content.Context
 import com.onekaleidoscope.platform.AndroidCoreStorage
 import com.onekaleidoscope.platform.AndroidDeviceSigner
 import com.onekaleidoscope.platform.AndroidSecureCredentialVault
+import com.onekaleidoscope.push.PushAddressState
 import com.onekaleidoscope.ui.ActionAvailability
 import com.onekaleidoscope.ui.AppUiState
 import com.onekaleidoscope.ui.ConnectionUiState
@@ -20,6 +21,7 @@ import java.io.Closeable
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -28,15 +30,19 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import uniffi.kaleido_core.ConnectionStatusCallback
 import uniffi.kaleido_core.MobileClient
 import uniffi.kaleido_core.MobileClientException
+import uniffi.kaleido_core.MobileConnectionStatus
 import uniffi.kaleido_core.MobileQuestionAnswer
+import uniffi.kaleido_core.MobileResumeContext
 import uniffi.kaleido_core.MobileSessionAction
 import uniffi.kaleido_core.ProjectionCallback
 import uniffi.kaleido_core.ProjectionSubscription
 import uniffi.kaleido_core.mobileAttentionActionAvailability
 import uniffi.kaleido_core.mobileSessionActionAvailability
 import uniffi.kaleido_proto.AttentionItem
+import uniffi.kaleido_proto.AttentionSubject
 import uniffi.kaleido_proto.CanonicalError
 import uniffi.kaleido_proto.CommandAck
 import uniffi.kaleido_proto.CommandOutcome
@@ -65,7 +71,10 @@ import uniffi.kaleido_proto.TurnId
  * Kotlin never validates cursors or reconstructs canonical state; the extra cursor comparison only
  * prevents a stale UI callback from replacing a newer, already core-validated full projection.
  */
-internal class MobileRepository(context: Context) : Closeable {
+internal class MobileRepository(
+    context: Context,
+    private val onRemoteConfigured: () -> Unit = {},
+) : Closeable {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
     private val closing = AtomicBoolean(false)
     private val messageIds = AtomicLong(1)
@@ -73,6 +82,7 @@ internal class MobileRepository(context: Context) : Closeable {
     private var client: MobileClient? = null
     private var connected = false
     private var workerStarted = false
+    private var statusCallbackInstalled = false
     private var nextSubscriptionGeneration = 1L
 
     private val subscriptions = mutableMapOf<ProjectionKey, ActiveSubscription>()
@@ -90,6 +100,8 @@ internal class MobileRepository(context: Context) : Closeable {
     private val sessionFreshness = mutableMapOf<String, DataFreshness>()
     private val sessionsByProject = mutableMapOf<String, Map<String, SessionSummary>>()
     private val sessionsById = mutableMapOf<String, SessionSummary>()
+    private val historySessionIdsByProject = mutableMapOf<String, Set<String>>()
+    private val historySessionIds = mutableSetOf<String>()
 
     private val transcriptViews = mutableMapOf<String, TranscriptView>()
     private val transcriptFreshness = mutableMapOf<String, DataFreshness>()
@@ -102,6 +114,7 @@ internal class MobileRepository(context: Context) : Closeable {
     private val capabilities = mutableMapOf<String, RuntimeCapabilityView>()
     private val capabilityFreshness = mutableMapOf<String, DataFreshness>()
     private var attentionItems: List<AttentionItem> = emptyList()
+    private val questionRequestIdentities = mutableMapOf<String, String>()
     private var attentionFreshness = DataFreshness.CachedOffline
     private val ephemeralText = mutableMapOf<String, TextResult>()
 
@@ -118,6 +131,90 @@ internal class MobileRepository(context: Context) : Closeable {
     fun dispatch(action: UiAction) {
         if (closing.get()) return
         scope.launch { handleAction(action) }
+    }
+
+    /**
+     * Narrow Android lifecycle signal. Rust still selects, authenticates and validates the route;
+     * Kotlin only restarts the existing core-owned connection after the OS changes reachability.
+     */
+    internal fun requestRemoteRecovery(trigger: RemoteRecoveryTrigger) {
+        if (closing.get()) return
+        scope.launch { recoverRemoteConnection(trigger) }
+    }
+
+    internal suspend fun synchronizePushAddress(state: PushAddressState): PushSyncOutcome {
+        if (closing.get()) return PushSyncOutcome.Pending
+        val completion = CompletableDeferred<PushSyncOutcome>()
+        scope.launch { completion.complete(synchronizePushAddressNow(state)) }
+        return completion.await()
+    }
+
+    private fun synchronizePushAddressNow(state: PushAddressState): PushSyncOutcome {
+        val active = client ?: return PushSyncOutcome.Pending
+        val remoteConfigured = try {
+            active.remoteIsConfigured()
+        } catch (_: RuntimeException) {
+            false
+        }
+        if (!remoteConfigured) return PushSyncOutcome.Deferred
+        return PushAddressSynchronizer.synchronize(state, object : PushAddressCorePort {
+            override fun deleteAddress(): Boolean =
+                remotePushCall { active.deletePushAddress() }
+
+            override fun replaceAddress(
+                fid: String,
+                observedAtMs: Long,
+                expiresAtMs: Long,
+            ): Boolean = remotePushCall {
+                active.replacePushAddress(fid, observedAtMs, expiresAtMs)
+            }
+
+            override fun flushOutbox(): Boolean =
+                remotePushCall { active.flushRemotePushOutbox() }
+        })
+    }
+
+    private fun remotePushCall(call: () -> Unit): Boolean = try {
+        call()
+        true
+    } catch (_: MobileClientException) {
+        false
+    } catch (_: RuntimeException) {
+        false
+    }
+
+    private fun recoverRemoteConnection(trigger: RemoteRecoveryTrigger) {
+        val active = client ?: return
+        val hostId = try {
+            active.pairedHostInfo()?.hostId?.value
+        } catch (_: MobileClientException) {
+            null
+        } catch (_: RuntimeException) {
+            null
+        } ?: return
+        if (workerStarted && trigger is RemoteRecoveryTrigger.NetworkChanged) {
+            try {
+                active.networkEpochChanged(trigger.epoch.toULong())
+                connected = false
+                markOffline("网络已切换，正在安全恢复")
+                mutableState.update {
+                    it.copy(connection = ConnectionUiState.Connecting(hostLabel(hostId)))
+                }
+            } catch (_: MobileClientException) {
+                connected = false
+                closeSubscriptions(sendUnsubscribe = false)
+                markOffline("网络切换恢复失败")
+            } catch (_: RuntimeException) {
+                connected = false
+                closeSubscriptions(sendUnsubscribe = false)
+                markOffline("网络切换恢复失败")
+            }
+            return
+        } else if (workerStarted) {
+            reconcileSubscriptions()
+            return
+        }
+        connectNow(active, hostId)
     }
 
     private fun initialize(context: Context) {
@@ -153,6 +250,7 @@ internal class MobileRepository(context: Context) : Closeable {
             mutableState.value = AppUiState(connection = ConnectionUiState.Unpaired)
             return
         }
+        installConnectionStatusCallback(opened)
         val hostId = paired.hostId.value
         mutableState.update {
             it.copy(
@@ -191,6 +289,15 @@ internal class MobileRepository(context: Context) : Closeable {
             is UiAction.UpdateAttentionDraft -> mutableState.update {
                 it.copy(attentionDrafts = it.attentionDrafts + (action.attentionId to action.value))
             }
+            is UiAction.UpdateQuestionDraft -> mutableState.update { state ->
+                val current = state.questionDrafts[action.attentionId].orEmpty()
+                val next = current.filterNot {
+                    it.questionKey == action.answer.questionKey
+                } + action.answer.copy(optionIds = action.answer.optionIds.toList())
+                state.copy(
+                    questionDrafts = state.questionDrafts + (action.attentionId to next),
+                )
+            }
             is UiAction.RespondAttention -> respondAttention(action)
             is UiAction.RespondQuestion -> respondQuestion(action)
             is UiAction.ForgetHost -> showMessage("请先在 hostd 撤销此设备；本版本不在本地静默遗忘凭据")
@@ -205,10 +312,15 @@ internal class MobileRepository(context: Context) : Closeable {
             showMessage("配对内容不能为空")
             return
         }
+        if (payload.startsWith(REMOTE_PAIR_URI_PREFIX)) {
+            configureRemote(active, payload)
+            return
+        }
         mutableState.update { it.copy(connection = ConnectionUiState.Pairing("验证 PC 身份")) }
         try {
             active.pair(payload, "OneKaleidoscope Android")
             val paired = active.pairedHostInfo() ?: throw IllegalStateException("missing paired host")
+            installConnectionStatusCallback(active)
             mutableState.update { it.copy(selectedHostId = paired.hostId.value) }
             workerStarted = false
             connectNow(active, paired.hostId.value)
@@ -218,6 +330,28 @@ internal class MobileRepository(context: Context) : Closeable {
             }
         } catch (_: RuntimeException) {
             mutableState.update { it.copy(connection = ConnectionUiState.Error("配对失败", true)) }
+        }
+    }
+
+    private fun configureRemote(active: MobileClient, payload: String) {
+        val hostId = runCatching { active.pairedHostInfo()?.hostId?.value }.getOrNull()
+        if (hostId == null) {
+            showMessage("请先完成 PC 身份配对，再启用公网路径")
+            return
+        }
+        if (workerStarted) disconnect()
+        mutableState.update { it.copy(connection = ConnectionUiState.Pairing("验证自有远程服务配置")) }
+        try {
+            active.configureRemote(payload)
+            onRemoteConfigured()
+            showMessage("公网路径配置已安全保存；连接后才会显示真实路径")
+            connectNow(active, hostId)
+        } catch (_: MobileClientException) {
+            mutableState.update {
+                it.copy(connection = ConnectionUiState.Error("公网配置无效、已过期或身份不匹配", true))
+            }
+        } catch (_: RuntimeException) {
+            mutableState.update { it.copy(connection = ConnectionUiState.Error("无法保存公网配置", true)) }
         }
     }
 
@@ -244,17 +378,12 @@ internal class MobileRepository(context: Context) : Closeable {
         try {
             if (workerStarted) active.reconnect() else active.connect()
             workerStarted = true
-            connected = true
-            mutableState.update {
-                it.copy(
-                    connection = ConnectionUiState.Live(hostLabel(hostId), "TLS 1.3 · LAN"),
-                    selectedHostId = hostId,
-                )
-            }
-            reconcileSubscriptions()
+            connected = false
+            mutableState.update { it.copy(selectedHostId = hostId) }
             // A successful transport connection is not projection freshness evidence. Each panel
             // remains cached until its own CurrentFollows/Resumed callback is reduced below.
             renderAllSelected()
+            disableAllActions("正在等待端到端认证路径")
         } catch (_: MobileClientException.Authentication) {
             connected = false
             workerStarted = false
@@ -266,6 +395,47 @@ internal class MobileRepository(context: Context) : Closeable {
             markOffline("无法连接 PC")
         } catch (_: RuntimeException) {
             markOffline("无法连接 PC")
+        }
+    }
+
+    private fun installConnectionStatusCallback(active: MobileClient) {
+        if (statusCallbackInstalled) return
+        active.setConnectionStatusCallback(object : ConnectionStatusCallback {
+            override fun onStatus(status: MobileConnectionStatus) {
+                enqueueCallback { applyConnectionStatus(status) }
+            }
+        })
+        statusCallbackInstalled = true
+    }
+
+    private fun applyConnectionStatus(status: MobileConnectionStatus) {
+        val hostId = mutableState.value.selectedHostId ?: return
+        when (val presentation = ConnectionStatusPresenter.present(status)) {
+            is ConnectionStatusPresentation.Offline -> {
+                connected = false
+                markOffline(presentation.reason)
+            }
+            ConnectionStatusPresentation.Connecting -> {
+                connected = false
+                markOffline("正在恢复安全连接")
+                mutableState.update {
+                    it.copy(connection = ConnectionUiState.Connecting(hostLabel(hostId)))
+                }
+            }
+            is ConnectionStatusPresentation.Online -> {
+                // A callback already queued when the user disconnects must not resurrect the UI.
+                if (!workerStarted) return
+                connected = true
+                mutableState.update {
+                    it.copy(
+                        connection = ConnectionUiState.Live(
+                            hostName = hostLabel(hostId),
+                            endpointLabel = presentation.endpointLabel,
+                        ),
+                    )
+                }
+                reconcileSubscriptions()
+            }
         }
     }
 
@@ -513,6 +683,8 @@ internal class MobileRepository(context: Context) : Closeable {
                 sessionFreshness[projectId] = freshness
                 val (_, raw) = ProjectionMapper.sessions(payload.view)
                 sessionsByProject[projectId] = raw
+                historySessionIdsByProject[projectId] =
+                    payload.view.history.mapTo(mutableSetOf()) { it.sessionId.value }
                 rebuildSessionIndex()
                 if (mutableState.value.selectedProjectId == projectId) renderSelectedSessions()
                 renderAttention()
@@ -533,6 +705,7 @@ internal class MobileRepository(context: Context) : Closeable {
                 liveViews[sessionId] = payload.view
                 liveFreshness[sessionId] = freshness
                 if (mutableState.value.selectedSessionId == sessionId) renderLive(sessionId)
+                refreshActionAvailability()
             }
             is ProjectionPayload.InputQueue -> {
                 val sessionId = payload.view.sessionId.value
@@ -543,6 +716,28 @@ internal class MobileRepository(context: Context) : Closeable {
             }
             is ProjectionPayload.AttentionInbox -> {
                 attentionItems = payload.view.entries
+                val nextRequestIdentities = attentionItems.mapNotNull { item ->
+                    val requestKey = when (val subject = item.subject) {
+                        is AttentionSubject.Question -> subject.request.requestKey
+                        else -> null
+                    }
+                    requestKey?.let { item.id.value to it }
+                }.toMap()
+                val unchangedRequestIds = nextRequestIdentities
+                    .filter { (attentionId, requestKey) ->
+                        questionRequestIdentities[attentionId] == requestKey
+                    }
+                    .keys
+                questionRequestIdentities.clear()
+                questionRequestIdentities.putAll(nextRequestIdentities)
+                mutableState.update { state ->
+                    state.copy(
+                        attentionDrafts = state.attentionDrafts.filterKeys { attentionId ->
+                            attentionItems.any { it.id.value == attentionId }
+                        },
+                        questionDrafts = state.questionDrafts.filterKeys(unchangedRequestIds::contains),
+                    )
+                }
                 pendingActions.retainResolvedAttention(
                     payload.view.entries.mapTo(mutableSetOf()) { it.id.value },
                 )
@@ -671,6 +866,8 @@ internal class MobileRepository(context: Context) : Closeable {
     private fun rebuildSessionIndex() {
         sessionsById.clear()
         sessionsByProject.values.forEach { sessionsById.putAll(it) }
+        historySessionIds.clear()
+        historySessionIdsByProject.values.forEach(historySessionIds::addAll)
     }
 
     private fun renderAllSelected() {
@@ -703,12 +900,25 @@ internal class MobileRepository(context: Context) : Closeable {
         val capability = runtimeId?.let(capabilities::get)
         val queue = queueViews[sessionId]
         val live = liveViews[sessionId]
+        val resumeContext = runtimeId?.let {
+            MobileResumeContext(
+                projectBindingId = session.projectBindingId,
+                runtimeId = ProviderRuntimeId(it),
+                historyEligible = sessionId in historySessionIds,
+            )
+        }
         mutableState.update {
             it.copy(
                 promptAction = if (runtimeId != null && capabilityFreshness[runtimeId] == DataFreshness.Live) {
                     availabilityUnlessInFlight(
                         PendingActionSlot.Prompt,
-                        mobileSessionActionAvailability(session, queue, capability, MobileSessionAction.SUBMIT_PROMPT),
+                        mobileSessionActionAvailability(
+                            session,
+                            queue,
+                            capability,
+                            MobileSessionAction.SUBMIT_PROMPT,
+                            null,
+                        ),
                     )
                 } else {
                     ActionAvailability.disabled("等待实时能力投影确认")
@@ -716,7 +926,13 @@ internal class MobileRepository(context: Context) : Closeable {
                 enqueueNewTurnAction = if (queueFreshness[sessionId] == DataFreshness.Live) {
                     availabilityUnlessInFlight(
                         PendingActionSlot.EnqueueNewTurn,
-                        mobileSessionActionAvailability(session, queue, capability, MobileSessionAction.ENQUEUE_NEW_TURN),
+                        mobileSessionActionAvailability(
+                            session,
+                            queue,
+                            capability,
+                            MobileSessionAction.ENQUEUE_NEW_TURN,
+                            null,
+                        ),
                     )
                 } else {
                     ActionAvailability.disabled("等待实时队列投影确认")
@@ -724,7 +940,13 @@ internal class MobileRepository(context: Context) : Closeable {
                 enqueueSteerAction = if (queueFreshness[sessionId] == DataFreshness.Live) {
                     availabilityUnlessInFlight(
                         PendingActionSlot.EnqueueSteer,
-                        mobileSessionActionAvailability(session, queue, capability, MobileSessionAction.ENQUEUE_STEER),
+                        mobileSessionActionAvailability(
+                            session,
+                            queue,
+                            capability,
+                            MobileSessionAction.ENQUEUE_STEER,
+                            null,
+                        ),
                     )
                 } else {
                     ActionAvailability.disabled("等待实时队列投影确认")
@@ -732,19 +954,31 @@ internal class MobileRepository(context: Context) : Closeable {
                 resumeAction = if (runtimeId != null && capabilityFreshness[runtimeId] == DataFreshness.Live) {
                     availabilityUnlessInFlight(
                         PendingActionSlot.Resume,
-                        mobileSessionActionAvailability(session, queue, capability, MobileSessionAction.RESUME_SESSION),
+                        mobileSessionActionAvailability(
+                            session,
+                            queue,
+                            capability,
+                            MobileSessionAction.RESUME_SESSION,
+                            resumeContext,
+                        ),
                     )
                 } else {
                     ActionAvailability.disabled("等待运行时恢复能力投影确认")
                 },
                 interruptAction = if (
-                    live?.activeTurnId != null &&
+                    hasFreshActiveTurn(live?.activeTurnId != null, liveFreshness[sessionId]) &&
                     runtimeId != null &&
                     capabilityFreshness[runtimeId] == DataFreshness.Live
                 ) {
                     availabilityUnlessInFlight(
                         PendingActionSlot.Interrupt,
-                        mobileSessionActionAvailability(session, queue, capability, MobileSessionAction.INTERRUPT_TURN),
+                        mobileSessionActionAvailability(
+                            session,
+                            queue,
+                            capability,
+                            MobileSessionAction.INTERRUPT_TURN,
+                            null,
+                        ),
                     )
                 } else {
                     ActionAvailability.disabled("当前没有可中断的活动回合")
@@ -872,12 +1106,17 @@ internal class MobileRepository(context: Context) : Closeable {
             ?: return showMessage("提醒已变化，请刷新")
         val slot = PendingActionSlot.Attention(action.attentionId)
         val signature = PendingActionSignature(
-            PendingActionKind.Attention,
-            action.attentionId,
-            action.answers.joinToString("|") { answer ->
-                "${answer.questionKey}:${answer.optionIds.joinToString(",")}:${answer.freeForm.orEmpty()}"
+            kind = PendingActionKind.Attention,
+            targetId = action.attentionId,
+            text = "",
+            optionId = null,
+            questionAnswers = action.answers.map { answer ->
+                PendingQuestionAnswerSignature(
+                    questionKey = answer.questionKey,
+                    optionIds = answer.optionIds.toList(),
+                    freeForm = answer.freeForm,
+                )
             },
-            null,
         )
         performCommand(active, slot, signature, retainDefiniteSuccess = true) { key ->
             active.respondQuestionText(
@@ -891,6 +1130,10 @@ internal class MobileRepository(context: Context) : Closeable {
                 },
                 key,
             )
+        }.onDefiniteSuccess {
+            mutableState.update { state ->
+                state.copy(questionDrafts = state.questionDrafts - action.attentionId)
+            }
         }
     }
 
@@ -995,6 +1238,8 @@ internal class MobileRepository(context: Context) : Closeable {
             val active = client
             runCatching { active?.disconnect() }
             workerStarted = false
+            runCatching { active?.clearConnectionStatusCallback() }
+            statusCallbackInstalled = false
             runCatching { active?.destroy() }
             client = null
             ephemeralText.clear()
@@ -1010,6 +1255,13 @@ internal class MobileRepository(context: Context) : Closeable {
         is LiveBinding.Blocked, is LiveBinding.NotBound, null -> null
     }
 }
+
+internal sealed interface RemoteRecoveryTrigger {
+    data class NetworkChanged(val epoch: Long) : RemoteRecoveryTrigger
+    data object PushWake : RemoteRecoveryTrigger
+}
+
+private const val REMOTE_PAIR_URI_PREFIX = "onekaleidoscope://remote/v1?data="
 
 private data class ActiveSubscription(
     val generation: Long,
@@ -1067,7 +1319,19 @@ internal data class PendingActionSignature(
     val targetId: String,
     val text: String,
     val optionId: String?,
+    val questionAnswers: List<PendingQuestionAnswerSignature> = emptyList(),
 )
+
+internal data class PendingQuestionAnswerSignature(
+    val questionKey: String,
+    val optionIds: List<String>,
+    val freeForm: String?,
+)
+
+internal fun hasFreshActiveTurn(
+    activeTurnPresent: Boolean,
+    freshness: DataFreshness?,
+): Boolean = activeTurnPresent && freshness == DataFreshness.Live
 
 internal data class PendingMobileAction(
     val signature: PendingActionSignature,

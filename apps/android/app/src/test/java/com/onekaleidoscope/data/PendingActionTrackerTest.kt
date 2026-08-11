@@ -1,5 +1,6 @@
 package com.onekaleidoscope.data
 
+import com.onekaleidoscope.ui.DataFreshness
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -122,6 +123,53 @@ class PendingActionTrackerTest {
         )
     }
 
+    @Test
+    fun questionSetRetryUsesStructuredAnswersWithoutDelimiterCollisions() {
+        val tracker = PendingActionTracker()
+        val slot = PendingActionSlot.Attention("attention-1")
+        val first = questionSignature(
+            PendingQuestionAnswerSignature("a:b", listOf("c"), null),
+        )
+        val delimiterCollision = questionSignature(
+            PendingQuestionAnswerSignature("a", listOf("b:c"), null),
+        )
+        var createdKeys = 0
+
+        val initial = requireNotNull(tracker.begin(slot, first) { "key-${++createdKeys}" })
+        tracker.complete(slot, CommandCompletion.Uncertain)
+        val retry = requireNotNull(tracker.begin(slot, first) { "key-${++createdKeys}" })
+        assertEquals(initial.idempotencyKey, retry.idempotencyKey)
+
+        tracker.complete(slot, CommandCompletion.Uncertain)
+        val changed = requireNotNull(
+            tracker.begin(slot, delimiterCollision) { "key-${++createdKeys}" },
+        )
+        assertEquals("key-2", changed.idempotencyKey)
+        assertEquals(2, createdKeys)
+    }
+
+    @Test
+    fun interruptRequiresAFreshLiveActivityProjection() {
+        assertFalse(
+            hasFreshActiveTurn(
+                activeTurnPresent = true,
+                freshness = DataFreshness.CachedOffline,
+            ),
+        )
+        assertFalse(
+            hasFreshActiveTurn(
+                activeTurnPresent = false,
+                freshness = DataFreshness.Live,
+            ),
+        )
+        assertTrue(
+            hasFreshActiveTurn(
+                activeTurnPresent = true,
+                freshness = DataFreshness.Live,
+            ),
+        )
+    }
+
     private fun promptSignature(text: String) = PendingActionSignature(
         kind = PendingActionKind.Prompt,
         targetId = "session-1",
@@ -141,5 +189,15 @@ class PendingActionTrackerTest {
         targetId = attentionId,
         text = "",
         optionId = "approve",
+    )
+
+    private fun questionSignature(
+        vararg answers: PendingQuestionAnswerSignature,
+    ) = PendingActionSignature(
+        kind = PendingActionKind.Attention,
+        targetId = "attention-1",
+        text = "",
+        optionId = null,
+        questionAnswers = answers.toList(),
     )
 }

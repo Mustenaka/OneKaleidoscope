@@ -81,6 +81,39 @@ struct RecordingProjection {
     errors: Arc<AtomicUsize>,
 }
 
+#[test]
+fn a_bound_or_connecting_listener_is_not_published_as_online() {
+    let (directory, broker, _session_id) = replayed_broker();
+    let server = LanServer::bind(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        &directory.path().join("security"),
+        broker.clone(),
+        None,
+    )
+    .expect("bind product LAN server");
+    let subscription = broker
+        .subscribe(
+            &ProjectionSubscribe {
+                key: ProjectionKey::ProjectIndex {
+                    host_id: broker.host_id(),
+                },
+                since: None,
+            },
+            REPLAY_BASE_AT_MS + 20_000,
+        )
+        .expect("read project index while no device is authenticated");
+    assert!(matches!(
+        subscription.replay().envelopes.as_slice(),
+        [envelope]
+            if matches!(
+                &envelope.payload,
+                ProjectionPayload::ProjectIndex { view }
+                    if view.reachability == HostReachability::Offline
+            )
+    ));
+    server.shutdown().expect("shutdown listener");
+}
+
 impl ProjectionCallback for RecordingProjection {
     fn on_projection(&self, projection: kaleido_proto::projection::ProjectionEnvelope) {
         let _ = self.projections.send(projection);
@@ -282,6 +315,12 @@ fn mobile_client_cold_reconnect_uses_the_exact_cached_projection_cursor() {
     drop(client);
 
     let cold = MobileClient::new(mobile_root_text, Box::new(signer)).expect("cold mobile client");
+    assert_eq!(
+        cold.cached_projection(project_key.clone())
+            .expect("cold cache before network recovery")
+            .cursor,
+        exact_cursor
+    );
     cold.connect().expect("cold challenge reconnect");
     let (cold_tx, cold_rx) = mpsc::channel();
     let cold_subscription = cold
@@ -293,12 +332,30 @@ fn mobile_client_cold_reconnect_uses_the_exact_cached_projection_cursor() {
             }),
         )
         .expect("resume cached subscription");
+    let offline = cold_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("disconnect delta resumed from the exact cached cursor");
+    assert!(matches!(
+        offline.payload,
+        ProjectionPayload::ProjectIndex { view }
+            if view.reachability == HostReachability::Offline
+    ));
+    let recovered = cold_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("authenticated reconnect delta follows the offline delta");
+    assert!(matches!(
+        recovered.payload,
+        ProjectionPayload::ProjectIndex { view }
+            if view.reachability == HostReachability::LanDirect
+    ));
+    assert!(offline.cursor > exact_cursor);
+    assert!(recovered.cursor > offline.cursor);
     assert!(cold_rx.recv_timeout(Duration::from_millis(250)).is_err());
     assert_eq!(
         cold.cached_projection(project_key)
             .expect("cold cache")
             .cursor,
-        exact_cursor
+        recovered.cursor
     );
     assert!(matches!(
         cold.read_content(ContentReadRequest {

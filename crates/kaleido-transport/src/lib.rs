@@ -11,7 +11,10 @@ pub mod control;
 pub mod error;
 pub mod frame;
 pub mod limits;
+pub mod private_file;
 pub mod registry;
+pub mod remote;
+pub mod remote_client;
 pub mod tls;
 
 mod platform;

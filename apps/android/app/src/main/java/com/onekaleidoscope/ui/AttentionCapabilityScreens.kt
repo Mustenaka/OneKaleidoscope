@@ -20,17 +20,33 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+
+internal fun questionPromptTestTag(attentionId: String, questionKey: String): String =
+    "attention-question-prompt:$attentionId:$questionKey"
+
+internal fun questionOptionTestTag(attentionId: String, questionKey: String, optionId: String): String =
+    "attention-question-option:$attentionId:$questionKey:$optionId"
+
+internal fun questionFreeFormTestTag(attentionId: String, questionKey: String): String =
+    "attention-question-free-form:$attentionId:$questionKey"
+
+internal fun questionSubmitTestTag(attentionId: String): String =
+    "attention-question-submit:$attentionId"
 
 @Composable
 internal fun AttentionScreen(
     panel: PanelState<List<AttentionUi>>,
     drafts: Map<String, String>,
+    questionDrafts: Map<String, List<QuestionAnswerDraftUi>>,
     onAction: (UiAction) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -56,6 +72,7 @@ internal fun AttentionScreen(
         ResponseDialog(
             attention = selected,
             draft = drafts[selected.id].orEmpty(),
+            questionDrafts = questionDrafts[selected.id].orEmpty(),
             onDraftChange = { onAction(UiAction.UpdateAttentionDraft(selected.id, it)) },
             onDismiss = { respondingTo = null },
             onRespond = { optionId, freeForm ->
@@ -63,6 +80,9 @@ internal fun AttentionScreen(
             },
             onRespondQuestion = { answers ->
                 onAction(UiAction.RespondQuestion(selected.id, answers))
+            },
+            onQuestionDraftChange = { answer ->
+                onAction(UiAction.UpdateQuestionDraft(selected.id, answer))
             },
         )
     }
@@ -112,10 +132,12 @@ private fun AttentionCard(attention: AttentionUi, onRespond: () -> Unit) {
 private fun ResponseDialog(
     attention: AttentionUi,
     draft: String,
+    questionDrafts: List<QuestionAnswerDraftUi>,
     onDraftChange: (String) -> Unit,
     onDismiss: () -> Unit,
     onRespond: (String?, String?) -> Unit,
     onRespondQuestion: (List<QuestionAnswerDraftUi>) -> Unit,
+    onQuestionDraftChange: (QuestionAnswerDraftUi) -> Unit,
 ) {
     val subject = attention.subject
     val options = when (subject) {
@@ -125,15 +147,10 @@ private fun ResponseDialog(
     }
     val freeFormAllowed = subject is AttentionSubjectUi.Question && subject.freeFormAllowed
     val questionPrompts = (subject as? AttentionSubjectUi.Question)?.questions.orEmpty()
-    var selectedQuestionOptions by remember(attention.id) {
-        mutableStateOf<Map<String, List<String>>>(emptyMap())
-    }
-    var questionFreeForms by remember(attention.id) {
-        mutableStateOf<Map<String, String>>(emptyMap())
-    }
+    val draftsByQuestion = questionDrafts.associateBy(QuestionAnswerDraftUi::questionKey)
     val allQuestionsReady = questionPrompts.isNotEmpty() && questionPrompts.all { question ->
-        val selected = selectedQuestionOptions[question.key].orEmpty()
-        val freeForm = questionFreeForms[question.key].orEmpty().trim()
+        val selected = draftsByQuestion[question.key]?.optionIds.orEmpty()
+        val freeForm = draftsByQuestion[question.key]?.freeForm.orEmpty().trim()
         selected.isNotEmpty() || (question.freeFormAllowed && freeForm.isNotEmpty())
     }
     AlertDialog(
@@ -156,12 +173,13 @@ private fun ResponseDialog(
                         } else {
                             questionPrompts.forEach { question ->
                                 QuestionPromptForm(
+                                    attentionId = attention.id,
                                     question = question,
-                                    selectedOptionIds = selectedQuestionOptions[question.key].orEmpty(),
-                                    freeForm = questionFreeForms[question.key].orEmpty(),
+                                    selectedOptionIds = draftsByQuestion[question.key]?.optionIds.orEmpty(),
+                                    freeForm = draftsByQuestion[question.key]?.freeForm.orEmpty(),
                                     enabled = attention.responseAvailability.enabled,
                                     onOptionToggle = { optionId ->
-                                        val current = selectedQuestionOptions[question.key].orEmpty()
+                                        val current = draftsByQuestion[question.key]?.optionIds.orEmpty()
                                         val next = if (optionId in current) {
                                             current - optionId
                                         } else if (question.multiSelect) {
@@ -169,10 +187,22 @@ private fun ResponseDialog(
                                         } else {
                                             listOf(optionId)
                                         }
-                                        selectedQuestionOptions = selectedQuestionOptions + (question.key to next)
+                                        onQuestionDraftChange(
+                                            QuestionAnswerDraftUi(
+                                                questionKey = question.key,
+                                                optionIds = next,
+                                                freeForm = draftsByQuestion[question.key]?.freeForm,
+                                            ),
+                                        )
                                     },
                                     onFreeFormChange = { value ->
-                                        questionFreeForms = questionFreeForms + (question.key to value)
+                                        onQuestionDraftChange(
+                                            QuestionAnswerDraftUi(
+                                                questionKey = question.key,
+                                                optionIds = draftsByQuestion[question.key]?.optionIds.orEmpty(),
+                                                freeForm = value,
+                                            ),
+                                        )
                                     },
                                 )
                             }
@@ -182,8 +212,8 @@ private fun ResponseDialog(
                                         questionPrompts.map { question ->
                                             QuestionAnswerDraftUi(
                                                 questionKey = question.key,
-                                                optionIds = selectedQuestionOptions[question.key].orEmpty(),
-                                                freeForm = questionFreeForms[question.key].orEmpty()
+                                                optionIds = draftsByQuestion[question.key]?.optionIds.orEmpty(),
+                                                freeForm = draftsByQuestion[question.key]?.freeForm.orEmpty()
                                                     .trim()
                                                     .takeIf(String::isNotEmpty),
                                             )
@@ -191,7 +221,10 @@ private fun ResponseDialog(
                                     )
                                 },
                                 enabled = attention.responseAvailability.enabled && allQuestionsReady,
-                                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(min = 48.dp)
+                                    .testTag(questionSubmitTestTag(attention.id)),
                             ) { Text("提交全部回答") }
                         }
                     }
@@ -239,6 +272,7 @@ private fun ResponseDialog(
 
 @Composable
 private fun QuestionPromptForm(
+    attentionId: String,
     question: QuestionPromptUi,
     selectedOptionIds: List<String>,
     freeForm: String,
@@ -247,12 +281,22 @@ private fun QuestionPromptForm(
     onFreeFormChange: (String) -> Unit,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(question.prompt ?: "问题正文不可用", style = MaterialTheme.typography.bodyLarge)
+        Text(
+            question.prompt ?: "问题正文不可用",
+            modifier = Modifier
+                .testTag(questionPromptTestTag(attentionId, question.key))
+                .semantics { heading() },
+            style = MaterialTheme.typography.bodyLarge,
+        )
         question.options.forEach { option ->
             val selected = option.id in selectedOptionIds
             DecisionButton(
                 option = if (selected) option.copy(label = "✓ ${option.label}") else option,
                 enabled = enabled,
+                modifier = Modifier.testTag(
+                    questionOptionTestTag(attentionId, question.key, option.id),
+                ),
+                selected = selected,
                 onClick = { onOptionToggle(option.id) },
             )
         }
@@ -260,7 +304,9 @@ private fun QuestionPromptForm(
             OutlinedTextField(
                 value = freeForm,
                 onValueChange = onFreeFormChange,
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag(questionFreeFormTestTag(attentionId, question.key)),
                 label = { Text("本题自定义回答") },
                 minLines = 2,
                 maxLines = 6,
@@ -271,18 +317,29 @@ private fun QuestionPromptForm(
 }
 
 @Composable
-private fun DecisionButton(option: DecisionOptionUi, enabled: Boolean, onClick: () -> Unit) {
+private fun DecisionButton(
+    option: DecisionOptionUi,
+    enabled: Boolean,
+    modifier: Modifier = Modifier,
+    selected: Boolean? = null,
+    onClick: () -> Unit,
+) {
+    val buttonModifier = if (selected == null) {
+        modifier
+    } else {
+        modifier.semantics { this.selected = selected }
+    }
     if (option.tone == DecisionToneUi.Positive) {
         Button(
             onClick = onClick,
             enabled = enabled,
-            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+            modifier = buttonModifier.fillMaxWidth().heightIn(min = 48.dp),
         ) { Text(option.label) }
     } else {
         OutlinedButton(
             onClick = onClick,
             enabled = enabled,
-            modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+            modifier = buttonModifier.fillMaxWidth().heightIn(min = 48.dp),
             colors = if (option.tone == DecisionToneUi.Destructive) {
                 ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
             } else {

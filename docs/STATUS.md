@@ -1,14 +1,15 @@
 # OneKaleidoscope 当前状态
 
-> 生效：2026-08-10
+> 生效：2026-08-11
 > 进度基线：R3 / T-109 实体 arm64 Android 最终门禁通过；提交 SHA 与本机证据见
-> [T-109 门禁结果](gates/T-109-result.md)。R4 尚未进入 `main` 且最终公网门禁未完成；
-> R5 在 `origin/main@893e930` 上以独立任务卡实施，不能替代或隐含完成 R4。
+> [T-109 门禁结果](gates/T-109-result.md)。R4 功能实现已由 PR #11 进入 `main`，最终公网
+> release/physical acceptance 由 T-115 独立承接；R5 正把旧基线上的 provider 实现集成到该主线。
 
 ## 1. 当前结论
 
-**R0、R1、R2、R3 已完成；R4 / T-110 与 R5 / T-111～T-114 均为 active。
-R4 未完成、未进入 `main`，R5 也没有通过最终门禁。**
+**R0、R1、R2、R3 已完成；R4 功能实现已通过 [T-110](tasks/T-110.md) / PR #11
+合并，release/physical acceptance 仍由 [T-115](tasks/T-115.md) 持续，R4 未标 completed；
+R5 / T-111～T-113 仍为 active，T-114 已完成共享合同门禁但不代表 R5 完成。**
 
 已经跑通并持久化验证的 PC 端纵切是：
 
@@ -24,9 +25,10 @@ provider-neutral multi-runtime hostd 与 UACP `0.5.0` QuestionSet/scoped runtime
 真实 OpenCode `1.18.16` question fixture 已通过，但最新 generated product live probe 暴露同版本
 `/doc` 与 `/event` 的 timestamp 类型冲突及未声明 heartbeat，adapter fail-closed，实时/恢复与 D-B11
 仍被阻塞；Claude 只有真实 SDK `0.3.226` OAuth 失败 fixture，不能称为
-成功 turn 或真实 permission/question 验收。第三次完整本地 `cargo xtask ci`、静态 schema diff 与
-Android no-build-cache 双 ABI/UniFFI 编译和 unit tests 已通过；exact-commit 跨平台 CI 尚待 push，
-`adb devices -l` 为空，实体 Android R5 纵切仍 blocked。
+成功 turn 或真实 permission/question 验收。旧 R5 SHA 的完整本地 `cargo xtask ci` 与静态 schema
+diff 已通过；最新 R4/R5 集成候选已通过 scoped Rust lint/tests 和 Android 双 ABI/UniFFI 增量编译，
+仍待冻结 SHA 的干净总门禁与 exact-commit 跨平台 CI。`adb devices -l` 为空，实体 Android R5
+纵切仍 blocked。
 
 R3 的三条旧前置已全部解除：
 
@@ -61,6 +63,7 @@ approval decline、90 秒 OEM 后台、外部 force-stop cursor 恢复与 durabl
 | T-106 | UACP `0.3.0` mobile contract、projection 独立游标、可信 command/content ingress、TRANSPORT `0.1.0` |
 | T-107 | pinned TLS LAN Broker、projection journal、可信 mobile ingress、Rust `MobileClient`、真实 Codex 冷重连纵切；两套三平台 CI 全绿 |
 | T-108 / T-109 | Android Compose 产品 App、Keystore/加密凭据、双 ABI UniFFI、七类真实 projection；API 35 emulator 与实体 arm64 Wi-Fi/审批/后台/冷启游标恢复/吊销门禁通过 |
+| T-110 / R4 implementation | 自有 iroh relay、跨公网 pinned TLS E2EE、FCM FID/outbox、网络/冷启 cursor 恢复、三平台进程树终止；PR #11 合并，最终实现 SHA `603dfd8` 自动化全绿 |
 
 ## 3. 当前可用能力
 
@@ -68,11 +71,11 @@ approval decline、90 秒 OEM 后台、外部 force-stop cursor 恢复与 durabl
 |---|---|---|
 | `kaleido-state` | canonical state、内容寻址存储、八类 projection builder、持久 projection journal、device command outbox | projection journal 尚无物理 checkpoint/compaction |
 | `kaleido-adapter-codex` | 真实 Codex JSON-RPC 会话、流式输出、file-change approval、prompt runtime ack | 尚无真实 steer delivery |
-| `kaleido-adapter-opencode`（R5 branch） | OpenAPI 生成类型；REST discovery/history；SSE live；v2 prompt admission；permission/question/abort/reconnect 实现 | `1.18.16` fixture、REST/resume/queue receipt 有真实证据；最新 live probe 因 `/doc` timestamp number 与 `/event` string 冲突、未声明 `server.heartbeat` 而 fail-closed，实时/恢复 blocked；SSE 无 cursor，恢复即使解码后也明确非无损 |
-| `kaleido-adapter-claude`（R5 branch） | 官方 SDK `0.3.226` typed sidecar；provisional Broker Session、`ProviderManaged` metadata discovery/resume、stream、permission/QuestionSet、interrupt 路径 | `listSessions` 只证明 SDK 管理持久化与 HistoryList，typed history read 尚待 `getSessionMessages`；不声称原生 CLI/GUI attach；真实 fixture 以 OAuth 过期失败；成功 turn/人工交互/恢复未验 |
-| `kaleido-hostd` | pinned TLS LAN Broker、可信 gateway、断线恢复；R5 branch 增加 provider-neutral registry、canonical Resume alias、receipt-gated NewTurn queue pump 与 StructuredLanHost | OpenCode + Claude provisional 双 runtime 启停通过；三家真实会话同驻未验；仅 LAN，公网 relay/push 在 R4 |
-| `kaleido-core` | 产品级 `MobileClient`、pair/connect/reconnect/subscribe/command/content、last-good cache、移动端能力/正文 helper；R5 增加 Resume/Interrupt exact capability action | iOS 产品接入仍在 R8 |
-| Android | Compose Project/Session/Transcript/Live/Queue/Attention/Capability，hardware-backed Keystore P-256、加密凭据、离线缓存与 cursor resume；R5 branch 复用同一 UI 支持 QuestionSet/Resume/Interrupt | R3 实体 arm64 门禁通过；R5 三 provider 实体纵切未执行；无公网 relay/push |
+| `kaleido-adapter-opencode`（R5 integration） | OpenAPI 生成类型；REST discovery/history；SSE live；v2 prompt admission；permission/question/abort/reconnect 实现 | `1.18.16` fixture、REST/resume/queue receipt 有真实证据；latest live 因 `/doc` timestamp number 与 `/event` string 冲突及未声明 heartbeat fail-closed；SSE 恢复明确非无损 |
+| `kaleido-adapter-claude`（R5 integration） | 官方 SDK `0.3.226` typed sidecar；provisional Broker Session、`ProviderManaged` metadata discovery/resume、bounded `getSessionMessages` history read、stream、permission/QuestionSet、interrupt 路径 | 空 discovery 只证明 HistoryList，非空真实消息才证明 HistoryRead；真实 fixture 为 OAuth 失败，成功 turn/人工交互/恢复未验 |
+| `kaleido-hostd` | provider-neutral registry、canonical Resume alias、receipt-gated NewTurn queue pump、StructuredLanHost；R4 自托管 iroh presence/P2P/relay、durable remote revoke | OpenCode + Claude provisional 双 runtime 启停通过；三家真实会话同驻未验；自有 Ubuntu + 蜂窝实体机 release gate 仍 pending |
+| `kaleido-core` | 产品级 `MobileClient`、pair/connect/reconnect/subscribe/command/content、逐 key last-good cache、Resume/Interrupt action；R4 pinned control、custom relay、网络 epoch 与 durable FCM outbox | iOS 产品接入仍在 R8；公网实体恢复仍待 T-115 |
+| Android | 共享 Compose Project/Session/Transcript/Live/Queue/Attention/Capability 与 QuestionSet/Resume/Interrupt；R4 FCM FID、后台 WorkManager 与网络切换回调 | 蜂窝/真实 FCM/R5 三 provider 实体纵切均未验收 |
 | iOS | Swift 绑定可生成并编译 | 尚无产品 App，归 R8 |
 
 因此当前已经交付并在实体 arm64 Android 上验证了 R3 Android LAN 纵切。公网 relay、
@@ -87,19 +90,21 @@ approval decline、90 秒 OEM 后台、外部 force-stop cursor 恢复与 durabl
 | 3 | [T-108](tasks/T-108.md) | Android Compose 项目/会话/实时/队列/Attention、冷启与断线恢复 |
 | 4 | [T-109](tasks/T-109.md) | 实体 arm64 Wi-Fi、硬件密钥、真实审批、OEM 后台、force-stop 与吊销最终门禁 |
 
-R4 活动任务是 [T-110](tasks/T-110.md)：Ubuntu rendezvous/P2P/relay、跨公网 E2EE、
-Android FCM、网络切换与活进程树终止。其实现不在当前 `main` 基线，真实 Ubuntu/FCM/蜂窝
-门禁仍待完成。
+当前活动任务是 [T-115](tasks/T-115.md)：只执行 R4 自有 Ubuntu、真实 FCM、蜂窝与
+实体 arm64 release/physical gate；不继续扩展 R4 功能代码。
 
-R5 独立执行序列为：
+截至 2026-08-11，T-110 的实现已闭合 ADR-0024、REMOTE_CONTROL 0.1、
+自有 iroh relay、复用 R3 pinned TLS 的公网数据面、FCM FID、逐 key cursor 恢复；本轮审核又
+补齐 route-scoped push、lost-ack outbox、Ubuntu ack 后主动 relay 断链、致命 control 错误断链、
+Windows Job Object 与真实 iroh server 集成门禁。PR #11 最终实现 SHA `603dfd8` 的本地
+`cargo xtask ci`、Windows/macOS/Linux、Ubuntu relay integration、Android clean build/lint/JVM
+与 API 35 instrumentation 全绿并已合并为 `f7f7b3b`。这是 implementation merged，不是 R4
+completed：自有 Ubuntu 的 DNS/ACME/FCM 运行及实体 arm64 Android 蜂窝公网纵切尚未执行，
+真实门禁继续保持 [pending](gates/T-110-evidence.md)，由 T-115 承接。
 
-1. [T-114](tasks/T-114.md)：QuestionSet、逐题回答与 answer provenance；
-2. [T-111](tasks/T-111.md)：OpenCode REST/SSE、生成类型与 D-B11；
-3. [T-112](tasks/T-112.md)：Claude 官方 Agent SDK managed session；
-4. [T-113](tasks/T-113.md)：multi-runtime hostd、移动端、跨平台 CI 与实体 Android 总门禁。
-
-T-111～T-113 仍为 active；T-114 共享 QuestionSet 合同卡本地总门禁已完成，但不代表 R5 完成。
-当前真实证据与空缺分别见
+R5 独立执行序列仍为：T-114 QuestionSet 合同（已完成）→ T-111 OpenCode 生成 REST/SSE 与
+D-B11 → T-112 Claude SDK managed session → T-113 multi-runtime/移动端/跨平台与实体 Android
+总门禁。T-111～T-113 保持 active；真实证据分别见
 [T-111](gates/T-111-evidence.md)、[T-112](gates/T-112-evidence.md)、
 [T-113](gates/T-113-evidence.md) 和 [T-114](gates/T-114-evidence.md)。
 
@@ -107,8 +112,8 @@ T-111～T-113 仍为 active；T-114 共享 QuestionSet 合同卡本地总门禁�
 
 | 里程碑 | 内容 |
 |---|---|
-| R4 / [T-110](tasks/T-110.md) | Ubuntu rendezvous/relay、跨公网 E2EE、推送、活进程树终止 |
-| R5 / [T-111～T-114](tasks/README.md) | active；OpenCode、Claude Broker 管理会话、QuestionSet 与多 runtime 总门禁。OpenCode generated live/D-B11 被同版本合同漂移阻塞，Claude success/cross-platform/实体 Android 未通过 |
+| R4 release gate / [T-115](tasks/T-115.md) | 自有 Ubuntu、真实 FCM、蜂窝/实体 arm64 全纵切与零 canary 验收 |
+| R5 / [T-111～T-114](tasks/README.md) | active；OpenCode generated live/D-B11 被同版本合同漂移阻塞；Claude success、三家同驻、跨平台与实体 Android 未验收 |
 | R6 | 跨 Agent workflow 执行器与手机 WorkflowBoard |
 | R7 | 三家 CLI/GUI 六格真实验收 |
 | R8 | iOS 产品对齐 |
@@ -118,9 +123,7 @@ T-111～T-113 仍为 active；T-114 共享 QuestionSet 合同卡本地总门禁�
 
 | ID | 内容 | 结清点 |
 |---|---|---|
-| D-B2 | 活进程树终止尚无真实存活子树测试 | T-110 |
 | D-B6 / D-B7 | Unix 反斜杠与 macOS `/var` 符号链接路径规则 | R9 |
-| D-B8 | `<HOME>` / `<SANDBOX>` 脱敏标签精度 | T-110 |
 | D-B11 | snapshot、required surface、CLI 与 SDK 公开版本号均对齐 `1.18.16`，但真实 `/event` 违反同版本 `/doc`（prompt-admitted timestamp number/string 冲突，另有未声明 heartbeat）；生成型 adapter fail-closed，故当前分支也未结清 | T-111 |
 | P-2 | Codex approval 没有真实过期时间 | UI 必须诚实显示无过期时间 |
 

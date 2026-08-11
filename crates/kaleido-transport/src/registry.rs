@@ -360,6 +360,17 @@ impl<B: DurableBackend> SecurityStore<B> {
     pub fn device_count(&self) -> usize {
         self.snapshot.devices.len()
     }
+
+    /// Returns the durable local revocation set for cross-store reconciliation.
+    /// Callers must not log these canonical device identifiers.
+    pub fn revoked_device_ids(&self) -> Vec<DeviceId> {
+        self.snapshot
+            .devices
+            .values()
+            .filter(|device| device.is_revoked())
+            .map(|device| device.device_id.clone())
+            .collect()
+    }
 }
 
 fn fresh_device_id(existing: &BTreeMap<String, DeviceRecord>) -> Result<DeviceId, TransportError> {
@@ -568,6 +579,7 @@ mod tests {
             store.device_for_auth(&device_id),
             Err(TransportError::AuthenticationFailed)
         );
+        assert_eq!(store.revoked_device_ids(), vec![device_id]);
         std::fs::remove_dir_all(&directory).expect("cleanup");
     }
 }

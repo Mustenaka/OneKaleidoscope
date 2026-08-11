@@ -30,10 +30,11 @@ use kaleido_hostd::error::HostdError;
 use kaleido_hostd::slice::{self, ApprovalDecision, ReplayRequest, RunRequest};
 use kaleido_hostd::{
     RuntimeBootstrap, RuntimeBootstrapFactory, StructuredLanConfig, StructuredLanHost,
+    StructuredRemoteConfig,
 };
 use kaleido_proto::capability::EvidenceSource;
 use kaleido_proto::host::LaunchSurface;
-use kaleido_proto::ids::SessionId;
+use kaleido_proto::ids::{DeviceId, SessionId};
 use kaleido_proto::turn::TurnOrigin;
 use kaleido_state::ProjectionName;
 
@@ -49,6 +50,10 @@ kaleido-hostd lan run      --providers <codex,opencode,claude> --project-root <d
                            [--executable <codex.exe>] [--opencode-url <url>]
                            [--node-executable <node>] [--claude-bridge <index.ts>]
                            [--no-print-pairing]
+                           [--remote-service <host:port>
+                            --remote-service-pin <sha256:base64url>
+                            --remote-relay <https://self-hosted-relay>
+                            [--remote-device-id <already-paired-device>]]
                            [--serve-secs <positive>] [--timeout-secs 30]
 
 projections: project-index, session-index, transcript, live-activity, input-queue,
@@ -197,14 +202,36 @@ async fn run_lan(arguments: &[String]) -> Result<String, HostdError> {
         bind_address,
         runtimes,
     };
+    let remote_service = optional(arguments, "--remote-service");
+    let remote_pin = optional(arguments, "--remote-service-pin");
+    let remote_relay = optional(arguments, "--remote-relay");
+    let remote_device = optional(arguments, "--remote-device-id");
+    let remote = match (remote_service, remote_pin, remote_relay) {
+        (Some(service_endpoint), Some(service_public_key_pin), Some(relay_url)) => {
+            Some(StructuredRemoteConfig {
+                service_endpoint,
+                service_public_key_pin,
+                relay_url,
+            })
+        }
+        (None, None, None) if remote_device.is_none() => None,
+        _ => {
+            return Err(HostdError::usage(
+                "remote mode requires --remote-service, --remote-service-pin and --remote-relay together; --remote-device-id is valid only in remote mode",
+            ));
+        }
+    };
     // Blocking provider clients (notably reqwest's OpenCode client) own a
     // private Tokio runtime and must be constructed outside this async task.
     // Keeping the whole bootstrap in `spawn_blocking` also makes rollback drop
     // adapters on the same valid blocking boundary.
-    let host = tokio::task::spawn_blocking(move || StructuredLanHost::start(config))
-        .await
-        .map_err(|_| HostdError::Lan)?
-        .map_err(|_| HostdError::Lan)?;
+    let host = tokio::task::spawn_blocking(move || match remote {
+        Some(remote) => StructuredLanHost::start_remote_controlled(config, &remote),
+        None => StructuredLanHost::start(config),
+    })
+    .await
+    .map_err(|_| HostdError::Lan)?
+    .map_err(|_| HostdError::Lan)?;
     // This is an operator-requested one-time credential. It deliberately
     // bypasses tracing and is never retained in the returned summary.
     if !arguments
@@ -212,6 +239,12 @@ async fn run_lan(arguments: &[String]) -> Result<String, HostdError> {
         .any(|argument| argument == "--no-print-pairing")
     {
         println!("{}", host.pairing_uri());
+    }
+    if let Some(device_id) = remote_device {
+        let remote_pairing = host
+            .issue_remote_pairing_uri(&DeviceId::new(device_id))
+            .map_err(|_| HostdError::Lan)?;
+        println!("{}", remote_pairing.as_str());
     }
     let session_ids = host.session_ids().to_vec();
     if let Some(serve_seconds) = serve_seconds {

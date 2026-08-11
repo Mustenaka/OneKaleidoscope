@@ -22,6 +22,7 @@ data class AppUiState(
     val resumeAction: ActionAvailability = ActionAvailability.disabled("选择可恢复的历史会话后可用"),
     val interruptAction: ActionAvailability = ActionAvailability.disabled("当前没有可中断的活动回合"),
     val attentionDrafts: Map<String, String> = emptyMap(),
+    val questionDrafts: Map<String, List<QuestionAnswerDraftUi>> = emptyMap(),
     val message: UiMessage? = null,
 )
 
@@ -256,6 +257,10 @@ sealed interface UiAction {
     data class RespondQuestion(
         val attentionId: String,
         val answers: List<QuestionAnswerDraftUi>,
+    ) : UiAction
+    data class UpdateQuestionDraft(
+        val attentionId: String,
+        val answer: QuestionAnswerDraftUi,
     ) : UiAction
     data class UpdateAttentionDraft(val attentionId: String, val value: String) : UiAction
     data object Refresh : UiAction

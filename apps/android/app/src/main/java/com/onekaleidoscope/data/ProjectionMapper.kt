@@ -136,7 +136,7 @@ internal object ProjectionMapper {
         },
         ownershipLabel = when (value.ownership) {
             OwnershipMode.BROKER_MANAGED -> "Broker 管理"
-            OwnershipMode.PROVIDER_MANAGED -> "Provider SDK 管理"
+            OwnershipMode.PROVIDER_MANAGED -> "上游管理"
             OwnershipMode.SHARED_RUNTIME -> "共享 Runtime"
             OwnershipMode.EXTERNAL_NATIVE -> "外部会话"
         },
@@ -358,6 +358,7 @@ internal object ProjectionMapper {
         ActionAvailability.disabled(
             when (value.blocker) {
                 MobileActionBlocker.SESSION_NOT_LIVE -> "会话当前没有实时连接"
+                MobileActionBlocker.SESSION_NOT_RESUMABLE -> "此会话不在可恢复历史中"
                 MobileActionBlocker.RUNTIME_CAPABILITY_MISSING -> "尚未收到 Runtime 能力投影"
                 MobileActionBlocker.CAPABILITY_UNSUPPORTED -> "Runtime 明确不支持此操作"
                 MobileActionBlocker.CAPABILITY_UNAVAILABLE -> "此连接暂时不可执行该操作"

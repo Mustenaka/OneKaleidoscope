@@ -7,11 +7,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertIsNotSelected
+import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.StateRestorationTester
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTextInput
@@ -114,34 +117,89 @@ class OneKaleidoscopeUiTest {
     @Test
     fun questionSetRendersEveryPromptAndSubmitsKeyedAnswersTogether() {
         val actions = CopyOnWriteArrayList<UiAction>()
+        var state by mutableStateOf(
+            verticalSliceState().copy(
+                attention = PanelState(listOf(questionSetAttention())),
+            ),
+        )
         compose.setContent {
             OneKaleidoscopeApp(
-                state = verticalSliceState().copy(
-                    attention = PanelState(listOf(questionSetAttention())),
-                ),
-                onAction = actions::add,
+                state = state,
+                onAction = { action ->
+                    actions += action
+                    if (action is UiAction.UpdateQuestionDraft) {
+                        val current = state.questionDrafts[action.attentionId].orEmpty()
+                        state = state.copy(
+                            questionDrafts = state.questionDrafts + (
+                                action.attentionId to (
+                                    current.filterNot {
+                                        it.questionKey == action.answer.questionKey
+                                    } + action.answer
+                                )
+                            ),
+                        )
+                    }
+                },
             )
         }
 
         compose.onNode(hasText("待处理") and hasClickAction()).performClick()
         compose.onNodeWithText("处理").performClick()
-        compose.onNodeWithText("选择语言").assertIsDisplayed()
-        compose.onNodeWithText("要包含哪些").assertIsDisplayed()
-        compose.onNodeWithText("Rust").performClick()
-        compose.onNodeWithText("测试").performClick()
-        compose.onNodeWithText("本题自定义回答").performTextInput("覆盖率说明")
-        compose.onNodeWithText("提交全部回答").performClick()
+        compose.onNodeWithTag(questionPromptTestTag(ATTENTION_ID, "language")).assertIsDisplayed()
+        compose.onNodeWithTag(questionPromptTestTag(ATTENTION_ID, "details")).assertIsDisplayed()
+        compose.onNodeWithTag(questionSubmitTestTag(ATTENTION_ID)).assertIsNotEnabled()
+        compose.onNodeWithTag(questionOptionTestTag(ATTENTION_ID, "language", "rust"))
+            .performClick()
+            .assertIsSelected()
+        compose.onNodeWithTag(questionOptionTestTag(ATTENTION_ID, "language", "python"))
+            .performClick()
+            .assertIsSelected()
+        compose.onNodeWithTag(questionOptionTestTag(ATTENTION_ID, "language", "rust"))
+            .assertIsNotSelected()
+        compose.onNodeWithTag(questionOptionTestTag(ATTENTION_ID, "details", "tests"))
+            .performClick()
+            .assertIsSelected()
+        compose.onNodeWithTag(questionOptionTestTag(ATTENTION_ID, "details", "docs"))
+            .performClick()
+            .assertIsSelected()
+            .performClick()
+            .assertIsNotSelected()
+        compose.onNodeWithTag(questionFreeFormTestTag(ATTENTION_ID, "details"))
+            .performTextInput("覆盖率说明")
+        compose.onNodeWithTag(questionSubmitTestTag(ATTENTION_ID)).performClick()
 
         assertEquals(
             UiAction.RespondQuestion(
                 ATTENTION_ID,
                 listOf(
-                    QuestionAnswerDraftUi("language", listOf("rust"), null),
+                    QuestionAnswerDraftUi("language", listOf("python"), null),
                     QuestionAnswerDraftUi("details", listOf("tests"), "覆盖率说明"),
                 ),
             ),
             actions.filterIsInstance<UiAction.RespondQuestion>().single(),
         )
+    }
+
+    @Test
+    fun cachedQuestionSetCannotBeEditedOrSubmitted() {
+        val cached = questionSetAttention().copy(
+            responseAvailability = ActionAvailability.disabled("离线缓存不能回答"),
+        )
+        compose.setContent {
+            OneKaleidoscopeApp(
+                state = verticalSliceState().copy(
+                    attention = PanelState(
+                        value = listOf(cached),
+                        freshness = DataFreshness.CachedOffline,
+                    ),
+                ),
+                onAction = {},
+            )
+        }
+
+        compose.onNode(hasText("待处理") and hasClickAction()).performClick()
+        compose.onNodeWithText("处理").assertIsNotEnabled()
+        compose.onNodeWithText("离线缓存不能回答").assertIsDisplayed()
     }
 
     @Test

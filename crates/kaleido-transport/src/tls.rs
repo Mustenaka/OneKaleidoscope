@@ -382,7 +382,7 @@ impl ServerCertVerifier for ExactSpkiVerifier {
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use std::io::Cursor;
+    use std::io::{Cursor, Write};
 
     use base64::Engine;
     use rcgen::generate_simple_self_signed;
@@ -428,6 +428,26 @@ mod tests {
         Err(())
     }
 
+    fn encrypted_record(identity: TlsIdentity, pin: SpkiPin, plaintext: &[u8]) -> Vec<u8> {
+        let mut client = ClientConnection::new(
+            client_config(pin).expect("client config"),
+            ServerName::try_from("localhost")
+                .expect("server name")
+                .to_owned(),
+        )
+        .expect("client");
+        let mut server =
+            ServerConnection::new(server_config(identity).expect("server config")).expect("server");
+        handshake(&mut client, &mut server).expect("TLS handshake");
+        client
+            .writer()
+            .write_all(plaintext)
+            .expect("application data");
+        let mut wire = Vec::new();
+        client.write_tls(&mut wire).expect("encrypted record");
+        wire
+    }
+
     #[test]
     fn tls_is_13_only_and_exact_pin_succeeds() {
         let (identity, certificate) = identity();
@@ -470,6 +490,22 @@ mod tests {
         let mut server =
             ServerConnection::new(server_config(identity).expect("server config")).expect("server");
         assert!(handshake(&mut client, &mut server).is_err());
+    }
+
+    #[test]
+    fn same_plaintext_produces_distinct_opaque_tls_records() {
+        let (identity, certificate) = identity();
+        let pin = SpkiPin::from_certificate_der(&certificate).expect("pin");
+        let plaintext = b"KALEIDO-RELAY-CONFIDENTIALITY-CANARY";
+        let first = encrypted_record(identity.clone(), pin.clone(), plaintext);
+        let second = encrypted_record(identity, pin, plaintext);
+        assert_ne!(first, second);
+        assert!(!first
+            .windows(plaintext.len())
+            .any(|window| window == plaintext));
+        assert!(!second
+            .windows(plaintext.len())
+            .any(|window| window == plaintext));
     }
 
     #[test]

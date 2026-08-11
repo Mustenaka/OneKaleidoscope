@@ -11,6 +11,7 @@ repository = { workspace = true }
 publish = false
 
 [dependencies]
+iroh = { version = "=1.0.3", default-features = false, features = ["tls-ring"] }
 kaleido-adapter = { path = "../kaleido-adapter" }
 kaleido-adapter-codex = { path = "../kaleido-adapter-codex" }
 kaleido-adapter-claude = { path = "../kaleido-adapter-claude" }
@@ -25,6 +26,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 kaleido-core = { path = "../kaleido-core" }
