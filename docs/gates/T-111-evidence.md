@@ -1,8 +1,8 @@
 # T-111 OpenCode / D-B11 evidence
 
 > 状态：**active evidence ledger，不是完成证明**
-> 基线：`origin/main@893e930`
-> 记录日期：2026-08-10
+> 集成基线：`origin/main@c993d9f9bb115003e2ee69066c233ac47b7c52cc`
+> 更新日期：2026-08-11
 
 ## 1. D-B11 版本结论
 
@@ -16,35 +16,48 @@
 `schemas/required-surface.toml` 记录的 warning range 是 exact `=1.18.16`。它不是 feature
 switch；adapter 只按当前连接的结构化成功/流量证明能力。早期 fixture 保留为回归资产，但
 1.18.9～1.18.14 缺少逐版本证据，因此不声明连续范围。范围外版本仍允许 `schema diff` 并显示
-unverified warning。`npm view opencode-ai version` 与 `npm view @opencode-ai/sdk version` 均返回
-`1.18.16`，因此下述漂移不能解释为 CLI/server 与 SDK 的公开版本号不一致。
+unverified warning。2026-08-11 重新执行 `opencode --version`、`npm view opencode-ai version`
+与 `npm view @opencode-ai/sdk version`，三者仍均返回 `1.18.16`，因此下述漂移不能解释为
+CLI/server 与 SDK 的公开版本号不一致。
 
 ## 2. 生成链
 
 `cargo check -p kaleido-adapter-opencode` 的当前构建报告：
 
 ```text
-opencode normalization numeric_exclusive_minimum_to_bound hit 25
-opencode generated subset: 117 schemas
+opencode generated subset: 125 schemas
 Finished `dev` profile ...
 ```
 
-当前只保留这一条实际命中规则；真实 `1.18.16` 快照测试锁定命中数 25，单元测试锁定
-before/after 等价形状。新增生成的 `EventPluginAdded` / `EventSessionNextPromptAdmitted` 使实时流卫生
-检查也走 `/doc` 生成类型，当前 closure 为 117 schemas。规范化产物与 Rust 生成物只在构建目录，
-`schemas/` 快照未被生成器回写。
+审查发现旧规则把 JSON Schema draft-07 本就使用的数值 `exclusiveMinimum` 错写成 draft-04 的
+`minimum` + boolean `exclusiveMinimum`。当前链保留原数值约束且无需规范化规则，并移除了不能正确
+理解 OpenAPI 3.1 schema 的旧 3.0 解析器。generated REST request/response 与显式
+`EventPluginAdded` / `EventSessionNextPromptAdmitted` owner 使 closure 为 125 schemas；规范化产物与
+Rust 生成物仍只在构建目录，`schemas/` 原样快照未被回写。
 
-最终本地候选已执行 `cargo xtask schema diff`，exit 0：Codex `0.147.0`、OpenCode
+最新 R4/R5 集成候选用隔离安装的精确 Codex `0.147.0` 执行 `cargo xtask schema diff`，exit 0：Codex `0.147.0`、OpenCode
 `1.18.16`、ACP schema `1.18.0` 共 288 个 JSON 文件，required-surface 内外均为 0 drift。
 这证明当前快照可重复，不推翻真实 runtime 违反同版本 `/doc` 的 D-B11 阻塞。
 
-第三次完整 `cargo xtask ci` 也 exit 0，依次通过 fmt、check-deps、lint-forbidden、clippy、
-Claude sidecar、workspace tests 与 fixtures verify。本页仍不把静态 schema/fixture gate 冒充
+最新集成候选的完整 `cargo xtask ci` 也 exit 0，依次通过 fmt、check-deps、lint-forbidden、clippy、
+Claude sidecar、workspace/doc tests 与 fixtures verify。本页仍不把静态 schema/fixture gate 冒充
 OpenCode realtime acceptance。
 
-OpenCode adapter focused fmt/clippy 已通过，`cargo test -p kaleido-adapter-opencode --all-targets`
-当前 11/11 通过。测试 lint 使用 `get`/`pointer`/`first` 与显式错误传播，没有扩大 clippy allow，
-也没有改写真实 fixture 迎合实现。
+最新工作树的 OpenCode adapter focused fmt/clippy 已通过，
+`cargo test -p kaleido-adapter-opencode --all-targets` 当前 21/21 通过。新增回归锁定：assistant
+`parentID` 与 user message 共用 canonical Turn、user/assistant role 不串位、同一 part 更新保持 sequence、
+idle 清 active turn、空 discovery 只证明 `HistoryList`、timestamp string 漂移继续变红、generated
+REST body/response 与 project scope/abort true、attention 回执的 session/request/reply/answers 精确匹配。
+没有扩大 clippy allow，也没有改写真实 fixture 迎合实现。
+
+变异验证实际执行：临时从 reducer 支持表移除 `session.next.prompt.admitted` 后，精确测试
+`generated_prompt_admission_timestamp_rejects_the_observed_string_drift` 因
+`UnknownEventType` exit 1；恢复该标签后同一测试 exit 0。
+
+SSE reader 已移到 adapter 私有 reader thread，worker 的 `drain_effects` 在无事件时立即返回；
+`RespondAttention` 的 HTTP 200 不再完成命令，而是在有限 request timeout 内消费同一 typed SSE
+队列，只有精确 matching 的 answered event 且 `AttentionAnswerSource::LocalCommand` 绑定原
+`CommandId` 才返回终态 effect。缺回执、拒绝/答案不符或 stream 漂移均返回明确错误，保持命令未完成。
 
 ## 3. 真实 fixture
 
@@ -118,14 +131,13 @@ REST snapshot + 新 SSE tail 不能证明输入无 gap。
 | permission allow/deny | **未验** | endpoint/reducer 已实现，但本卡没有真实触发 fixture |
 | active-turn interrupt | **未验** | abort route/ack 已实现，但没有真实 active-turn receipt |
 | forced SSE disconnect/reconnect | **部分** | snapshot-first 非无损恢复、event-id 去重与 per-session live scope 已实现；真实强制中断/gap 场景未齐 |
-| unknown/malformed/scope rejection | **focused 测试通过** | 仍需总门禁与要求中的完整错误矩阵 |
-| `cargo xtask schema diff` | **本地通过** | exit 0；288 JSON files；required-surface 内外 0 drift；不能检测本次 runtime-vs-`/doc` 漂移 |
-| `cargo xtask ci` | **本地通过** | 第三次完整运行 exit 0；T-111 仍因 D-B11/真实 provider 门禁 active |
+| unknown/malformed/scope/receipt rejection | **focused 测试通过** | 21/21；仍需最新集成总门禁与真实 permission/abort/reconnect 取证 |
+| `cargo xtask schema diff` | **最新集成候选本地通过** | 精确 Codex `0.147.0` 下 exit 0；288 JSON files；仍不能检测 runtime-vs-`/doc` 漂移 |
+| `cargo xtask ci` | **最新集成候选本地通过** | 全入口 exit 0；T-111 仍因 D-B11/真实 provider 门禁 active |
 
 ## 6. 未完成门禁
 
 - 先取得与真实 `/event` 一致、可生成且可审查的上游合同，或上游修复同版本 `/doc`；禁止手写绕过；
 - permission allow/deny、active abort、强制 SSE 断线/重连的真实 provider 证据；
-- 把 blocking SSE reader 与 command dispatch 解耦，避免空闲流量把移动命令延迟到 HTTP timeout；
 - success/refusal/unknown/reconnect/duplicate/gap 的完整会失败测试与记录的变异红灯；
 - T-113 的跨平台 CI 与实体 Android 总门禁。

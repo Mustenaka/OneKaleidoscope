@@ -11,6 +11,7 @@ use kaleido_proto::{
     effect::StateEffect,
     host::HostPlatform,
     ids::ContentId,
+    turn::ItemBody,
 };
 use serde_json::Value;
 
@@ -193,6 +194,122 @@ fn real_recorded_rest_snapshot_discovers_and_replays_history() {
     assert!(reducer
         .capability_probe()
         .is_proven(kaleido_proto::capability::Capability::HistoryResume));
+}
+
+#[test]
+fn empty_discovery_proves_only_history_list() {
+    let mut reducer = reducer();
+    let mut content = MemoryContent::default();
+    reducer
+        .reduce_snapshot(&[], &[], BASE_AT_MS, &mut content)
+        .expect("empty list is a valid discovery result");
+    let probe = reducer.capability_probe();
+    assert!(probe.is_proven(kaleido_proto::capability::Capability::HistoryList));
+    assert!(!probe.is_proven(kaleido_proto::capability::Capability::HistoryRead));
+    assert!(!probe.is_proven(kaleido_proto::capability::Capability::HistoryResume));
+}
+
+#[test]
+fn generated_prompt_admission_timestamp_rejects_the_observed_string_drift() {
+    let numeric = serde_json::json!({
+        "id": "evt_contract",
+        "type": "session.next.prompt.admitted",
+        "properties": {
+            "timestamp": 1.5,
+            "sessionID": "ses_contract",
+            "messageID": "msg_contract",
+            "prompt": {"text": "hello"},
+            "delivery": "queue"
+        }
+    });
+    let mut reducer = reducer();
+    let numeric = serde_json::to_vec(&numeric).expect("event JSON");
+    reducer
+        .decode_event(&numeric)
+        .expect("the pinned generated number contract decodes");
+
+    let mut drifted: Value = serde_json::from_slice(&numeric).expect("event JSON");
+    *drifted
+        .pointer_mut("/properties/timestamp")
+        .expect("timestamp exists") = Value::String("1.5".to_owned());
+    let drifted = serde_json::to_vec(&drifted).expect("drifted event JSON");
+    assert!(reducer.decode_event(&drifted).is_err());
+}
+
+#[test]
+fn required_surface_explicitly_owns_stream_hygiene_types() {
+    let surface = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../schemas/required-surface.toml"),
+    )
+    .expect("required surface");
+    assert!(surface.contains("id = \"opencode.type.EventPluginAdded\""));
+    assert!(surface.contains("id = \"opencode.type.EventSessionNextPromptAdmitted\""));
+}
+
+#[test]
+fn real_message_parent_and_part_updates_keep_turn_and_sequence_stable() -> Result<(), String> {
+    let mut reducer = reducer();
+    let mut content = MemoryContent::default();
+    let mut user_turn = None;
+    let mut assistant_turn = None;
+    let mut reasoning_sequences = Vec::new();
+    let mut saw_user_body = false;
+    let mut idle_cleared_active = false;
+
+    for line in elicitation_fixture().lines() {
+        let envelope: Value = serde_json::from_str(line).expect("fixture JSON");
+        if envelope.get("transport").and_then(Value::as_str) != Some("sse") {
+            continue;
+        }
+        let payload = envelope.get("payload").expect("fixture payload");
+        let event_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+        let role = payload
+            .pointer("/properties/info/role")
+            .and_then(Value::as_str);
+        let part_id = payload
+            .pointer("/properties/part/id")
+            .and_then(Value::as_str);
+        let bytes = serde_json::to_vec(payload).expect("payload JSON");
+        let (_, effects) = reducer
+            .reduce_sse_event(&bytes, None, BASE_AT_MS, &mut content)
+            .map_err(|error| format!("recorded event must reduce: {error}"))?;
+        for effect in effects {
+            match effect {
+                StateEffect::TurnUpserted { turn } if event_type == "message.updated" => {
+                    if role == Some("user") {
+                        user_turn = Some(turn.id);
+                    } else if role == Some("assistant") && assistant_turn.is_none() {
+                        assistant_turn = Some(turn.id);
+                    }
+                }
+                StateEffect::ItemUpserted { item } => {
+                    saw_user_body |= matches!(&item.body, ItemBody::UserMessage { .. });
+                    if part_id == Some("prt_feb17022a001if1fiR40i6oOzW") {
+                        reasoning_sequences.push(item.sequence);
+                    }
+                }
+                StateEffect::SessionUpserted { session }
+                    if event_type == "session.status"
+                        && payload
+                            .pointer("/properties/status/type")
+                            .and_then(Value::as_str)
+                            == Some("idle") =>
+                {
+                    idle_cleared_active = session.active_turn_id.is_none();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    assert_eq!(user_turn, assistant_turn);
+    assert!(saw_user_body);
+    assert!(reasoning_sequences.len() >= 2);
+    assert!(reasoning_sequences
+        .windows(2)
+        .all(|pair| pair.first() == pair.last()));
+    assert!(idle_cleared_active);
+    Ok(())
 }
 
 #[test]

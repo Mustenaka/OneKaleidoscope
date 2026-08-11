@@ -140,9 +140,13 @@ The schema-diff exit-code contract is:
 | `2` | A required tool does not exist or cannot be executed; version mismatch is not this condition |
 
 Object key order and whitespace do not count as drift. Added, removed, or
-changed values are reported as escaped JSON paths. When an observed version is
-new, its required-surface digests are appended once to
+changed values are reported as escaped JSON paths. When an observed version or
+reviewed required-surface entry set is new, its digests are appended once to
 `schemas/surface-history.jsonl`; full snapshots are not retained per version.
+The same public version may therefore have multiple ordered observations only
+when the declared entry set changed. The same version and same entry set
+producing different digests remains a hard conflict, so a mutable upstream
+publication cannot be hidden by surface expansion.
 
 Inspect one required-surface entry across observed versions with:
 
@@ -214,17 +218,12 @@ schemas/opencode/openapi.json (read-only OpenAPI 3.1)
   -> build-directory Rust generation
 ```
 
-The `1.18.16` source document currently exercises exactly one normalization
-rule:
-
-| Rule | Before | After | Hits |
-|---|---|---|---:|
-| `numeric_exclusive_minimum_to_bound` | numeric `exclusiveMinimum: n` | `minimum: n` and `exclusiveMinimum: true` | 25 |
-
-This is the draft-07 spelling of the same strict lower bound; it neither drops
-fields nor widens the constraint. The unit test asserts the before/after shape,
-and the real-snapshot test asserts the exact hit count. The generated closure
-currently contains 117 schemas. `EventPluginAdded` and
+The `1.18.16` source document currently needs no normalization rule. An earlier
+R5 implementation rewrote numeric `exclusiveMinimum`, but numeric form is
+already the valid OpenAPI 3.1 / JSON Schema draft-07 spelling; converting it to
+the old boolean spelling was not mechanically equivalent. That rule and the
+OpenAPI 3.0 parser that could not model the 3.1 schema were removed. The
+generated closure currently contains 125 schemas. `EventPluginAdded` and
 `EventSessionNextPromptAdmitted` are generated specifically so real stream
 hygiene remains checked by upstream types. No zero-hit rule is retained. Normalized and
 generated files are build artifacts and are not committed.

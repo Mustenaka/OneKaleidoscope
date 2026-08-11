@@ -1,10 +1,15 @@
+use std::{
+    sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
+    time::Instant,
+};
+
 use kaleido_adapter::{
     capability::CapabilityProbe,
     content::ContentAccess,
     session::{ProviderRuntimeSession, RuntimeSessionError, SessionStartRequest},
 };
 use kaleido_proto::{
-    attention::{AttentionResponse, AttentionSubject},
+    attention::{AttentionAnswerSource, AttentionResponse, AttentionState, AttentionSubject},
     capability::{Capability, CapabilityUnavailableReason},
     command::RuntimeAcceptanceKind,
     content::ContentRef,
@@ -38,10 +43,60 @@ pub struct ReconnectOutcome {
 }
 
 #[derive(Debug)]
+struct SseEventReceiver {
+    events: Receiver<Result<Option<SseEvent>, OpenCodeAdapterError>>,
+    _reader: std::thread::JoinHandle<()>,
+}
+
+impl SseEventReceiver {
+    fn spawn(mut stream: SseStream) -> Result<Self, OpenCodeAdapterError> {
+        let (sender, events) = mpsc::channel();
+        let reader = std::thread::Builder::new()
+            .name("kaleido-opencode-sse".to_owned())
+            .spawn(move || loop {
+                let event = stream.next_event();
+                let terminal = !matches!(&event, Ok(Some(_)));
+                if sender.send(event).is_err() || terminal {
+                    break;
+                }
+            })
+            .map_err(|error| OpenCodeAdapterError::Transport(error.to_string()))?;
+        Ok(Self {
+            events,
+            _reader: reader,
+        })
+    }
+
+    fn try_next_event(&self) -> Result<Option<SseEvent>, OpenCodeAdapterError> {
+        match self.events.try_recv() {
+            Ok(Ok(Some(event))) => Ok(Some(event)),
+            Ok(Ok(None)) | Err(TryRecvError::Disconnected) => {
+                Err(OpenCodeAdapterError::SseDisconnected)
+            }
+            Ok(Err(error)) => Err(error),
+            Err(TryRecvError::Empty) => Ok(None),
+        }
+    }
+
+    fn next_event_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<SseEvent, OpenCodeAdapterError> {
+        match self.events.recv_timeout(timeout) {
+            Ok(Ok(Some(event))) => Ok(event),
+            Ok(Ok(None)) | Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => {
+                Err(OpenCodeAdapterError::SseDisconnected)
+            }
+            Ok(Err(error)) => Err(error),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct OpenCodeRuntimeSession {
     client: OpenCodeClient,
     reducer: OpenCodeReducer,
-    stream: Option<SseStream>,
+    stream: Option<SseEventReceiver>,
     connected: bool,
     started_at_ms: i64,
     session_raw: Option<String>,
@@ -50,6 +105,11 @@ pub struct OpenCodeRuntimeSession {
 
 impl OpenCodeRuntimeSession {
     pub fn new(config: OpenCodeRuntimeConfig) -> Result<Self, OpenCodeAdapterError> {
+        if config.client.project_directory.as_deref()
+            != Some(config.reducer.project_directory.as_str())
+        {
+            return Err(crate::error::OpenCodeDecodeError::ScopeMismatch.into());
+        }
         Ok(Self {
             client: OpenCodeClient::new(config.client)?,
             reducer: OpenCodeReducer::new(config.reducer),
@@ -117,6 +177,7 @@ impl OpenCodeRuntimeSession {
         at_ms: i64,
         content: &mut dyn ContentAccess,
     ) -> Result<Vec<StateEffect>, OpenCodeAdapterError> {
+        let _ = self.client.get_project_current()?;
         let sessions = self.client.list_sessions()?;
         let mut messages = Vec::new();
         for session in &sessions {
@@ -140,6 +201,7 @@ impl OpenCodeRuntimeSession {
         at_ms: i64,
         content: &mut dyn ContentAccess,
     ) -> Result<ReconnectOutcome, OpenCodeAdapterError> {
+        let _ = self.client.get_project_current()?;
         let session = self.client.get_session(session_raw)?;
         let messages = self.client.get_messages(session_raw)?;
         let effects = self
@@ -151,7 +213,7 @@ impl OpenCodeRuntimeSession {
                 content,
             )
             .map_err(|error| protocol_error(&error.to_string()))?;
-        self.stream = Some(self.client.subscribe()?);
+        self.stream = Some(SseEventReceiver::spawn(self.client.subscribe()?)?);
         self.connected = true;
         self.session_raw = Some(session_raw.to_owned());
         Ok(ReconnectOutcome {
@@ -219,6 +281,129 @@ impl OpenCodeRuntimeSession {
             Err(RuntimeSessionError::NotConnected)
         }
     }
+
+    fn wait_for_attention_confirmation(
+        &mut self,
+        command_id: &CommandId,
+        attention_id: &kaleido_proto::ids::AttentionId,
+        raw_session: &str,
+        raw_request: &str,
+        expected: &ExpectedAttentionConfirmation,
+        content: &mut dyn ContentAccess,
+    ) -> Result<Vec<StateEffect>, RuntimeSessionError> {
+        const MAX_EVENTS_BEFORE_UNCONFIRMED: usize = 256;
+
+        let mut accumulated = Vec::new();
+        let started = Instant::now();
+        for _ in 0..MAX_EVENTS_BEFORE_UNCONFIRMED {
+            let remaining = self
+                .client
+                .config()
+                .request_timeout
+                .checked_sub(started.elapsed())
+                .ok_or(RuntimeSessionError::ConnectionFault {
+                    reason: ConnectionFaultReason::TransportError,
+                })?;
+            let event = self
+                .stream
+                .as_mut()
+                .ok_or(RuntimeSessionError::NotConnected)?
+                .next_event_timeout(remaining)
+                .map_err(to_runtime_error)?;
+            let (event_type, properties) =
+                self.reducer.decode_event(&event.data).map_err(|error| {
+                    RuntimeSessionError::ProtocolViolation {
+                        detail: error.to_string(),
+                    }
+                })?;
+            let matching = expected
+                .matches(&event_type, &properties, raw_session, raw_request)
+                .map_err(|detail| RuntimeSessionError::ProtocolViolation { detail })?;
+            let effects = self
+                .ingest_sse(event, now_ms(), content)
+                .map_err(to_runtime_error)?;
+            if matching {
+                if !effects.iter().any(|effect| {
+                    matches!(
+                        effect,
+                        StateEffect::AttentionUpserted { item }
+                            if &item.id == attention_id
+                                && matches!(
+                                    &item.state,
+                                    AttentionState::Answered {
+                                        answer_source: AttentionAnswerSource::LocalCommand {
+                                            command_id: observed,
+                                        },
+                                        ..
+                                    } if observed == command_id
+                                )
+                    )
+                }) {
+                    return Err(RuntimeSessionError::ProtocolViolation {
+                        detail: "OpenCode attention receipt did not confirm the local command"
+                            .to_owned(),
+                    });
+                }
+                accumulated.extend(effects);
+                return Ok(accumulated);
+            }
+            accumulated.extend(effects);
+        }
+        Err(RuntimeSessionError::ProtocolViolation {
+            detail: "OpenCode HTTP reply had no matching structured SSE confirmation".to_owned(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ExpectedAttentionConfirmation {
+    Permission { reply: String },
+    Question { answers: serde_json::Value },
+}
+
+impl ExpectedAttentionConfirmation {
+    fn matches(
+        &self,
+        event_type: &str,
+        properties: &serde_json::Value,
+        raw_session: &str,
+        raw_request: &str,
+    ) -> Result<bool, String> {
+        let object = properties
+            .as_object()
+            .ok_or_else(|| "OpenCode attention receipt properties are not an object".to_owned())?;
+        let is_answer = matches!(
+            event_type,
+            "permission.replied"
+                | "permission.v2.replied"
+                | "question.replied"
+                | "question.v2.replied"
+                | "question.rejected"
+                | "question.v2.rejected"
+        );
+        if !is_answer
+            || object.get("sessionID").and_then(serde_json::Value::as_str) != Some(raw_session)
+            || object.get("requestID").and_then(serde_json::Value::as_str) != Some(raw_request)
+        {
+            return Ok(false);
+        }
+        let exact = match self {
+            Self::Permission { reply } => {
+                matches!(event_type, "permission.replied" | "permission.v2.replied")
+                    && object.get("reply").and_then(serde_json::Value::as_str)
+                        == Some(reply.as_str())
+            }
+            Self::Question { answers } => {
+                matches!(event_type, "question.replied" | "question.v2.replied")
+                    && object.get("answers") == Some(answers)
+            }
+        };
+        if exact {
+            Ok(true)
+        } else {
+            Err("OpenCode returned a mismatched attention receipt".to_owned())
+        }
+    }
 }
 
 impl ProviderRuntimeSession for OpenCodeRuntimeSession {
@@ -251,6 +436,9 @@ impl ProviderRuntimeSession for OpenCodeRuntimeSession {
             });
         }
         self.started_at_ms = now_ms();
+        self.client
+            .get_project_current()
+            .map_err(to_runtime_error)?;
         let session = self.client.create_session(None).map_err(to_runtime_error)?;
         let raw_id = session
             .get("id")
@@ -274,7 +462,10 @@ impl ProviderRuntimeSession for OpenCodeRuntimeSession {
             .map_err(|error| RuntimeSessionError::ProtocolViolation {
                 detail: error.to_string(),
             })?;
-        self.stream = Some(self.client.subscribe().map_err(to_runtime_error)?);
+        self.stream = Some(
+            SseEventReceiver::spawn(self.client.subscribe().map_err(to_runtime_error)?)
+                .map_err(to_runtime_error)?,
+        );
         self.session_raw = Some(raw_id);
         self.connected = true;
         Ok(effects)
@@ -376,7 +567,7 @@ impl ProviderRuntimeSession for OpenCodeRuntimeSession {
             self.reducer.forget_local_attention_answer(&raw_request);
             return Err(RuntimeSessionError::CapabilityUnavailable);
         }
-        let result = if question {
+        let expected = if question {
             let attention = self
                 .reducer
                 .attention(&response.attention_id)
@@ -425,9 +616,13 @@ impl ProviderRuntimeSession for OpenCodeRuntimeSession {
                     return Err(error);
                 }
             };
+            let expected = ExpectedAttentionConfirmation::Question {
+                answers: serde_json::json!(answers),
+            };
             self.client
                 .reply_question(&raw_session, &raw_request, answers)
-                .map_err(to_runtime_error)
+                .map_err(to_runtime_error)?;
+            expected
         } else {
             let option = response
                 .option_id
@@ -452,15 +647,24 @@ impl ProviderRuntimeSession for OpenCodeRuntimeSession {
                     .reply_permission_v2(&raw_session, &raw_request, reply)
                     .map_err(to_runtime_error),
                 Err(error) => Err(to_runtime_error(error)),
+            }?;
+            ExpectedAttentionConfirmation::Permission {
+                reply: reply.as_wire().to_owned(),
             }
         };
-        if let Err(error) = result {
+        let confirmation = self.wait_for_attention_confirmation(
+            command_id,
+            &response.attention_id,
+            &raw_session,
+            &raw_request,
+            &expected,
+            content,
+        );
+        if let Err(error) = confirmation {
             self.reducer.forget_local_attention_answer(&raw_request);
             return Err(error);
         }
-        Ok(vec![StateEffect::CapabilitiesUpdated {
-            capabilities: self.reducer.capability_probe().to_capabilities(),
-        }])
+        confirmation
     }
 
     fn discover(
@@ -630,13 +834,11 @@ impl ProviderRuntimeSession for OpenCodeRuntimeSession {
         self.require_connected()?;
         let stream = self
             .stream
-            .as_mut()
+            .as_ref()
             .ok_or(RuntimeSessionError::NotConnected)?;
-        let event = stream.next_event().map_err(to_runtime_error)?.ok_or(
-            RuntimeSessionError::ConnectionFault {
-                reason: ConnectionFaultReason::TransportError,
-            },
-        )?;
+        let Some(event) = stream.try_next_event().map_err(to_runtime_error)? else {
+            return Ok(Vec::new());
+        };
         self.ingest_sse(event, now_ms(), content)
             .map_err(to_runtime_error)
     }
@@ -686,4 +888,104 @@ fn now_ms() -> i64 {
         .ok()
         .and_then(|duration| i64::try_from(duration.as_millis()).ok())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use std::sync::{Arc, Barrier};
+
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn attention_confirmation_requires_exact_scope_and_payload() {
+        let permission = ExpectedAttentionConfirmation::Permission {
+            reply: "once".to_owned(),
+        };
+        assert!(permission
+            .matches(
+                "permission.replied",
+                &json!({
+                    "sessionID": "ses_exact",
+                    "requestID": "per_exact",
+                    "reply": "once"
+                }),
+                "ses_exact",
+                "per_exact"
+            )
+            .expect("matching receipt"));
+        assert!(!permission
+            .matches(
+                "permission.replied",
+                &json!({
+                    "sessionID": "ses_other",
+                    "requestID": "per_exact",
+                    "reply": "once"
+                }),
+                "ses_exact",
+                "per_exact"
+            )
+            .expect("other scope is unrelated"));
+        assert!(permission
+            .matches(
+                "permission.replied",
+                &json!({
+                    "sessionID": "ses_exact",
+                    "requestID": "per_exact",
+                    "reply": "reject"
+                }),
+                "ses_exact",
+                "per_exact"
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn question_confirmation_requires_every_answer() {
+        let question = ExpectedAttentionConfirmation::Question {
+            answers: json!([["Red"], ["details"]]),
+        };
+        assert!(question
+            .matches(
+                "question.v2.replied",
+                &json!({
+                    "sessionID": "ses_exact",
+                    "requestID": "que_exact",
+                    "answers": [["Red"], ["details"]]
+                }),
+                "ses_exact",
+                "que_exact"
+            )
+            .expect("matching question receipt"));
+        assert!(question
+            .matches(
+                "question.v2.replied",
+                &json!({
+                    "sessionID": "ses_exact",
+                    "requestID": "que_exact",
+                    "answers": [["Red"]]
+                }),
+                "ses_exact",
+                "que_exact"
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn idle_sse_receiver_does_not_block_command_dispatch() {
+        let (sender, events) = mpsc::channel();
+        let gate = Arc::new(Barrier::new(2));
+        let reader_gate = Arc::clone(&gate);
+        let reader = std::thread::spawn(move || {
+            reader_gate.wait();
+            drop(sender);
+        });
+        let receiver = SseEventReceiver {
+            events,
+            _reader: reader,
+        };
+        assert!(matches!(receiver.try_next_event(), Ok(None)));
+        gate.wait();
+    }
 }

@@ -7,6 +7,7 @@ use reqwest::{
     blocking::{Client, Response},
     header::{ACCEPT, CONTENT_TYPE},
 };
+use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
 
 use crate::error::{OpenCodeAdapterError, OpenCodeDecodeError};
@@ -50,6 +51,7 @@ impl OpenCodeClient {
     pub fn list_sessions(&self) -> Result<Vec<Value>, OpenCodeAdapterError> {
         let response = self.get("/session")?;
         let value: Value = response.json()?;
+        validate_generated::<crate::wire::SessionListResponse>(&value)?;
         let sessions = value
             .as_array()
             .ok_or(OpenCodeDecodeError::UnsupportedShape)?;
@@ -69,6 +71,7 @@ impl OpenCodeClient {
     pub fn get_messages(&self, session_id: &str) -> Result<Vec<Value>, OpenCodeAdapterError> {
         let response = self.get(&format!("/session/{}/message", path_segment(session_id)?))?;
         let value: Value = response.json()?;
+        validate_generated::<crate::wire::SessionMessagesResponse>(&value)?;
         let messages = value
             .as_array()
             .ok_or(OpenCodeDecodeError::UnsupportedShape)?;
@@ -81,7 +84,9 @@ impl OpenCodeClient {
 
     pub fn get_project_current(&self) -> Result<Value, OpenCodeAdapterError> {
         let response = self.get("/project/current")?;
-        Ok(response.json()?)
+        let value: Value = response.json()?;
+        validate_project_scope(&value, self.config.project_directory.as_deref())?;
+        Ok(value)
     }
 
     pub fn create_session(&self, title: Option<&str>) -> Result<Value, OpenCodeAdapterError> {
@@ -89,7 +94,8 @@ impl OpenCodeClient {
         if let Some(title) = title {
             body.insert("title".to_owned(), Value::String(title.to_owned()));
         }
-        let response = self.post_json("/session", Value::Object(body))?;
+        let body = generated_body::<crate::wire::CreateSessionRequest>(Value::Object(body))?;
+        let response = self.post_json("/session", body)?;
         let value = response.json()?;
         validate_session_value(value)
     }
@@ -99,17 +105,21 @@ impl OpenCodeClient {
         let body = json!({
             "parts": [{"type": "text", "text": text}],
         });
+        let body = generated_body::<crate::wire::PromptRequest>(body)?;
         let response = self.post_json(
             &format!("/session/{}/message", path_segment(session_id)?),
             body,
         )?;
-        Ok(response.json()?)
+        let value = response.json()?;
+        validate_generated::<crate::wire::PromptResponse>(&value)?;
+        Ok(value)
     }
 
     pub fn prompt_async(&self, session_id: &str, text: &str) -> Result<(), OpenCodeAdapterError> {
         let body = json!({
             "parts": [{"type": "text", "text": text}],
         });
+        let body = generated_body::<crate::wire::PromptAsyncRequest>(body)?;
         let response = self.post_json(
             &format!("/session/{}/prompt_async", path_segment(session_id)?),
             body,
@@ -127,12 +137,10 @@ impl OpenCodeClient {
         text: &str,
         delivery: PromptDelivery,
     ) -> Result<PromptAdmission, OpenCodeAdapterError> {
-        let body = json!({
+        let body = generated_body::<crate::wire::SessionPromptV2Request>(json!({
             "prompt": {"text": text},
             "delivery": delivery.as_wire(),
-        });
-        serde_json::from_value::<crate::wire::SessionPromptV2Request>(body.clone())
-            .map_err(OpenCodeDecodeError::MalformedJson)?;
+        }))?;
         let response = self.post_json(
             &format!("/api/session/{}/prompt", path_segment(session_id)?),
             body,
@@ -145,8 +153,7 @@ impl OpenCodeClient {
 
     pub fn abort(&self, session_id: &str) -> Result<(), OpenCodeAdapterError> {
         let response = self.post_empty(&format!("/session/{}/abort", path_segment(session_id)?))?;
-        let _ = response;
-        Ok(())
+        require_true_response::<crate::wire::AbortSessionResponse>(response)
     }
 
     pub fn reply_permission(
@@ -155,15 +162,16 @@ impl OpenCodeClient {
         request_id: &str,
         reply: PermissionReply,
     ) -> Result<(), OpenCodeAdapterError> {
-        let body = json!({"response": reply.as_wire()});
+        let body = generated_body::<crate::wire::SessionPermissionReplyRequest>(
+            json!({"response": reply.as_wire()}),
+        )?;
         let path = format!(
             "/session/{}/permissions/{}/",
             path_segment(session_id)?,
             path_segment(request_id)?
         );
         let response = self.post_json(path.trim_end_matches('/'), body)?;
-        let _ = response;
-        Ok(())
+        require_true_response::<crate::wire::SessionPermissionReplyResponse>(response)
     }
 
     pub fn reply_permission_legacy(
@@ -171,7 +179,9 @@ impl OpenCodeClient {
         request_id: &str,
         reply: PermissionReply,
     ) -> Result<(), OpenCodeAdapterError> {
-        let body = json!({"reply": reply.as_wire()});
+        let body = generated_body::<crate::wire::PermissionReplyRequest>(
+            json!({"reply": reply.as_wire()}),
+        )?;
         let response = self.post_json(
             &format!("/permission/{}/reply", path_segment(request_id)?),
             body,
@@ -186,7 +196,9 @@ impl OpenCodeClient {
         request_id: &str,
         reply: PermissionReply,
     ) -> Result<(), OpenCodeAdapterError> {
-        let body = json!({"reply": reply.as_wire()});
+        let body = generated_body::<crate::wire::PermissionV2ReplyRequest>(
+            json!({"reply": reply.as_wire()}),
+        )?;
         let response = self.post_json(
             &format!(
                 "/api/session/{}/permission/{}/reply",
@@ -205,7 +217,8 @@ impl OpenCodeClient {
         request_id: &str,
         answers: Vec<Vec<String>>,
     ) -> Result<(), OpenCodeAdapterError> {
-        let body = json!({"answers": answers});
+        let body =
+            generated_body::<crate::wire::QuestionV2ReplyRequest>(json!({"answers": answers}))?;
         let response = self.post_json(
             &format!(
                 "/api/session/{}/question/{}/reply",
@@ -356,13 +369,66 @@ fn decode_prompt_admission(
 }
 
 impl PermissionReply {
-    fn as_wire(self) -> &'static str {
+    pub(crate) fn as_wire(self) -> &'static str {
         match self {
             Self::Once => "once",
             Self::Always => "always",
             Self::Reject => "reject",
         }
     }
+}
+
+fn generated_body<T>(value: Value) -> Result<Value, OpenCodeAdapterError>
+where
+    T: DeserializeOwned + Serialize,
+{
+    let typed = serde_json::from_value::<T>(value).map_err(OpenCodeDecodeError::MalformedJson)?;
+    serde_json::to_value(typed)
+        .map_err(OpenCodeDecodeError::MalformedJson)
+        .map_err(Into::into)
+}
+
+fn validate_generated<T>(value: &Value) -> Result<(), OpenCodeAdapterError>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_value::<T>(value.clone())
+        .map(|_| ())
+        .map_err(OpenCodeDecodeError::MalformedJson)
+        .map_err(Into::into)
+}
+
+fn require_true_response<T>(response: Response) -> Result<(), OpenCodeAdapterError>
+where
+    T: DeserializeOwned,
+{
+    let value: Value = response.json()?;
+    require_true_value::<T>(&value)
+}
+
+fn require_true_value<T>(value: &Value) -> Result<(), OpenCodeAdapterError>
+where
+    T: DeserializeOwned,
+{
+    validate_generated::<T>(value)?;
+    if value == &Value::Bool(true) {
+        Ok(())
+    } else {
+        Err(OpenCodeDecodeError::AdmissionMismatch("boolean acknowledgement").into())
+    }
+}
+
+fn validate_project_scope(
+    value: &Value,
+    expected_directory: Option<&str>,
+) -> Result<(), OpenCodeAdapterError> {
+    validate_generated::<crate::wire::ProjectCurrentResponse>(value)?;
+    if expected_directory
+        .is_some_and(|expected| value.get("worktree").and_then(Value::as_str) != Some(expected))
+    {
+        return Err(OpenCodeDecodeError::ScopeMismatch.into());
+    }
+    Ok(())
 }
 
 fn checked(response: Response) -> Result<Response, OpenCodeAdapterError> {
@@ -446,6 +512,50 @@ mod tests {
         assert_eq!(admission.session_id, "ses_123");
         assert_eq!(admission.prompt, "hello");
         assert_eq!(admission.delivery, PromptDelivery::Queue);
+    }
+
+    #[test]
+    fn generated_rest_requests_reject_out_of_contract_fields() {
+        assert!(generated_body::<crate::wire::CreateSessionRequest>(json!({
+            "title": "valid"
+        }))
+        .is_ok());
+        assert!(generated_body::<crate::wire::CreateSessionRequest>(json!({
+            "invented": true
+        }))
+        .is_err());
+        assert!(generated_body::<crate::wire::PromptRequest>(json!({
+            "parts": [{"type": "text", "text": "hello"}]
+        }))
+        .is_ok());
+        assert!(generated_body::<crate::wire::PromptRequest>(json!({
+            "parts": [{"type": "text"}]
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn abort_requires_a_generated_true_acknowledgement() {
+        assert!(require_true_value::<crate::wire::AbortSessionResponse>(&json!(true)).is_ok());
+        assert!(require_true_value::<crate::wire::AbortSessionResponse>(&json!(false)).is_err());
+        assert!(require_true_value::<crate::wire::AbortSessionResponse>(&json!({})).is_err());
+    }
+
+    #[test]
+    fn generated_project_response_must_match_the_scoped_directory() {
+        let project = json!({
+            "id": "project",
+            "worktree": "C:/scoped",
+            "time": {"created": 1, "updated": 2},
+            "sandboxes": []
+        });
+        assert!(validate_project_scope(&project, Some("C:/scoped")).is_ok());
+        assert!(matches!(
+            validate_project_scope(&project, Some("C:/other")),
+            Err(OpenCodeAdapterError::Decode(
+                OpenCodeDecodeError::ScopeMismatch
+            ))
+        ));
     }
 }
 

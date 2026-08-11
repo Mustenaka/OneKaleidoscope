@@ -711,7 +711,7 @@ id = "opencode.method.session-create"
 tool = "opencode"
 kind = "method"
 name = "POST /session"
-reason = "Required to create a Broker-managed OpenCode session."
+reason = "Required to create a session in the selected shared OpenCode runtime; this does not imply ownership of the server process."
 
 [[entries]]
 id = "opencode.method.session-prompt-async"
@@ -781,7 +781,7 @@ id = "opencode.method.project-current"
 tool = "opencode"
 kind = "method"
 name = "GET /project/current"
-reason = "Required to prove the active OpenCode project root is the protected fixture sandbox."
+reason = "Required to prove the active OpenCode project root matches the configured canonical project binding."
 
 # OpenCode core, permission, and question schema types
 
@@ -826,6 +826,20 @@ tool = "opencode"
 kind = "type"
 name = "EventServerConnected"
 reason = "Required to validate the live structured SSE subscription handshake."
+
+[[entries]]
+id = "opencode.type.EventPluginAdded"
+tool = "opencode"
+kind = "type"
+name = "EventPluginAdded"
+reason = "Required to fail closed on the plugin-added event emitted before session traffic instead of bypassing generated SSE validation."
+
+[[entries]]
+id = "opencode.type.EventSessionNextPromptAdmitted"
+tool = "opencode"
+kind = "type"
+name = "EventSessionNextPromptAdmitted"
+reason = "Required to validate the structured prompt-admission event, including its timestamp contract, before live capability evidence is accepted."
 
 [[entries]]
 id = "opencode.type.EventSessionCreated"

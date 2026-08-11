@@ -34,14 +34,11 @@ SSE，也不能证明 snapshot 与新 tail 之间绝对没有事件窗口。
 ```
 
 规范化产物与生成物只写构建目录，不提交，也不穿透到 canonical、UniFFI 或移动端。
-当前 `1.18.16` 全文实际命中的规则只有：
-
-| 规则 | 机械等价变换 | 实际命中 |
-|---|---|---:|
-| `numeric_exclusive_minimum_to_bound` | 数值 `exclusiveMinimum: n` 改写为 draft-07 的 `minimum: n` + `exclusiveMinimum: true` | 25 |
-
-规则不删除字段、不放宽约束、不猜 provider 语义。构建报告还必须打印生成闭包规模；当前为
-117 schemas。零命中规则不得保留，规则超过 10 条必须重新评估生成器。
+当前 `1.18.16` 全文不需要规范化改写。审计删除了旧的
+`numeric_exclusive_minimum_to_bound`：数值 `exclusiveMinimum` 本来就是 OpenAPI 3.1 / JSON
+Schema draft-07 的合法严格下界，把它改写成 boolean 形式反而会降回旧 draft 语义。生成链直接保留
+原约束，并移除了不能正确理解 3.1 schema 的 OpenAPI 3.0 parser。构建报告必须打印生成闭包规模；
+当前为 125 schemas。零命中规则不得保留，规则超过 10 条必须重新评估生成器。
 
 ### D-2 REST 证明 history，SSE 证明 live
 

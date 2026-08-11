@@ -124,6 +124,8 @@ pub struct OpenCodeReducer {
     bindings: BindingStore,
     sessions: BTreeMap<String, Session>,
     turns: BTreeMap<String, Turn>,
+    message_turn_roots: BTreeMap<String, String>,
+    message_roles: BTreeMap<String, String>,
     items: BTreeMap<String, Item>,
     part_text: BTreeMap<String, String>,
     attentions: BTreeMap<String, AttentionItem>,
@@ -155,6 +157,8 @@ impl OpenCodeReducer {
             bindings: BindingStore::default(),
             sessions: BTreeMap::new(),
             turns: BTreeMap::new(),
+            message_turn_roots: BTreeMap::new(),
+            message_roles: BTreeMap::new(),
             items: BTreeMap::new(),
             part_text: BTreeMap::new(),
             attentions: BTreeMap::new(),
@@ -379,8 +383,21 @@ impl OpenCodeReducer {
             .ensure_bootstrapped(at_ms, content)
             .map_err(|_| OpenCodeDecodeError::UnsupportedShape)?;
         self.capabilities.prove(Capability::HistoryList);
-        self.capabilities.prove(Capability::HistoryRead);
-        self.capabilities.prove(Capability::HistoryResume);
+        let complete_message_snapshot = !sessions.is_empty()
+            && sessions.iter().all(|session| {
+                session
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|raw_session| {
+                        messages
+                            .iter()
+                            .any(|(message_session, _)| message_session == raw_session)
+                    })
+            });
+        if complete_message_snapshot {
+            self.capabilities.prove(Capability::HistoryRead);
+            self.capabilities.prove(Capability::HistoryResume);
+        }
         for session in sessions {
             effects.extend(
                 self.reduce_session_value(session, at_ms, content)
@@ -556,6 +573,9 @@ impl OpenCodeReducer {
                     .ok_or(ReduceError::Decode(OpenCodeDecodeError::ScopeMismatch))?;
                 if let Some(session) = self.sessions.get_mut(session_id) {
                     session.status = status;
+                    if status == SessionStatus::Idle {
+                        session.active_turn_id = None;
+                    }
                     session.updated_at_ms = session.updated_at_ms.max(at_ms);
                     effects.push(StateEffect::SessionStatusChanged {
                         session_id: canonical.clone(),
@@ -866,16 +886,36 @@ impl OpenCodeReducer {
         if !self.sessions.contains_key(raw_session) {
             return Err(ReduceError::Decode(OpenCodeDecodeError::ScopeMismatch));
         }
-        let (turn_id, turn_handle, _) =
-            self.bindings
-                .turn(&self.mint, &self.runtime_id, raw_message, &session_id);
         let role = info
             .get("role")
             .and_then(Value::as_str)
             .ok_or(ReduceError::Decode(OpenCodeDecodeError::UnsupportedShape))?;
+        if !matches!(role, "user" | "assistant") {
+            return Err(ReduceError::Decode(OpenCodeDecodeError::UnsupportedShape));
+        }
+        let raw_turn = if role == "user" {
+            raw_message
+        } else {
+            let parent = required_id(info, "parentID", "msg")?;
+            self.message_turn_roots
+                .get(parent)
+                .map(String::as_str)
+                .unwrap_or(parent)
+        };
+        let raw_turn = raw_turn.to_owned();
+        self.message_turn_roots
+            .insert(raw_message.to_owned(), raw_turn.clone());
+        self.message_roles
+            .insert(raw_message.to_owned(), role.to_owned());
+        let (turn_id, turn_handle, bound_session) =
+            self.bindings
+                .turn(&self.mint, &self.runtime_id, &raw_turn, &session_id);
+        if bound_session != session_id {
+            return Err(ReduceError::Decode(OpenCodeDecodeError::ScopeMismatch));
+        }
         let mut item_ids = self
             .turns
-            .get(raw_message)
+            .get(&raw_turn)
             .map_or_else(Vec::new, |turn| turn.item_ids.clone());
         let mut effects = Vec::new();
         if let Some(parts) = object.get("parts").and_then(Value::as_array) {
@@ -901,33 +941,38 @@ impl OpenCodeReducer {
                 effects.push(StateEffect::ItemUpserted { item });
             }
         }
-        let turn = self
-            .turns
-            .entry(raw_message.to_owned())
-            .or_insert_with(|| Turn {
-                id: turn_id.clone(),
-                session_id: session_id.clone(),
-                status: TurnStatus::Running,
-                origin: TurnOrigin::LocalSurface,
-                started_at_ms: Some(at_ms),
-                completed_at_ms: None,
-                item_ids: Vec::new(),
-                error: None,
-                binding_handle: Some(turn_handle.clone()),
-            });
+        let turn = self.turns.entry(raw_turn).or_insert_with(|| Turn {
+            id: turn_id.clone(),
+            session_id: session_id.clone(),
+            status: TurnStatus::Running,
+            origin: TurnOrigin::LocalSurface,
+            started_at_ms: Some(at_ms),
+            completed_at_ms: None,
+            item_ids: Vec::new(),
+            error: None,
+            binding_handle: Some(turn_handle.clone()),
+        });
         turn.item_ids = item_ids;
-        turn.status = if role == "assistant" {
+        let completed = role == "assistant"
+            && info
+                .get("time")
+                .and_then(Value::as_object)
+                .and_then(|time| time.get("completed"))
+                .and_then(Value::as_i64)
+                .is_some();
+        let terminal = completed || turn.status == TurnStatus::Completed;
+        turn.status = if terminal {
             TurnStatus::Completed
         } else {
             TurnStatus::Running
         };
-        if turn.status == TurnStatus::Completed {
+        if completed && turn.completed_at_ms.is_none() {
             turn.completed_at_ms = Some(at_ms);
         }
         effects.insert(0, StateEffect::TurnUpserted { turn: turn.clone() });
         if let Some(session) = self.sessions.get_mut(raw_session) {
-            session.active_turn_id = Some(turn_id);
-            session.status = if role == "assistant" {
+            session.active_turn_id = (!terminal).then_some(turn_id);
+            session.status = if terminal {
                 SessionStatus::Idle
             } else {
                 SessionStatus::Running
@@ -955,20 +1000,42 @@ impl OpenCodeReducer {
         let (session_id, _) = self
             .bindings
             .session(&self.mint, &self.runtime_id, raw_session);
-        let (turn_id, _, _) =
+        let raw_turn = self
+            .message_turn_roots
+            .get(raw_message)
+            .cloned()
+            .ok_or(ReduceError::Decode(OpenCodeDecodeError::ScopeMismatch))?;
+        let role = self
+            .message_roles
+            .get(raw_message)
+            .cloned()
+            .ok_or(ReduceError::Decode(OpenCodeDecodeError::ScopeMismatch))?;
+        let (turn_id, _, bound_session) =
             self.bindings
-                .turn(&self.mint, &self.runtime_id, raw_message, &session_id);
+                .turn(&self.mint, &self.runtime_id, &raw_turn, &session_id);
+        if bound_session != session_id {
+            return Err(ReduceError::Decode(OpenCodeDecodeError::ScopeMismatch));
+        }
         let item = self.make_item_from_part(
             value,
             raw_part,
-            "assistant",
+            &role,
             &session_id,
             &turn_id,
             at_ms,
             content,
         )?;
-        self.items.insert(raw_part.to_owned(), item.clone());
-        Ok(vec![StateEffect::ItemUpserted { item }])
+        let turn = self
+            .turns
+            .get_mut(&raw_turn)
+            .ok_or(ReduceError::Decode(OpenCodeDecodeError::ScopeMismatch))?;
+        if !turn.item_ids.contains(&item.id) {
+            turn.item_ids.push(item.id.clone());
+        }
+        Ok(vec![
+            StateEffect::TurnUpserted { turn: turn.clone() },
+            StateEffect::ItemUpserted { item },
+        ])
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1060,18 +1127,23 @@ impl OpenCodeReducer {
         let binding =
             self.bindings
                 .item(&self.mint, &self.runtime_id, raw_part, session_id, turn_id);
+        let existing = self.items.get(raw_part);
+        let sequence = existing.map_or(self.next_sequence, |item| item.sequence);
+        let created_at_ms = existing.map_or(at_ms, |item| item.created_at_ms);
         let item = Item {
             id: binding.item_id,
             session_id: session_id.clone(),
             turn_id: turn_id.clone(),
-            sequence: self.next_sequence,
+            sequence,
             status,
             body,
-            created_at_ms: at_ms,
+            created_at_ms,
             updated_at_ms: at_ms,
             binding_handle: Some(binding.handle),
         };
-        self.next_sequence = self.next_sequence.saturating_add(1);
+        if existing.is_none() {
+            self.next_sequence = self.next_sequence.saturating_add(1);
+        }
         self.items.insert(raw_part.to_owned(), item.clone());
         Ok(item)
     }

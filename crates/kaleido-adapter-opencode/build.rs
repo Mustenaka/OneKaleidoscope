@@ -7,7 +7,6 @@ use std::{
     path::PathBuf,
 };
 
-use openapiv3::OpenAPI;
 use proc_macro2::TokenStream;
 use quote::quote;
 use schemars::schema::RootSchema;
@@ -80,6 +79,12 @@ const SYNTHETIC_OPERATIONS: &[(&str, &str, &str, &str)] = &[
         "requestBody",
     ),
     (
+        "PromptAsyncRequest",
+        "/session/{sessionID}/prompt_async",
+        "post",
+        "requestBody",
+    ),
+    (
         "PermissionReplyRequest",
         "/permission/{requestID}/reply",
         "post",
@@ -103,14 +108,48 @@ const SYNTHETIC_OPERATIONS: &[(&str, &str, &str, &str)] = &[
         "post",
         "requestBody",
     ),
+    (
+        "QuestionV2ReplyRequest",
+        "/api/session/{sessionID}/question/{requestID}/reply",
+        "post",
+        "requestBody",
+    ),
 ];
 
-const SYNTHETIC_RESPONSES: &[(&str, &str, &str, &str)] = &[(
-    "SessionPromptV2Response",
-    "/api/session/{sessionID}/prompt",
-    "post",
-    "200",
-)];
+const SYNTHETIC_RESPONSES: &[(&str, &str, &str, &str)] = &[
+    ("SessionListResponse", "/session", "get", "200"),
+    (
+        "SessionMessagesResponse",
+        "/session/{sessionID}/message",
+        "get",
+        "200",
+    ),
+    (
+        "PromptResponse",
+        "/session/{sessionID}/message",
+        "post",
+        "200",
+    ),
+    (
+        "SessionPromptV2Response",
+        "/api/session/{sessionID}/prompt",
+        "post",
+        "200",
+    ),
+    (
+        "AbortSessionResponse",
+        "/session/{sessionID}/abort",
+        "post",
+        "200",
+    ),
+    ("ProjectCurrentResponse", "/project/current", "get", "200"),
+    (
+        "SessionPermissionReplyResponse",
+        "/session/{sessionID}/permissions/{permissionID}",
+        "post",
+        "200",
+    ),
+];
 
 fn main() {
     println!("cargo:rerun-if-changed=../../schemas/opencode/openapi.json");
@@ -128,10 +167,6 @@ fn generate() -> Result<(), Box<dyn std::error::Error>> {
     let source: Value = serde_json::from_slice(&fs::read(&schema_path)?)?;
     let (normalized, report) = normalization::normalize_openapi_document(source)?;
 
-    // Parse the normalized document with an OpenAPI 3 parser as a structural
-    // guard.  We still retain the source JSON for extraction because the
-    // OpenAPI crate models 3.0 semantics and intentionally drops extensions.
-    let _: OpenAPI = serde_json::from_value(normalized.clone())?;
     let subset = extract_subset(&normalized)?;
 
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
