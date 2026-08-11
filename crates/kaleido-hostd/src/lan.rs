@@ -354,20 +354,27 @@ impl CodexLanHost {
     /// Durably revokes a paired Android identity before active connections are
     /// notified and closed by the LAN server.
     pub fn revoke_device(&self, device_id: &DeviceId) -> Result<(), CodexLanError> {
-        self.server
-            .as_ref()
-            .ok_or(CodexLanError::Listener)?
-            .revoke_device(device_id, now_ms())
+        let server = self.server.as_ref().ok_or(CodexLanError::Listener)?;
+        server
+            .revoke_device_durable(device_id, now_ms())
             .map_err(|_| CodexLanError::Listener)?;
-        if let Some(remote) = &self.remote_control {
+        let remote_result = if let Some(remote) = &self.remote_control {
             let mut runtime = lock(remote);
-            runtime
+            let queued = runtime
                 .plane
                 .enqueue_revoke_after_local_registry(device_id, now_ms())
-                .map_err(|_| CodexLanError::RemoteControl)?;
-            runtime.flush_pending_revokes()?;
-        }
-        Ok(())
+                .map_err(|_| CodexLanError::RemoteControl);
+            queued.and_then(|()| runtime.flush_pending_revokes())
+        } else {
+            Ok(())
+        };
+        // Normal success reaches this point only after the Ubuntu ack, whose
+        // service handler has already disconnected the outer relay endpoint.
+        // On an unavailable service or outbox persistence error we still close
+        // the inner connection after durably suppressing local authentication;
+        // startup reconciliation repairs any remaining cross-store window.
+        server.disconnect_revoked_device(device_id);
+        remote_result
     }
 
     /// Registers an already LAN-paired DeviceId and returns a short-lived
@@ -517,7 +524,35 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use super::{load_or_create_identity_salt, CodexLanError, IDENTITY_SALT_FILE};
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use kaleido_adapter_codex::CodexSandboxMode;
+
+    use super::{load_or_create_identity_salt, CodexLanConfig, CodexLanError, IDENTITY_SALT_FILE};
+
+    #[test]
+    fn product_runtime_diagnostics_keep_sandbox_specific_without_path_leaks() {
+        let config = CodexLanConfig {
+            executable: PathBuf::from(r"C:\Users\private-user\bin\codex.exe"),
+            project_root: PathBuf::from(r"C:\Users\private-user\secret-project"),
+            data_directory: PathBuf::from(r"C:\Users\private-user\private-data"),
+            bind_address: "127.0.0.1:7443".parse().expect("loopback address"),
+            sandbox: CodexSandboxMode::WorkspaceWrite,
+            request_timeout: Duration::from_secs(10),
+        };
+        let diagnostic = format!("{config:?}");
+        assert!(diagnostic.contains("project_root: \"<SANDBOX>\""));
+        assert!(diagnostic.contains("executable: \"<PATH>\""));
+        for forbidden in [
+            "private-user",
+            "secret-project",
+            "private-data",
+            "127.0.0.1",
+        ] {
+            assert!(!diagnostic.contains(forbidden));
+        }
+    }
 
     #[test]
     fn host_identity_is_owner_only_stable_and_corruption_is_fail_loud() {

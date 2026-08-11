@@ -72,17 +72,23 @@ pub(crate) fn flush(
         RemoteControlClient::connect(&remote.service_endpoint, &remote.service_public_key_pin)
             .map_err(|_| RemotePushError::Unavailable)?;
     let (frame, expected) = request(remote, &pending, issued_at_ms);
-    client
-        .request(&frame, expected)
-        .map_err(|error| match error {
+    if let Err(error) = client.request(&frame, expected) {
+        return match error {
+            kaleido_transport::remote_client::RemoteClientError::Rejected(
+                kaleido_transport::remote::RemoteErrorCode::Replay,
+            ) => {
+                persist_pending(credentials, paired, rotate_operation(&pending))?;
+                Err(RemotePushError::Unavailable)
+            }
             kaleido_transport::remote_client::RemoteClientError::Rejected(_) => {
-                RemotePushError::Rejected
+                Err(RemotePushError::Rejected)
             }
             kaleido_transport::remote_client::RemoteClientError::Contract => {
-                RemotePushError::Contract
+                Err(RemotePushError::Contract)
             }
-            _ => RemotePushError::Unavailable,
-        })?;
+            _ => Err(RemotePushError::Unavailable),
+        };
+    }
 
     let mut committed = paired.clone();
     committed
@@ -99,6 +105,25 @@ pub(crate) fn flush(
         .ok_or(RemotePushError::NotConfigured)?
         .pending_push = None;
     Ok(true)
+}
+
+fn rotate_operation(pending: &PendingPushOperation) -> PendingPushOperation {
+    match pending {
+        PendingPushOperation::Replace {
+            opaque_address,
+            registered_at_ms,
+            expires_at_ms,
+            ..
+        } => PendingPushOperation::Replace {
+            operation_id: generate_remote_id(),
+            opaque_address: opaque_address.clone(),
+            registered_at_ms: *registered_at_ms,
+            expires_at_ms: *expires_at_ms,
+        },
+        PendingPushOperation::Delete { .. } => PendingPushOperation::Delete {
+            operation_id: generate_remote_id(),
+        },
+    }
 }
 
 fn persist_pending(
@@ -169,11 +194,19 @@ fn request(
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+    use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
+    use std::thread;
 
     use kaleido_proto::ids::{DeviceId, HostId};
+    use kaleido_transport::remote::{
+        RemoteControlFrame, RemoteErrorCode, MAX_REMOTE_CONTROL_FRAME_BYTES, REMOTE_CONTROL_VERSION,
+    };
+    use kaleido_transport::remote_client::{read_frame, write_frame};
+    use kaleido_transport::tls::{server_config, TlsIdentityStore};
+    use rustls::{ServerConnection, StreamOwned};
 
-    use super::{queue_delete, queue_replace, RemotePushError};
+    use super::{flush, queue_delete, queue_replace, RemotePushError};
     use crate::credential::{
         CredentialStore, PairedHost, RemoteAccess, SecureCredentialVault,
         SecureCredentialVaultError,
@@ -227,6 +260,84 @@ mod tests {
             Err(RemotePushError::NotConfigured)
         );
         assert!(store.load().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_lost_ack_replay_rotates_the_durable_operation_before_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = TlsIdentityStore::new(directory.path().join("private").join("service.json"))
+            .unwrap()
+            .load_or_generate()
+            .unwrap();
+        let pin = identity.leaf_pin().unwrap().encode();
+        let tls = server_config(identity).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let server = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let connection = ServerConnection::new(tls).unwrap();
+            let mut stream = StreamOwned::new(connection, socket);
+            assert!(matches!(
+                read_frame(&mut stream).unwrap(),
+                RemoteControlFrame::RemoteHello { request_id: 1, .. }
+            ));
+            write_frame(
+                &mut stream,
+                &RemoteControlFrame::RemoteHelloAck {
+                    request_id: 1,
+                    remote_control_version: REMOTE_CONTROL_VERSION.to_owned(),
+                    max_frame_length: u32::try_from(MAX_REMOTE_CONTROL_FRAME_BYTES).unwrap(),
+                },
+                false,
+            )
+            .unwrap();
+            assert!(matches!(
+                read_frame(&mut stream).unwrap(),
+                RemoteControlFrame::DeletePushAddress { request_id: 2, .. }
+            ));
+            write_frame(
+                &mut stream,
+                &RemoteControlFrame::RemoteError {
+                    request_id: Some(2),
+                    code: RemoteErrorCode::Replay,
+                    retriable: false,
+                },
+                false,
+            )
+            .unwrap();
+        });
+
+        let vault = Arc::new(MemoryVault::default());
+        let store = CredentialStore::secure(vault);
+        let mut paired = paired();
+        let remote = paired.remote.as_mut().unwrap();
+        remote.service_endpoint = endpoint;
+        remote.service_public_key_pin = pin;
+        queue_delete(&store, &mut paired).unwrap();
+        let before = pending_operation_id(&paired);
+        assert_eq!(
+            flush(&store, &mut paired, 1),
+            Err(RemotePushError::Unavailable)
+        );
+        let after = pending_operation_id(&paired);
+        assert_ne!(before, after);
+        let reloaded = store.load().unwrap().unwrap();
+        assert_eq!(pending_operation_id(&reloaded), after);
+        server.join().unwrap();
+    }
+
+    fn pending_operation_id(paired: &PairedHost) -> String {
+        match paired
+            .remote
+            .as_ref()
+            .and_then(|remote| remote.pending_push.as_ref())
+            .unwrap()
+        {
+            crate::credential::PendingPushOperation::Replace { operation_id, .. }
+            | crate::credential::PendingPushOperation::Delete { operation_id } => {
+                operation_id.clone()
+            }
+        }
     }
 
     fn paired() -> PairedHost {

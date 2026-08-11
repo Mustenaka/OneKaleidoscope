@@ -362,12 +362,24 @@ impl LanServer {
     /// Persists revocation first; live connections observe the durable marker
     /// and emit `DeviceRevoked` before closing on their next bounded poll.
     pub fn revoke_device(&self, device_id: &DeviceId, at_ms: i64) -> Result<(), LanServerError> {
-        let revoked = Arc::clone(&self.revoked);
-        lock(&self.registry)
-            .revoke_and_then(device_id, at_ms, move |durable_device| {
-                lock(&revoked).insert(durable_device.clone());
-            })
-            .map_err(map_transport)
+        self.revoke_device_durable(device_id, at_ms)?;
+        self.disconnect_revoked_device(device_id);
+        Ok(())
+    }
+
+    pub(crate) fn revoke_device_durable(
+        &self,
+        device_id: &DeviceId,
+        at_ms: i64,
+    ) -> Result<(), LanServerError> {
+        match lock(&self.registry).revoke_and_then(device_id, at_ms, |_| {}) {
+            Ok(()) | Err(TransportError::DeviceRevoked) => Ok(()),
+            Err(error) => Err(map_transport(error)),
+        }
+    }
+
+    pub(crate) fn disconnect_revoked_device(&self, device_id: &DeviceId) {
+        lock(&self.revoked).insert(device_id.clone());
     }
 
     pub(crate) fn revoked_device_ids(&self) -> Vec<DeviceId> {

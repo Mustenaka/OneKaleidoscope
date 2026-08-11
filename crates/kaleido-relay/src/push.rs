@@ -12,6 +12,7 @@ pub const MAX_PUSH_PAYLOAD_BYTES: usize = 256;
 pub const FCM_SCOPE: &str = "https://www.googleapis.com/auth/firebase.messaging";
 const FCM_SEND_URL: &str = "https://fcm.googleapis.com/v1/projects";
 const OPAQUE_HINT_CHARS: usize = 22;
+const MAX_FCM_ERROR_BYTES: usize = 8 * 1_024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PushProvider {
@@ -20,6 +21,7 @@ pub enum PushProvider {
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PushAddress {
     pub provider: PushProvider,
     pub opaque_address: String,
@@ -241,7 +243,7 @@ impl FcmSender {
             .access_token()
             .await
             .map_err(|_| FcmSendError::Credentials)?;
-        let response = self
+        let mut response = self
             .client
             .post(&self.endpoint)
             .bearer_auth(token.token)
@@ -253,8 +255,16 @@ impl FcmSender {
         if status.is_success() {
             return Ok(());
         }
-        let body = response.text().await.unwrap_or_default();
-        Err(classify_response(status, &body))
+        let mut body = Vec::new();
+        while body.len() < MAX_FCM_ERROR_BYTES {
+            let chunk = match response.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) | Err(_) => break,
+            };
+            let remaining = MAX_FCM_ERROR_BYTES.saturating_sub(body.len());
+            body.extend(chunk.iter().copied().take(remaining));
+        }
+        Err(classify_response(status, &String::from_utf8_lossy(&body)))
     }
 }
 

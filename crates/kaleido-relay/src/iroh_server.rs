@@ -58,9 +58,15 @@ impl fmt::Debug for SelfHostedRelayUrl {
 /// iroh's server hook is intentionally the only code here that sees an
 /// EndpointId.  It admits only credentials from the durable route registry and
 /// forwards encrypted packets without interpreting their contents.
+#[derive(Clone)]
 pub struct IrohAccessControl {
     admission: Arc<RelayAdmission>,
-    leases: Arc<Mutex<HashMap<ConnectionId, crate::ConnectionLease>>>,
+    leases: Arc<Mutex<HashMap<ConnectionId, ActiveConnection>>>,
+}
+
+struct ActiveConnection {
+    endpoint_id: iroh_base::EndpointId,
+    lease: crate::ConnectionLease,
 }
 
 impl IrohAccessControl {
@@ -87,10 +93,26 @@ impl IrohAccessControl {
     }
 
     fn clone_for_config(&self) -> Self {
-        Self {
-            admission: Arc::clone(&self.admission),
-            leases: Arc::clone(&self.leases),
-        }
+        self.clone()
+    }
+
+    pub fn endpoints_for_device(
+        &self,
+        route_id: crate::RouteId,
+        slot_id: crate::DeviceSlotId,
+    ) -> Result<Vec<iroh_base::EndpointId>, RemoteErrorCode> {
+        let leases = self.leases.lock().map_err(|_| RemoteErrorCode::Internal)?;
+        Ok(leases
+            .values()
+            .filter_map(|active| {
+                (active.lease.principal()
+                    == Some(crate::AdmissionPrincipal {
+                        route_id,
+                        slot_id: Some(slot_id),
+                    }))
+                .then_some(active.endpoint_id)
+            })
+            .collect())
     }
 }
 
@@ -120,7 +142,10 @@ impl AccessControl for IrohAccessControl {
             Ok(leases) => leases,
             Err(_) => return Access::Deny { reason: None },
         };
-        leases.insert(request.connection_id(), lease);
+        leases.insert(
+            request.connection_id(),
+            ActiveConnection { endpoint_id, lease },
+        );
         Access::Allow
     }
 

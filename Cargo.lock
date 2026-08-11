@@ -2324,6 +2324,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.19",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2403,6 +2404,7 @@ dependencies = [
  "iroh-base",
  "iroh-relay",
  "kaleido-transport",
+ "n0-future",
  "rand_core 0.6.4",
  "reqwest",
  "rustls",

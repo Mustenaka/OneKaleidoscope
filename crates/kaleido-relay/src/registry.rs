@@ -57,12 +57,14 @@ impl fmt::Debug for Registry {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RegistryState {
     routes: BTreeMap<RouteId, RouteRecord>,
-    pushes: BTreeMap<DeviceSlotId, PushAddress>,
+    pushes: BTreeMap<RouteId, BTreeMap<DeviceSlotId, PushAddress>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RouteRecord {
     route_hint: RouteId,
     host_endpoint: HostEndpointId,
@@ -75,6 +77,7 @@ struct RouteRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GrantRecord {
     token_digest: [u8; 32],
 }
@@ -399,7 +402,7 @@ impl Registry {
             } else {
                 return Err(rejected(RemoteErrorCode::Revoked));
             }
-            state.pushes.remove(&slot_id);
+            remove_push(state, route_id, slot_id);
             Ok(())
         })
     }
@@ -430,7 +433,11 @@ impl Registry {
             if !digest_matches(&grant.token_digest, &token_digest(access_token)) {
                 return Err(rejected(RemoteErrorCode::AuthenticationFailed));
             }
-            state.pushes.insert(slot_id, address);
+            state
+                .pushes
+                .entry(route_id)
+                .or_default()
+                .insert(slot_id, address);
             Ok(())
         })
     }
@@ -453,7 +460,7 @@ impl Registry {
             if !digest_matches(&grant.token_digest, &token_digest(access_token)) {
                 return Err(rejected(RemoteErrorCode::RouteUnavailable));
             }
-            state.pushes.remove(&slot_id);
+            remove_push(state, route_id, slot_id);
             Ok(())
         })
     }
@@ -480,7 +487,8 @@ impl Registry {
         }
         Ok(state
             .pushes
-            .get(&slot_id)
+            .get(&route_id)
+            .and_then(|pushes| pushes.get(&slot_id))
             .cloned()
             .map(|address| (address, route.route_hint)))
     }
@@ -498,7 +506,7 @@ impl Registry {
             if !route.grants.contains_key(&slot_id) || route.revoked.contains_key(&slot_id) {
                 return Err(rejected(RemoteErrorCode::RouteUnavailable));
             }
-            state.pushes.remove(&slot_id);
+            remove_push(state, route_id, slot_id);
             Ok(())
         })
     }
@@ -547,6 +555,7 @@ impl Registry {
         let bearer = AccessToken::from_opaque(bearer).ok_or(BearerFailure::Invalid)?;
         let digest = token_digest(&bearer);
         let state = self.state.read().map_err(|_| BearerFailure::Invalid)?;
+        let mut was_revoked = false;
         for (route_id, route) in &state.routes {
             if digest_matches(&route.admin_digest, &digest) {
                 return Ok(BearerIdentity {
@@ -564,15 +573,16 @@ impl Registry {
                     });
                 }
             }
-            if route
+            was_revoked |= route
                 .revoked
                 .values()
-                .any(|revoked| digest_matches(revoked, &digest))
-            {
-                return Err(BearerFailure::Revoked);
-            }
+                .any(|revoked| digest_matches(revoked, &digest));
         }
-        Err(BearerFailure::Invalid)
+        if was_revoked {
+            Err(BearerFailure::Revoked)
+        } else {
+            Err(BearerFailure::Invalid)
+        }
     }
 
     pub(crate) fn authorize_admin(
@@ -639,6 +649,16 @@ impl Registry {
     }
 }
 
+fn remove_push(state: &mut RegistryState, route_id: RouteId, slot_id: DeviceSlotId) {
+    let should_remove_route = state.pushes.get_mut(&route_id).is_some_and(|pushes| {
+        pushes.remove(&slot_id);
+        pushes.is_empty()
+    });
+    if should_remove_route {
+        state.pushes.remove(&route_id);
+    }
+}
+
 fn digest_matches(left: &[u8; 32], right: &[u8; 32]) -> bool {
     bool::from(left.ct_eq(right))
 }
@@ -681,6 +701,26 @@ fn validate_state(state: &RegistryState) -> RemoteResult<()> {
         }
         for grant in route.grants.values() {
             if grant.token_digest == [0_u8; 32] {
+                return Err(rejected(RemoteErrorCode::Internal));
+            }
+        }
+    }
+    for (route_id, pushes) in &state.pushes {
+        let route = state
+            .routes
+            .get(route_id)
+            .ok_or_else(|| rejected(RemoteErrorCode::Internal))?;
+        for (slot_id, address) in pushes {
+            if !route.grants.contains_key(slot_id)
+                || route.revoked.contains_key(slot_id)
+                || PushAddress::fcm_fid(
+                    address.opaque_address.clone(),
+                    address.registered_at_ms,
+                    address.expires_at_ms,
+                )
+                .as_ref()
+                    != Some(address)
+            {
                 return Err(rejected(RemoteErrorCode::Internal));
             }
         }

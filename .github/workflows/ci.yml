@@ -58,6 +58,15 @@ jobs:
           cargo build --locked --release -p kaleido-relay --all-features
           test -x target/release/kaleido-relay
 
+      - name: Run the self-hosted Ubuntu relay integration gate
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p kaleido-relay --all-features \
+            tests::self_hosted_relay_admission_forwards_and_revocation_disconnects \
+            -- --exact
+
       - name: Compile Kotlin UniFFI consumer probe
         if: matrix.os == 'ubuntu-latest'
         shell: bash

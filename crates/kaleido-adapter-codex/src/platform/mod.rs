@@ -8,6 +8,17 @@ mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Default)]
+pub(crate) struct ProcessTree;
+
+#[cfg(target_os = "windows")]
+pub(crate) use windows::ProcessTree;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[derive(Debug, Default)]
+pub(crate) struct ProcessTree;
+
 pub(crate) fn configure(command: &mut Command) {
     #[cfg(target_os = "linux")]
     linux::configure(command);
@@ -19,16 +30,26 @@ pub(crate) fn configure(command: &mut Command) {
     let _ = command;
 }
 
-pub(crate) fn terminate_tree(child: &mut Child) -> io::Result<()> {
+pub(crate) fn attach_tree(child: &Child) -> io::Result<ProcessTree> {
+    #[cfg(target_os = "windows")]
+    return windows::attach_tree(child);
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = child;
+        Ok(ProcessTree)
+    }
+}
+
+pub(crate) fn terminate_tree(tree: &ProcessTree, child: &mut Child) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     return linux::terminate_tree(child);
     #[cfg(target_os = "macos")]
     return macos::terminate_tree(child);
     #[cfg(target_os = "windows")]
-    return windows::terminate_tree(child);
+    return windows::terminate_tree(tree, child);
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
-        let _ = child;
+        let _ = (tree, child);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "process tree termination is unsupported on this platform",
@@ -50,6 +71,7 @@ mod tests {
 
     struct LiveProcessTree {
         root: Child,
+        process_tree: super::ProcessTree,
         descendant_pid: Option<u32>,
         armed: bool,
     }
@@ -63,6 +85,7 @@ mod tests {
                 .stderr(Stdio::null());
             super::configure(&mut command);
             let mut root = command.spawn().expect("spawn process-tree root");
+            let process_tree = super::attach_tree(&root).expect("attach controlled process tree");
             let stdout = root.stdout.take().expect("take process-tree stdout");
             let (sender, receiver) = mpsc::channel();
             thread::spawn(move || {
@@ -74,6 +97,7 @@ mod tests {
             });
             let mut tree = Self {
                 root,
+                process_tree,
                 descendant_pid: None,
                 armed: true,
             };
@@ -125,7 +149,8 @@ mod tests {
             "the descendant must still be running before termination"
         );
 
-        super::terminate_tree(&mut tree.root).expect("terminate the complete process tree");
+        super::terminate_tree(&tree.process_tree, &mut tree.root)
+            .expect("terminate the complete process tree");
 
         assert!(
             tree.root.try_wait().expect("inspect root status").is_some(),

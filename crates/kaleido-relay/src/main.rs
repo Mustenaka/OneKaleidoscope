@@ -20,7 +20,7 @@ use std::thread;
 
 use kaleido_relay::{
     ControlConnection, ControlService, FcmSendError, FcmSender, Registry, RegistryConfig,
-    REMOTE_CONTROL_VERSION,
+    RevokedDevice, REMOTE_CONTROL_VERSION,
 };
 use kaleido_transport::remote::{RemoteControlFrame, RemoteErrorCode};
 use kaleido_transport::remote_client::{read_frame, write_frame};
@@ -32,6 +32,49 @@ use tokio::net::{TcpListener, TcpStream};
 const MAX_CONTROL_CONNECTIONS: usize = 1_024;
 const MAX_CONTROL_CONNECTIONS_PER_SOURCE: usize = 4;
 const MAX_CONTROL_FRAMES_PER_CONNECTION: usize = 16;
+
+#[derive(Default)]
+struct RelayRevoker {
+    #[cfg(feature = "iroh-server")]
+    runtime: Mutex<Option<RelayRevocationRuntime>>,
+}
+
+#[cfg(feature = "iroh-server")]
+struct RelayRevocationRuntime {
+    access: kaleido_relay::IrohAccessControl,
+    clients: iroh_relay::server::clients::Clients,
+}
+
+impl RelayRevoker {
+    #[cfg(feature = "iroh-server")]
+    fn install(
+        &self,
+        access: kaleido_relay::IrohAccessControl,
+        clients: iroh_relay::server::clients::Clients,
+    ) -> Result<(), ()> {
+        let mut runtime = self.runtime.lock().map_err(|_| ())?;
+        *runtime = Some(RelayRevocationRuntime { access, clients });
+        Ok(())
+    }
+
+    fn disconnect_device(&self, revoked: RevokedDevice) {
+        #[cfg(feature = "iroh-server")]
+        if let Ok(runtime) = self.runtime.lock() {
+            if let Some(runtime) = runtime.as_ref() {
+                if let Ok(endpoints) = runtime
+                    .access
+                    .endpoints_for_device(revoked.route_id, revoked.slot_id)
+                {
+                    for endpoint_id in endpoints {
+                        runtime.clients.disconnect(endpoint_id, None);
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "iroh-server"))]
+        let _ = revoked;
+    }
+}
 
 #[derive(Debug, Default)]
 struct ControlAdmission {
@@ -236,10 +279,20 @@ async fn run() -> Result<(), &'static str> {
     let control_listener =
         StdTcpListener::bind(config.control_addr).map_err(|_| "control listener unavailable")?;
     let control = Arc::new(ControlService::new(registry.clone()));
+    let relay_revoker = Arc::new(RelayRevoker::default());
     let runtime = tokio::runtime::Handle::current();
     let admission = Arc::new(ControlAdmission::default());
+    let control_revoker = Arc::clone(&relay_revoker);
     let control_task = tokio::task::spawn_blocking(move || {
-        serve_control(control_listener, tls, control, fcm, runtime, admission)
+        serve_control(
+            control_listener,
+            tls,
+            control,
+            fcm,
+            runtime,
+            admission,
+            control_revoker,
+        )
     });
     let registry = Arc::new(registry);
     let health_listener = TcpListener::bind(config.health_addr)
@@ -251,7 +304,7 @@ async fn run() -> Result<(), &'static str> {
 
     #[cfg(feature = "iroh-server")]
     {
-        run_iroh(config, registry).await?;
+        run_iroh(config, registry, relay_revoker).await?;
         health_task.abort();
         control_task.abort();
         Ok(())
@@ -276,6 +329,7 @@ fn serve_control(
     fcm: Arc<FcmSender>,
     runtime: tokio::runtime::Handle,
     admission: Arc<ControlAdmission>,
+    relay_revoker: Arc<RelayRevoker>,
 ) -> Result<(), &'static str> {
     for accepted in listener.incoming() {
         let socket = accepted.map_err(|_| "control accept failed")?;
@@ -290,6 +344,7 @@ fn serve_control(
         let connection_control = Arc::clone(&control);
         let connection_fcm = Arc::clone(&fcm);
         let connection_runtime = runtime.clone();
+        let connection_revoker = Arc::clone(&relay_revoker);
         thread::Builder::new()
             .name("kaleido-remote-control".to_owned())
             .spawn(move || {
@@ -300,6 +355,7 @@ fn serve_control(
                     connection_fcm,
                     connection_runtime,
                     lease,
+                    connection_revoker,
                 );
             })
             .map_err(|_| "control worker unavailable")?;
@@ -314,6 +370,7 @@ fn handle_control_connection(
     fcm: Arc<FcmSender>,
     runtime: tokio::runtime::Handle,
     _lease: ControlLease,
+    relay_revoker: Arc<RelayRevoker>,
 ) -> Result<(), &'static str> {
     socket
         .set_read_timeout(Some(std::time::Duration::from_secs(10)))
@@ -353,6 +410,12 @@ fn handle_control_connection(
         }
         write_frame(&mut stream, &outcome.response, false)
             .map_err(|_| "control response failed")?;
+        if let Some(revoked) = outcome.revoked_device {
+            relay_revoker.disconnect_device(revoked);
+        }
+        if outcome.close_connection {
+            break;
+        }
     }
     Ok(())
 }
@@ -404,7 +467,11 @@ async fn handle_health(mut stream: TcpStream) -> Result<(), &'static str> {
 }
 
 #[cfg(feature = "iroh-server")]
-async fn run_iroh(config: RuntimeConfig, registry: Arc<Registry>) -> Result<(), &'static str> {
+async fn run_iroh(
+    config: RuntimeConfig,
+    registry: Arc<Registry>,
+    relay_revoker: Arc<RelayRevoker>,
+) -> Result<(), &'static str> {
     use std::num::NonZeroU32;
 
     use iroh_relay::server::{
@@ -434,16 +501,25 @@ async fn run_iroh(config: RuntimeConfig, registry: Arc<Registry>) -> Result<(), 
     client_rate.max_burst_bytes = NonZeroU32::new(262_144);
     limits.client_rx = Some(client_rate);
     relay.limits = limits;
-    relay.access = Arc::new(IrohAccessControl::new(Arc::new(RelayAdmission::new(
+    let access = IrohAccessControl::new(Arc::new(RelayAdmission::new(
         registry,
         AdmissionLimits::default(),
-    ))));
+    )));
+    relay.access = Arc::new(access.clone());
     let mut server_config = ServerConfig::default();
     server_config.relay = Some(relay);
     server_config.quic = Some(QuicConfig::new(config.relay_quic_addr));
     let mut server = Server::spawn(server_config)
         .await
         .map_err(|_| "iroh relay failed to bind")?;
+    let clients = server
+        .relay_service()
+        .ok_or("iroh relay service unavailable")?
+        .clients()
+        .clone();
+    relay_revoker
+        .install(access, clients)
+        .map_err(|()| "iroh relay revocation unavailable")?;
     tokio::select! {
         result = server.join() => {
             let joined = result.map_err(|_| "iroh relay supervisor failed")?;
@@ -459,7 +535,7 @@ async fn run_iroh(config: RuntimeConfig, registry: Arc<Registry>) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used)]
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
@@ -477,5 +553,141 @@ mod tests {
         assert!(admission.acquire(source).is_none());
         leases.pop();
         assert!(admission.acquire(source).is_some());
+    }
+
+    #[cfg(feature = "iroh-server")]
+    #[tokio::test]
+    async fn self_hosted_relay_admission_forwards_and_revocation_disconnects() {
+        use std::net::Ipv4Addr;
+        use std::time::Duration;
+
+        use iroh_base::{RelayUrl, SecretKey};
+        use iroh_relay::client::ClientBuilder;
+        use iroh_relay::protos::relay::{ClientToRelayMsg, Datagrams, RelayToClientMsg};
+        use iroh_relay::server::{RelayConfig, Server, ServerConfig};
+        use iroh_relay::tls::{default_provider, CaTlsConfig};
+        use kaleido_relay::{
+            AdmissionLimits, HostEndpointId, IrohAccessControl, Registry, RelayAdmission,
+            RevokedDevice,
+        };
+        use n0_future::{SinkExt, StreamExt};
+
+        use super::RelayRevoker;
+
+        let registry = Arc::new(Registry::new_ephemeral());
+        let host_secret = SecretKey::generate();
+        let host_endpoint = HostEndpointId::from_bytes(*host_secret.public().as_bytes());
+        let route = registry
+            .create_route(host_endpoint, "https://relay.example.test".to_owned())
+            .unwrap();
+        let grant = registry
+            .grant_device(route.route_id, &route.admin_token)
+            .unwrap();
+        let access = IrohAccessControl::new(Arc::new(RelayAdmission::new(
+            Arc::clone(&registry),
+            AdmissionLimits::default(),
+        )));
+        let mut relay = RelayConfig::new((Ipv4Addr::LOCALHOST, 0));
+        relay.access = Arc::new(access.clone());
+        let mut server_config = ServerConfig::default();
+        server_config.relay = Some(relay);
+        server_config.quic = None;
+        server_config.metrics_addr = None;
+        let server = Server::spawn(server_config).await.unwrap();
+        let relay_url: RelayUrl = format!("http://{}", server.http_addr().unwrap())
+            .parse()
+            .unwrap();
+        let clients = server.relay_service().unwrap().clients().clone();
+        let revoker = RelayRevoker::default();
+        revoker.install(access, clients).unwrap();
+        let client_tls = CaTlsConfig::default()
+            .client_config(default_provider())
+            .unwrap();
+
+        let denied = ClientBuilder::new(
+            relay_url.clone(),
+            SecretKey::generate(),
+            iroh::dns::DnsResolver::new(),
+        )
+        .tls_client_config(client_tls.clone())
+        .auth_token(kaleido_relay::AccessToken::from_bytes([61; 32]).opaque())
+        .connect()
+        .await;
+        assert!(denied.is_err());
+
+        let host_endpoint_id = host_secret.public();
+        let mut host = ClientBuilder::new(
+            relay_url.clone(),
+            host_secret,
+            iroh::dns::DnsResolver::new(),
+        )
+        .tls_client_config(client_tls.clone())
+        .auth_token(route.admin_token.opaque())
+        .connect()
+        .await
+        .unwrap();
+        let device_secret = SecretKey::generate();
+        let device_endpoint_id = device_secret.public();
+        let mut device = ClientBuilder::new(
+            relay_url.clone(),
+            device_secret,
+            iroh::dns::DnsResolver::new(),
+        )
+        .tls_client_config(client_tls.clone())
+        .auth_token(grant.access_token.opaque())
+        .connect()
+        .await
+        .unwrap();
+
+        let opaque = Datagrams::from("opaque-relay-integration-record");
+        device
+            .send(ClientToRelayMsg::Datagrams {
+                dst_endpoint_id: host_endpoint_id,
+                datagrams: opaque.clone(),
+            })
+            .await
+            .unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(2), host.next())
+            .await
+            .expect("relay forwarding timed out")
+            .expect("host relay stream closed")
+            .expect("host relay receive failed");
+        assert!(matches!(
+            received,
+            RelayToClientMsg::Datagrams {
+                remote_endpoint_id,
+                datagrams,
+            } if remote_endpoint_id == device_endpoint_id && datagrams == opaque
+        ));
+
+        registry
+            .revoke_device(route.route_id, &route.admin_token, grant.slot_id)
+            .unwrap();
+        revoker.disconnect_device(RevokedDevice {
+            route_id: route.route_id,
+            slot_id: grant.slot_id,
+        });
+        let disconnected = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match device.next().await {
+                    None | Some(Err(_)) => break,
+                    Some(Ok(_)) => {}
+                }
+            }
+        })
+        .await;
+        assert!(disconnected.is_ok());
+
+        let revoked_reconnect = ClientBuilder::new(
+            relay_url,
+            SecretKey::generate(),
+            iroh::dns::DnsResolver::new(),
+        )
+        .tls_client_config(client_tls)
+        .auth_token(grant.access_token.opaque())
+        .connect()
+        .await;
+        assert!(revoked_reconnect.is_err());
+        server.shutdown().await.unwrap();
     }
 }

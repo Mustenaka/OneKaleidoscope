@@ -32,10 +32,18 @@ pub struct WakeDispatch {
     pub payload: PushPayload,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RevokedDevice {
+    pub route_id: RouteId,
+    pub slot_id: DeviceSlotId,
+}
+
 #[derive(Debug, Clone)]
 pub struct ControlOutcome {
     pub response: RemoteControlFrame,
     pub wake: Option<WakeDispatch>,
+    pub revoked_device: Option<RevokedDevice>,
+    pub close_connection: bool,
 }
 
 pub struct ControlService {
@@ -81,6 +89,8 @@ impl ControlService {
                     retriable: is_retriable(code),
                 },
                 wake: None,
+                revoked_device: None,
+                close_connection: is_connection_fatal(code),
             },
         }
     }
@@ -128,10 +138,13 @@ impl ControlService {
                     max_frame_length,
                 },
                 wake: None,
+                revoked_device: None,
+                close_connection: false,
             });
         }
         connection.last_request_id = request_id;
         let now = now_ms();
+        let mut revoked_device = None;
         let (response, wake) = match frame {
             RemoteControlFrame::RegisterRoute {
                 operation_id,
@@ -170,7 +183,7 @@ impl ControlService {
                 let admin_token_value = parse_admin(&admin_token)?;
                 self.registry
                     .authorize_admin(route_id, &admin_token_value)
-                    .map_err(map_error)?;
+                    .map_err(map_admin_auth_error)?;
                 self.accept_operation(&operation_id, issued_at_ms, &admin_token, now)?;
                 let host_endpoint = crate::HostEndpointId::from_opaque(&host_endpoint_id)
                     .ok_or(WireErrorCode::MalformedFrame)?;
@@ -206,7 +219,7 @@ impl ControlService {
                 let admin_token_value = parse_admin(&admin_token)?;
                 self.registry
                     .authorize_admin(route_id, &admin_token_value)
-                    .map_err(map_error)?;
+                    .map_err(map_admin_auth_error)?;
                 self.accept_operation(&operation_id, issued_at_ms, &admin_token, now)?;
                 self.registry
                     .register_device_grant(DeviceGrantRegistration {
@@ -234,7 +247,7 @@ impl ControlService {
                 let access_token_value = parse_access(&access_token)?;
                 self.registry
                     .authorize_device(route_id, slot_id, &access_token_value)
-                    .map_err(map_error)?;
+                    .map_err(map_device_auth_error)?;
                 self.accept_operation(&operation_id, issued_at_ms, &access_token, now)?;
                 let resolved = self
                     .registry
@@ -265,7 +278,7 @@ impl ControlService {
                 let access_token_value = parse_access(&access_token)?;
                 self.registry
                     .authorize_device(route_id, slot_id, &access_token_value)
-                    .map_err(map_error)?;
+                    .map_err(map_device_auth_error)?;
                 self.accept_operation(&operation_id, issued_at_ms, &access_token, now)?;
                 let address = convert_push(address)?;
                 let expires_at_ms = address.expires_at_ms;
@@ -294,7 +307,7 @@ impl ControlService {
                 let access_token_value = parse_access(&access_token)?;
                 self.registry
                     .authorize_device(route_id, slot_id, &access_token_value)
-                    .map_err(map_error)?;
+                    .map_err(map_device_auth_error)?;
                 self.accept_operation(&operation_id, issued_at_ms, &access_token, now)?;
                 self.registry
                     .delete_push(route_id, slot_id, &access_token_value)
@@ -315,7 +328,7 @@ impl ControlService {
                 let admin_token_value = parse_admin(&admin_token)?;
                 self.registry
                     .authorize_admin(route, &admin_token_value)
-                    .map_err(map_error)?;
+                    .map_err(map_admin_auth_error)?;
                 self.accept_operation(&operation_id, issued_at_ms, &admin_token, now)?;
                 let (address, route_hint) = self
                     .registry
@@ -347,7 +360,7 @@ impl ControlService {
                 let admin_token_value = parse_admin(&admin_token)?;
                 self.registry
                     .authorize_admin(route_id, &admin_token_value)
-                    .map_err(map_error)?;
+                    .map_err(map_admin_auth_error)?;
                 let replayed =
                     match self.accept_operation(&operation_id, issued_at_ms, &admin_token, now) {
                         Ok(()) => false,
@@ -362,11 +375,17 @@ impl ControlService {
                     Err(error) if replayed && error.code() == RemoteErrorCode::Revoked => {}
                     Err(error) => return Err(map_error(error)),
                 }
+                revoked_device = Some(RevokedDevice { route_id, slot_id });
                 (RemoteControlFrame::DeviceGrantRevoked { request_id }, None)
             }
             _ => return Err(WireErrorCode::MalformedFrame),
         };
-        Ok(ControlOutcome { response, wake })
+        Ok(ControlOutcome {
+            response,
+            wake,
+            revoked_device,
+            close_connection: false,
+        })
     }
 
     fn accept_operation(
@@ -452,6 +471,27 @@ fn map_error(error: RemoteError) -> WireErrorCode {
     }
 }
 
+fn map_device_auth_error(error: RemoteError) -> WireErrorCode {
+    match error.code() {
+        RemoteErrorCode::Internal => WireErrorCode::Internal,
+        _ => WireErrorCode::RouteUnavailable,
+    }
+}
+
+fn map_admin_auth_error(error: RemoteError) -> WireErrorCode {
+    match error.code() {
+        RemoteErrorCode::Internal => WireErrorCode::Internal,
+        _ => WireErrorCode::AuthenticationFailed,
+    }
+}
+
+const fn is_connection_fatal(code: WireErrorCode) -> bool {
+    matches!(
+        code,
+        WireErrorCode::VersionMismatch | WireErrorCode::MalformedFrame
+    )
+}
+
 const fn is_retriable(code: WireErrorCode) -> bool {
     matches!(
         code,
@@ -489,8 +529,10 @@ mod tests {
             ttl_seconds: 30,
         };
         let mut first = ControlConnection::default();
+        let malformed = service.handle(&mut first, request.clone());
+        assert!(malformed.close_connection);
         assert!(matches!(
-            service.handle(&mut first, request.clone()).response,
+            malformed.response,
             RemoteControlFrame::RemoteError {
                 code: RemoteErrorCode::MalformedFrame,
                 ..
@@ -602,20 +644,26 @@ mod tests {
             RemoteControlFrame::DeviceGrantRegistered { request_id: 3 }
         ));
         let revoke_operation = RouteId::from_bytes([19; 16]).opaque();
+        let revoked = service.handle(
+            &mut first,
+            RemoteControlFrame::RevokeDeviceGrant {
+                request_id: 4,
+                operation_id: revoke_operation.clone(),
+                issued_at_ms,
+                route_id: route.opaque(),
+                device_slot_id: slot.opaque(),
+                admin_token: admin.opaque(),
+            },
+        );
+        assert_eq!(
+            revoked.revoked_device,
+            Some(super::RevokedDevice {
+                route_id: route,
+                slot_id: slot,
+            })
+        );
         assert!(matches!(
-            service
-                .handle(
-                    &mut first,
-                    RemoteControlFrame::RevokeDeviceGrant {
-                        request_id: 4,
-                        operation_id: revoke_operation.clone(),
-                        issued_at_ms,
-                        route_id: route.opaque(),
-                        device_slot_id: slot.opaque(),
-                        admin_token: admin.opaque(),
-                    },
-                )
-                .response,
+            revoked.response,
             RemoteControlFrame::DeviceGrantRevoked { request_id: 4 }
         ));
 
@@ -636,6 +684,114 @@ mod tests {
                 )
                 .response,
             RemoteControlFrame::DeviceGrantRevoked { request_id: 2 }
+        ));
+    }
+
+    #[test]
+    fn device_credential_failures_do_not_reveal_existence_or_revocation() {
+        let registry = Registry::new_ephemeral();
+        let route = registry
+            .create_route(
+                crate::HostEndpointId::from_bytes([51; 32]),
+                "https://relay.example.test".to_owned(),
+            )
+            .unwrap();
+        let grant = registry
+            .grant_device(route.route_id, &route.admin_token)
+            .unwrap();
+        let service = ControlService::new(registry.clone());
+        let issued_at_ms = i64::try_from(crate::protocol::now_ms()).unwrap();
+
+        for (marker, route_id, admin_token) in [
+            (55_u8, route.route_id, RouteAdminToken::from_bytes([55; 32])),
+            (
+                56_u8,
+                RouteId::from_bytes([56; 16]),
+                RouteAdminToken::from_bytes([56; 32]),
+            ),
+        ] {
+            let mut connection = ControlConnection::default();
+            hello(&service, &mut connection);
+            assert!(matches!(
+                service
+                    .handle(
+                        &mut connection,
+                        RemoteControlFrame::WakeDevice {
+                            request_id: 2,
+                            operation_id: RouteId::from_bytes([marker; 16]).opaque(),
+                            issued_at_ms,
+                            route_id: route_id.opaque(),
+                            device_slot_id: grant.slot_id.opaque(),
+                            admin_token: admin_token.opaque(),
+                            wake_id: RouteId::from_bytes([57; 16]).opaque(),
+                        },
+                    )
+                    .response,
+                RemoteControlFrame::RemoteError {
+                    code: RemoteErrorCode::AuthenticationFailed,
+                    ..
+                }
+            ));
+        }
+
+        for (marker, slot, access) in [
+            (
+                52_u8,
+                grant.slot_id,
+                crate::AccessToken::from_bytes([52; 32]),
+            ),
+            (
+                53_u8,
+                crate::DeviceSlotId::from_bytes([53; 16]),
+                crate::AccessToken::from_bytes([53; 32]),
+            ),
+        ] {
+            let mut connection = ControlConnection::default();
+            hello(&service, &mut connection);
+            let outcome = service.handle(
+                &mut connection,
+                RemoteControlFrame::DeletePushAddress {
+                    request_id: 2,
+                    operation_id: RouteId::from_bytes([marker; 16]).opaque(),
+                    issued_at_ms,
+                    route_id: route.route_id.opaque(),
+                    device_slot_id: slot.opaque(),
+                    access_token: access.opaque(),
+                },
+            );
+            assert!(!outcome.close_connection);
+            assert!(matches!(
+                outcome.response,
+                RemoteControlFrame::RemoteError {
+                    code: RemoteErrorCode::RouteUnavailable,
+                    ..
+                }
+            ));
+        }
+
+        registry
+            .revoke_device(route.route_id, &route.admin_token, grant.slot_id)
+            .unwrap();
+        let mut connection = ControlConnection::default();
+        hello(&service, &mut connection);
+        assert!(matches!(
+            service
+                .handle(
+                    &mut connection,
+                    RemoteControlFrame::DeletePushAddress {
+                        request_id: 2,
+                        operation_id: RouteId::from_bytes([54; 16]).opaque(),
+                        issued_at_ms,
+                        route_id: route.route_id.opaque(),
+                        device_slot_id: grant.slot_id.opaque(),
+                        access_token: grant.access_token.opaque(),
+                    },
+                )
+                .response,
+            RemoteControlFrame::RemoteError {
+                code: RemoteErrorCode::RouteUnavailable,
+                ..
+            }
         ));
     }
 

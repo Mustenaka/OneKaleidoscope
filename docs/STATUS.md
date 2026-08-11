@@ -58,9 +58,9 @@ approval decline、90 秒 OEM 后台、外部 force-stop cursor 恢复与 durabl
 |---|---|---|
 | `kaleido-state` | canonical state、内容寻址存储、八类 projection builder、持久 projection journal、device command outbox | projection journal 尚无物理 checkpoint/compaction |
 | `kaleido-adapter-codex` | 真实 Codex JSON-RPC 会话、流式输出、file-change approval、prompt runtime ack | 尚无 interrupt/真实 steer delivery |
-| `kaleido-hostd` | 常驻 Codex runtime、pinned TLS 配对/认证、订阅、content/command gateway、断线恢复 | 仅 LAN；公网 relay/push 在 R4 |
-| `kaleido-core` | 产品级 `MobileClient`、pair/connect/reconnect/subscribe/command/content、last-good cache、移动端能力/正文 helper | iOS 产品接入仍在 R8 |
-| Android | Compose Project/Session/Transcript/Live/Queue/Attention/Capability，hardware-backed Keystore P-256、加密凭据、离线缓存与 cursor resume；实体 arm64 Wi-Fi/OEM 后台门禁通过 | 无公网 relay/push；蜂窝网络切换与推送在 R4 |
+| `kaleido-hostd` | 常驻 Codex runtime、pinned TLS 配对/认证、订阅、content/command gateway、断线恢复；R4 候选含自托管 iroh presence/P2P/relay、durable remote revoke | 公网候选仍须在自有 Ubuntu + 蜂窝实体机闭合 |
+| `kaleido-core` | 产品级 `MobileClient`、pair/connect/reconnect/subscribe/command/content、逐 key last-good cache；R4 候选含 pinned control、custom relay、网络 epoch 与 durable FCM outbox | iOS 产品接入仍在 R8；公网恢复仍待实体门禁 |
+| Android | Compose Project/Session/Transcript/Live/Queue/Attention/Capability，hardware-backed Keystore P-256、加密凭据、离线缓存与 cursor resume；R4 候选含 FCM FID、后台 WorkManager 与网络切换回调 | 蜂窝、真实 FCM、冷启与吊销公网组合门禁仍 pending |
 | iOS | Swift 绑定可生成并编译 | 尚无产品 App，归 R8 |
 
 因此当前已经交付并在实体 arm64 Android 上验证了 R3 Android LAN 纵切。公网 relay、
@@ -78,11 +78,13 @@ approval decline、90 秒 OEM 后台、外部 force-stop cursor 恢复与 durabl
 当前活动任务是 [T-110](tasks/T-110.md)：Ubuntu rendezvous/P2P/relay、跨公网 E2EE、
 Android FCM、网络切换与活进程树终止。
 
-截至 2026-08-10，T-110 的实现候选已闭合 ADR-0024、REMOTE_CONTROL 0.1、
-自有 iroh relay、复用 R3 pinned TLS 的公网数据面、FCM FID、逐 key cursor 恢复和
-三平台进程树终止代码；本地 `cargo xtask ci`、Android 双 ABI/JVM/lint/AAR，以及 GitHub
-Windows/Ubuntu/macOS matrix 与 Android CI 均通过。这不是 R4 完成声明：自有 Ubuntu
-实例的 DNS/ACME/FCM 运行及实体 arm64 Android 蜂窝公网纵切尚未执行，真实门禁保持
+截至 2026-08-11，T-110 的实现候选已闭合 ADR-0024、REMOTE_CONTROL 0.1、
+自有 iroh relay、复用 R3 pinned TLS 的公网数据面、FCM FID、逐 key cursor 恢复；本轮审核又
+补齐 route-scoped push、lost-ack outbox、Ubuntu ack 后主动 relay 断链、致命 control 错误断链、
+Windows Job Object 与真实 iroh server 集成门禁。旧 SHA 的 CI 绿灯不计，PR #11 的最终 SHA
+本地 `cargo xtask ci`、Android AAR/APK/JVM/lint 与显式 iroh server 集成门禁已通过；三平台与
+Android CI 仍须在最终 SHA 重跑。这不是 R4 完成声明：自有 Ubuntu 实例的 DNS/ACME/FCM
+运行及实体 arm64 Android 蜂窝公网纵切尚未执行，真实门禁保持
 [pending](gates/T-110-evidence.md)。
 
 ## 5. 尚未完成的后续里程碑
@@ -100,9 +102,9 @@ Windows/Ubuntu/macOS matrix 与 Android CI 均通过。这不是 R4 完成声明
 
 | ID | 内容 | 结清点 |
 |---|---|---|
-| D-B2 | 活进程树终止尚无真实存活子树测试 | T-110 |
+| D-B2 | R4 候选已用 Windows Job Object、Unix process group 和真实存活子树测试修复；待最终 SHA 三平台 CI 固化证据 | T-110 |
 | D-B6 / D-B7 | Unix 反斜杠与 macOS `/var` 符号链接路径规则 | R9 |
-| D-B8 | `<HOME>` / `<SANDBOX>` 脱敏标签精度 | T-110 |
+| D-B8 | R4 产品 remote 边界已按 canonical sandbox 优先于 home 修复并做用户名/路径零泄漏测试；待最终 SHA CI 固化证据 | T-110 |
 | D-B11 | OpenCode 实机与快照版本对齐 | R5 |
 | P-2 | Codex approval 没有真实过期时间 | UI 必须诚实显示无过期时间 |
 

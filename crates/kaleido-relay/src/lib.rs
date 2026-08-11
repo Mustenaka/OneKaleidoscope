@@ -16,7 +16,7 @@ mod registry;
 mod iroh_server;
 
 pub use admission::{AdmissionLimits, AdmissionPrincipal, ConnectionLease, RelayAdmission};
-pub use control::{ControlConnection, ControlOutcome, ControlService, WakeDispatch};
+pub use control::{ControlConnection, ControlOutcome, ControlService, RevokedDevice, WakeDispatch};
 pub use error::{RemoteError, RemoteErrorCode, RemoteErrorFrame, RemoteResult};
 pub use ids::{AccessToken, DeviceSlotId, HostEndpointId, OperationId, RouteAdminToken, RouteId};
 pub use protocol::{
@@ -235,6 +235,69 @@ mod tests {
             .unwrap();
         assert_eq!(returned_hint, route_hint);
         assert_ne!(returned_hint, route_id);
+    }
+
+    #[test]
+    fn identical_slot_ids_are_isolated_by_route_for_push_and_revoke() {
+        let registry = Registry::new_ephemeral();
+        let slot_id = DeviceSlotId::from_bytes([41; 16]);
+        let registered_at_ms = crate::protocol::now_ms();
+        let mut routes = Vec::new();
+        for marker in [42_u8, 43_u8] {
+            let route_id = RouteId::from_bytes([marker; 16]);
+            let admin_token = RouteAdminToken::from_bytes([marker; 32]);
+            let access_token = AccessToken::from_bytes([marker.saturating_add(10); 32]);
+            registry
+                .register_route(RouteRegistration {
+                    route_id,
+                    route_hint: RouteId::from_bytes([marker.saturating_add(20); 16]),
+                    admin_token,
+                    host_endpoint: HostEndpointId::from_bytes([marker; 32]),
+                    relay_url: "https://relay.example.test".to_owned(),
+                })
+                .unwrap();
+            registry
+                .register_device_grant(DeviceGrantRegistration {
+                    route_id,
+                    slot_id,
+                    access_token,
+                    admin_token,
+                })
+                .unwrap();
+            registry
+                .register_push(
+                    route_id,
+                    slot_id,
+                    &access_token,
+                    PushAddress::fcm_fid(
+                        format!("fid-{marker}"),
+                        registered_at_ms,
+                        registered_at_ms.saturating_add(60_000),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            routes.push((route_id, admin_token));
+        }
+
+        let mut routes = routes.into_iter();
+        let (first_route, first_admin) = routes.next().unwrap();
+        let (second_route, second_admin) = routes.next().unwrap();
+        registry
+            .revoke_device(first_route, &first_admin, slot_id)
+            .unwrap();
+        assert_eq!(
+            registry
+                .push_address(first_route, slot_id, &first_admin)
+                .unwrap_err()
+                .code(),
+            RemoteErrorCode::RouteUnavailable
+        );
+        let (remaining, _) = registry
+            .push_address(second_route, slot_id, &second_admin)
+            .unwrap()
+            .unwrap();
+        assert_eq!(remaining.opaque_address, "fid-43");
     }
 
     #[cfg(unix)]
