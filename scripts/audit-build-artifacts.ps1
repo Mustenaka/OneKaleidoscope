@@ -16,9 +16,10 @@ $ErrorActionPreference = 'Stop'
 function Resolve-ExternalBuildRoot {
     param([Parameter(Mandatory = $true)][string]$Candidate)
 
+    $root = [System.IO.Path]::GetPathRoot($Candidate)
     if (-not [System.IO.Path]::IsPathRooted($Candidate) -or
-        [System.IO.Path]::GetPathRoot($Candidate) -ne 'D:\') {
-        throw 'BuildRoot must be an absolute path on D:.'
+        $root -notmatch '^[A-Za-z]:\\$') {
+        throw 'BuildRoot must be an absolute path on a local Windows drive.'
     }
 
     $absolute = [System.IO.Path]::GetFullPath($Candidate).TrimEnd('\')
@@ -87,7 +88,11 @@ function Test-ArtifactTreeHasNoReparsePoints {
 }
 
 if ([string]::IsNullOrWhiteSpace($BuildRoot)) {
-    $BuildRoot = 'D:\OneKaleidoscope\build'
+    if ($null -ne (Get-PSDrive -Name D -ErrorAction SilentlyContinue)) {
+        $BuildRoot = 'D:\OneKaleidoscope\build'
+    } else {
+        $BuildRoot = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'OneKaleidoscope\build'
+    }
 }
 
 $resolvedRoot = Resolve-ExternalBuildRoot -Candidate $BuildRoot
@@ -105,15 +110,16 @@ foreach ($artifact in $artifacts) {
     Write-Output ("{0}: {1} GiB" -f $artifact.Name, $sizeGiB)
 }
 
-$drive = Get-PSDrive -Name D
+$driveName = [System.IO.Path]::GetPathRoot($resolvedRoot).Substring(0, 1)
+$drive = Get-PSDrive -Name $driveName
 $freeGiB = [Math]::Round($drive.Free / 1GB, 2)
 $totalGiB = [Math]::Round($totalBytes / 1GB, 2)
-Write-Output ("external artifacts total: {0} GiB; D: free: {1} GiB" -f $totalGiB, $freeGiB)
+Write-Output ("external artifacts total: {0} GiB; {1}: free: {2} GiB" -f $totalGiB, $driveName, $freeGiB)
 if ($totalGiB -ge $WarnUsageGiB) {
     Write-Warning ("artifact usage meets the {0} GiB warning threshold" -f $WarnUsageGiB)
 }
 if ($freeGiB -lt $MinFreeGiB) {
-    Write-Warning ("D: free space is below the {0} GiB safety threshold" -f $MinFreeGiB)
+    Write-Warning ("{0}: free space is below the {1} GiB safety threshold" -f $driveName, $MinFreeGiB)
 }
 
 if ($Mode -eq 'Clean') {

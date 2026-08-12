@@ -9,9 +9,10 @@ $ErrorActionPreference = 'Stop'
 function Resolve-ExternalBuildRoot {
     param([Parameter(Mandatory = $true)][string]$Candidate)
 
+    $root = [System.IO.Path]::GetPathRoot($Candidate)
     if (-not [System.IO.Path]::IsPathRooted($Candidate) -or
-        [System.IO.Path]::GetPathRoot($Candidate) -ne 'D:\') {
-        throw 'KALEIDO_BUILD_ROOT must be an absolute path on D:.'
+        $root -notmatch '^[A-Za-z]:\\$') {
+        throw 'KALEIDO_BUILD_ROOT must be an absolute path on a local Windows drive.'
     }
 
     $absolute = [System.IO.Path]::GetFullPath($Candidate)
@@ -30,7 +31,11 @@ function Resolve-ExternalBuildRoot {
 }
 
 if ([string]::IsNullOrWhiteSpace($BuildRoot)) {
-    $BuildRoot = 'D:\OneKaleidoscope\build'
+    if ($null -ne (Get-PSDrive -Name D -ErrorAction SilentlyContinue)) {
+        $BuildRoot = 'D:\OneKaleidoscope\build'
+    } else {
+        $BuildRoot = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'OneKaleidoscope\build'
+    }
 }
 
 $resolvedRoot = Resolve-ExternalBuildRoot -Candidate $BuildRoot
@@ -44,5 +49,5 @@ $env:KALEIDO_BUILD_ROOT = $resolvedRoot
 $env:CARGO_TARGET_DIR = Join-Path $resolvedRoot 'cargo-target'
 $env:GRADLE_USER_HOME = Join-Path $resolvedRoot 'gradle-user-home'
 
-Write-Output 'Configured external D: build root for this PowerShell session.'
+Write-Output 'Configured an external build root for this PowerShell session.'
 Write-Output 'Cargo and Gradle artifacts will use the shared external directories.'

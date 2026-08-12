@@ -12,12 +12,12 @@ use kaleido_adapter_claude::error::ClaudeAdapterError;
 use kaleido_adapter_claude::parse_transcript;
 use kaleido_adapter_claude::transcript::{Direction, TranscriptFrame, SIDECAR_PROTOCOL};
 use kaleido_proto::attention::{AttentionState, AttentionSubject};
-use kaleido_proto::capability::{Capability, CapabilityState};
+use kaleido_proto::capability::{Capability, CapabilityState, CapabilityUnavailableReason};
 use kaleido_proto::effect::StateEffect;
 use kaleido_proto::turn::TurnStatus;
 use serde_json::{json, Value};
 
-use support::{fixture_path, reducer, MemoryContent, BASE_AT_MS};
+use support::{auth_failure_fixture_path, fixture_path, reducer, MemoryContent, BASE_AT_MS};
 
 fn frame(kind: &str, payload: Value, at_ms: i64) -> TranscriptFrame {
     TranscriptFrame::from_value(
@@ -116,6 +116,40 @@ fn real_sdk_capture_reduces_to_session_agent_item_and_completed_turn() {
         .all(|effect| effect.validate_for_log().is_ok()));
     assert!(!reducer.capability_probe().is_proven(Capability::TurnSteer));
     assert!(reducer.capability_probe().is_proven(Capability::TurnPrompt));
+}
+
+#[test]
+fn real_sdk_authentication_failure_projects_auth_required_without_prompt_capability() {
+    let raw = fs::read_to_string(auth_failure_fixture_path())
+        .expect("real SDK authentication-failure fixture exists");
+    let transcript =
+        parse_transcript(&raw).expect("real SDK authentication-failure fixture parses");
+    let mut reducer = reducer();
+    let mut content = MemoryContent::default();
+    let effects = reducer
+        .ingest(&transcript, &mut content)
+        .expect("authentication-failure capture reduces");
+
+    let turn = effects.iter().rev().find_map(|effect| match effect {
+        StateEffect::TurnUpserted { turn } => Some(turn),
+        _ => None,
+    });
+    assert_eq!(turn.map(|value| value.status), Some(TurnStatus::Failed));
+    assert!(turn.is_some_and(|value| {
+        value
+            .error
+            .as_ref()
+            .is_some_and(|error| error.code == kaleido_proto::error::ErrorCode::AuthRequired)
+    }));
+    assert_eq!(
+        reducer
+            .capability_probe()
+            .to_capabilities()
+            .state_of(&Capability::TurnPrompt),
+        CapabilityState::UnavailableOnThisConnection {
+            reason: CapabilityUnavailableReason::AuthenticationRequired,
+        }
+    );
 }
 
 #[test]

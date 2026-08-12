@@ -1165,10 +1165,10 @@ fn recorded_claude_success_uses_closed_sdk_events_and_is_acceptance() -> TestRes
     let fixture_root = repository_claude_fixtures()?;
     let summary = verify_claude_sidecar_paths(&fixture_root, &Identity::default())?;
 
-    assert_eq!(summary.files, 1);
-    assert_eq!(summary.records, 7);
+    assert_eq!(summary.files, 2);
+    assert_eq!(summary.records, 13);
     assert_eq!(summary.acceptance_files, 1);
-    assert_eq!(summary.auth_failure_files, 0);
+    assert_eq!(summary.auth_failure_files, 1);
     Ok(())
 }
 

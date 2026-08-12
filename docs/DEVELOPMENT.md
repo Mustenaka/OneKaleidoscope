@@ -21,25 +21,25 @@ workspace = true
 
 ## External Windows build artifacts
 
-On Windows, Rust and Gradle build artifacts must stay outside every C: worktree.
-Before running Cargo or Gradle in a new PowerShell session, dot-source the
-repository activation script:
+On Windows, large Rust and Gradle build artifacts can be kept outside a worktree.
+Before a costly gate, dot-source the repository activation script:
 
 ```powershell
 . .\scripts\use-external-build-root.ps1
 cargo xtask ci
 ```
 
-It defaults to `D:\OneKaleidoscope\build`, creates only that explicit external
-root, and sets `KALEIDO_BUILD_ROOT`, `CARGO_TARGET_DIR` and `GRADLE_USER_HOME`.
+It prefers `D:\OneKaleidoscope\build` when D: exists and otherwise uses the
+current user's local application-data directory. It creates only that explicit
+external root and sets `KALEIDO_BUILD_ROOT`, `CARGO_TARGET_DIR` and
+`GRADLE_USER_HOME`.
 After activation, `cargo xtask ci`, `cargo xtask test`, `cargo xtask clippy`,
 and schema staging all use the same Cargo target directory; they no longer make
 separate `target/debug`, `target/xtask-ci`, or `target/xtask-test` trees. An explicit
-`CARGO_TARGET_DIR` takes precedence, but xtask rejects a relative path or any
-Windows path outside D:. The Android Windows wrapper applies the same D: default
-when it is invoked directly.
+`CARGO_TARGET_DIR` takes precedence, and xtask rejects relative paths. Without
+activation, Cargo and the Android wrapper keep their standard portable defaults.
 
-To use a different external root, it must be an absolute D: directory:
+To use a different external root, pass an absolute path on any local drive:
 
 ```powershell
 . .\scripts\use-external-build-root.ps1 -BuildRoot D:\OneKaleidoscope\alternative-build
@@ -48,7 +48,7 @@ To use a different external root, it must be an absolute D: directory:
 Run the artifact audit before costly gates. It is an audit/dry run by default
 and never deletes files unless both `-Mode Clean` and `-Execute` are supplied after
 explicit user authorization. It warns when external artifacts reach 120 GiB or
-when D: has less than 80 GiB free; both thresholds are configurable.
+when the selected drive has less than 80 GiB free; both thresholds are configurable.
 
 ```powershell
 powershell -NoProfile -File .\scripts\audit-build-artifacts.ps1
@@ -75,7 +75,7 @@ It stops at the first failure and runs, in this order:
 3. the repository antipattern scanner
 4. `cargo clippy --all-targets -- -D warnings`
 5. `cargo test --workspace --exclude kaleido-recorder --exclude xtask`, then
-   `cargo test --package xtask --lib`
+   the xtask library plus every explicit `xtask/tests/*.rs` integration target
 6. fixture schema and leak verification
 
 Each gate can also be run independently:
@@ -92,9 +92,11 @@ cargo xtask fixtures verify
 `kaleido-recorder` is a frozen Windows research spike and is excluded from the
 CI behavior-test scope by ADR-0016. `xtask` is also excluded from the workspace
 test invocation because `cargo xtask ci` is itself the running Windows binary;
-the gate immediately runs all xtask library tests separately, without replacing
-that executable. Its committed fixtures remain covered by `cargo xtask fixtures
-verify` on every platform, and the spike remains covered by workspace clippy.
+the gate immediately runs the xtask library and all five integration targets
+without rebuilding that executable. A unit guard fails when a new integration
+test file is not added to this plan. Its committed fixtures also remain covered
+by `cargo xtask fixtures verify` on every platform, and the spike remains covered
+by workspace clippy.
 This is a local Windows regression check, not a CI gate:
 
 ```text

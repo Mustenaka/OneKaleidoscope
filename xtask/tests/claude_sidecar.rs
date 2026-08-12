@@ -30,10 +30,10 @@ fn recorded_sdk_success_is_verified_as_acceptance_evidence() -> TestResult {
 
     let summary = verify_claude_sidecar_paths(&fixtures, &Identity::default())?;
 
-    assert_eq!(summary.files, 1);
-    assert_eq!(summary.records, 7);
+    assert_eq!(summary.files, 2);
+    assert_eq!(summary.records, 13);
     assert_eq!(summary.acceptance_files, 1);
-    assert_eq!(summary.auth_failure_files, 0);
+    assert_eq!(summary.auth_failure_files, 1);
     Ok(())
 }
 
