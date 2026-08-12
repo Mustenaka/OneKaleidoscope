@@ -8,6 +8,7 @@ use std::process::{Command, ExitCode, ExitStatus};
 use xtask::antipattern::{self, scan_repository};
 use xtask::build::{self, BuildRootError};
 use xtask::schema::{self, SchemaCommand};
+use xtask::test_gate::test_gate_plan;
 use xtask::{deps, fixtures, sidecar};
 
 #[derive(Debug)]
@@ -274,23 +275,12 @@ fn workspace_root() -> Result<PathBuf, XtaskError> {
         .ok_or(XtaskError::WorkspaceRoot)
 }
 
-#[derive(Debug, Eq, PartialEq)]
-struct TestScope {
-    arguments: &'static [&'static str],
-    exclusion_notice: &'static str,
-}
-
-fn test_scope() -> TestScope {
-    TestScope {
-        arguments: &["test", "--workspace", "--exclude", "kaleido-recorder"],
-        exclusion_notice: "test: kaleido-recorder excluded on all platforms (ADR-0016)",
-    }
-}
-
 fn run_test_step(root: &Path, target: &Path) -> Result<(), XtaskError> {
-    let scope = test_scope();
-    println!("{}", scope.exclusion_notice);
-    run_cargo_step_with_target(root, target, "test", scope.arguments)
+    for invocation in test_gate_plan() {
+        println!("{}", invocation.notice);
+        run_cargo_step_with_target(root, target, "test", invocation.cargo_arguments)?;
+    }
+    Ok(())
 }
 
 fn run_cargo_step_with_target(
@@ -366,20 +356,4 @@ fn announce(step: &str) -> Result<(), XtaskError> {
     println!("==> {step}");
     io::stdout().flush()?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{test_scope, TestScope};
-
-    #[test]
-    fn test_scope_excludes_the_recorder_on_all_platforms_with_an_explicit_notice() {
-        assert_eq!(
-            test_scope(),
-            TestScope {
-                arguments: &["test", "--workspace", "--exclude", "kaleido-recorder"],
-                exclusion_notice: "test: kaleido-recorder excluded on all platforms (ADR-0016)",
-            }
-        );
-    }
 }

@@ -6,3 +6,4 @@ pub mod schema;
 pub mod schema_history;
 pub mod schema_surface;
 pub mod sidecar;
+pub mod test_gate;
