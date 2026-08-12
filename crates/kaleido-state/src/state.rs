@@ -275,7 +275,15 @@ impl CanonicalState {
             .binding_handle
             .as_ref()
             .map(|handle| &handle.runtime_id)
-            .or(session.history_source.runtime_id.as_ref())?;
+            .or(session.history_source.runtime_id.as_ref())
+            .or_else(|| {
+                self.projects
+                    .get(&session.project_id)?
+                    .bindings
+                    .iter()
+                    .find(|binding| binding.id == session.project_binding_id)
+                    .map(|binding| &binding.runtime_id)
+            })?;
         self.runtimes.get(runtime_id)
     }
 

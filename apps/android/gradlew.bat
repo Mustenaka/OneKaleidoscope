@@ -32,6 +32,10 @@ if "%DIRNAME%"=="" set DIRNAME=.
 set APP_BASE_NAME=%~n0
 set APP_HOME=%DIRNAME%
 
+@rem Reuse an explicitly activated external build root on any local Windows drive.
+if defined KALEIDO_BUILD_ROOT if not "%KALEIDO_BUILD_ROOT:~1,2%"==":\" goto invalidExternalBuildRoot
+if defined KALEIDO_BUILD_ROOT if not defined GRADLE_USER_HOME set GRADLE_USER_HOME=%KALEIDO_BUILD_ROOT%\gradle-user-home
+
 @rem Resolve any "." and ".." in APP_HOME to make it shorter.
 for %%i in ("%APP_HOME%") do set APP_HOME=%%~fi
 
@@ -51,6 +55,12 @@ echo. 1>&2
 echo Please set the JAVA_HOME variable in your environment to match the 1>&2
 echo location of your Java installation. 1>&2
 
+goto fail
+
+:invalidExternalBuildRoot
+echo. 1>&2
+echo ERROR: KALEIDO_BUILD_ROOT must be an absolute path on a local Windows drive. 1>&2
+echo. 1>&2
 goto fail
 
 :findJavaFromJavaHome

@@ -31,6 +31,15 @@ jobs:
           cache: false
           rustflags: ""
 
+      - name: Configure external Windows build artifacts
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          . .\scripts\use-external-build-root.ps1
+          "KALEIDO_BUILD_ROOT=$env:KALEIDO_BUILD_ROOT" | Add-Content -LiteralPath $env:GITHUB_ENV
+          "CARGO_TARGET_DIR=$env:CARGO_TARGET_DIR" | Add-Content -LiteralPath $env:GITHUB_ENV
+          "GRADLE_USER_HOME=$env:GRADLE_USER_HOME" | Add-Content -LiteralPath $env:GITHUB_ENV
+
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
 
@@ -55,6 +64,16 @@ jobs:
           gradle-version: '8.14'
 
       - name: Run repository checks
+        if: matrix.os != 'ubuntu-latest'
+        run: cargo xtask ci
+
+      - name: Run repository checks (resource-bounded)
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 30
+        env:
+          CARGO_BUILD_JOBS: '2'
+          CARGO_INCREMENTAL: '0'
+          RUST_TEST_THREADS: '2'
         run: cargo xtask ci
 
       - name: Compile and test the production Ubuntu relay surface

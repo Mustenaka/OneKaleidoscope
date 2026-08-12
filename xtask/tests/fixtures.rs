@@ -1161,25 +1161,26 @@ fn recorded_fixtures_pass_repository_schemas() -> TestResult {
 }
 
 #[test]
-fn recorded_claude_auth_failure_uses_closed_sdk_events_and_is_not_acceptance() -> TestResult {
+fn recorded_claude_success_uses_closed_sdk_events_and_is_acceptance() -> TestResult {
     let fixture_root = repository_claude_fixtures()?;
     let summary = verify_claude_sidecar_paths(&fixture_root, &Identity::default())?;
 
-    assert_eq!(summary.files, 1);
-    assert_eq!(summary.records, 6);
+    assert_eq!(summary.files, 2);
+    assert_eq!(summary.records, 13);
+    assert_eq!(summary.acceptance_files, 1);
     assert_eq!(summary.auth_failure_files, 1);
     Ok(())
 }
 
 #[test]
-fn claude_auth_failure_fixture_rejects_a_terminal_success_mutation() -> TestResult {
+fn claude_acceptance_fixture_rejects_a_terminal_error_mutation() -> TestResult {
     let source_root = repository_claude_fixtures()?;
     let root = tempdir()?;
     let fixtures = root.path().join("fixtures");
     let sandbox = fixtures.join("sandbox");
     fs::create_dir_all(&sandbox)?;
     let recording = fs::read_to_string(source_root.join("sandbox/real-sdk-simple-turn.jsonl"))?;
-    let mutated = recording.replace("\"is_error\":true", "\"is_error\":false");
+    let mutated = recording.replace("\"is_error\":false", "\"is_error\":true");
     fs::write(sandbox.join("real-sdk-simple-turn.jsonl"), mutated)?;
     fs::copy(
         source_root.join("sandbox/real-sdk-simple-turn.metadata.json"),
@@ -1188,11 +1189,11 @@ fn claude_auth_failure_fixture_rejects_a_terminal_success_mutation() -> TestResu
 
     let error = verification_error(
         verify_claude_sidecar_paths(&fixtures, &Identity::default()),
-        "a successful result must not pass as authentication-failure evidence",
+        "a terminal error must not pass as acceptance evidence",
     )?;
     assert!(error.issues().iter().any(|issue| {
-        issue.category == "authentication-failure fixture contains a successful result"
-            && issue.pointer.as_deref() == Some("/payload/event/is_error")
+        issue.category == "Claude acceptance fixture contains authentication-failure evidence"
+            && issue.pointer.as_deref() == Some("/payload/event")
     }));
     Ok(())
 }

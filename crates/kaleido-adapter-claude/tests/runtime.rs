@@ -13,6 +13,8 @@ use kaleido_adapter_claude::{ClaudeRuntimeConfig, ClaudeRuntimeSession};
 use kaleido_proto::capability::Capability;
 use kaleido_proto::content::{ContentKind, Sensitivity};
 use kaleido_proto::effect::StateEffect;
+use kaleido_proto::ids::{CommandId, QueueEntryId};
+use kaleido_proto::queue::{QueueEntry, QueueIntent, QueueState};
 
 use support::{MemoryContent, BASE_AT_MS};
 
@@ -147,4 +149,109 @@ fn history_runtime_uses_the_exact_discovery_scope_and_bounded_page() {
     ));
     fs::remove_dir_all(&other_root).expect("isolated wrong-scope root is removed");
     fs::remove_dir_all(&root).expect("isolated history root is removed");
+}
+
+#[test]
+fn a_provisional_session_delivers_a_new_turn_without_fabricating_live_control() {
+    let root = isolated_root("queued-first-turn");
+    let mut runtime = runtime(None);
+    let mut content = MemoryContent::default();
+    let request = start_request(&runtime, &root, &mut content);
+    let start = runtime
+        .start(&request, &mut content)
+        .expect("ready creates the provisional session");
+    let session_id = start
+        .iter()
+        .find_map(|effect| match effect {
+            StateEffect::SessionUpserted { session } => Some(session.id.clone()),
+            _ => None,
+        })
+        .expect("ready publishes a session");
+    let body = content
+        .store(
+            ContentKind::PlainText,
+            Sensitivity::Sensitive,
+            b"queued first turn",
+        )
+        .expect("queue body");
+    let command_id = CommandId::new("cmd_queued_first_turn");
+    let entry = QueueEntry {
+        id: QueueEntryId::new("que_queued_first_turn"),
+        session_id,
+        position: 0,
+        intent: QueueIntent::NewTurn,
+        body,
+        state: QueueState::Pending,
+        editable: true,
+        created_at_ms: BASE_AT_MS,
+        updated_at_ms: BASE_AT_MS,
+    };
+
+    let effects = runtime
+        .deliver_queue_entry(&command_id, &entry, &mut content)
+        .expect("structured prompt receipt delivers the queue entry");
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        StateEffect::QueueEntryUpserted {
+            entry: QueueEntry {
+                state: QueueState::DeliveredAsNewTurn { .. },
+                editable: false,
+                ..
+            }
+        }
+    )));
+    assert!(!effects
+        .iter()
+        .any(|effect| matches!(effect, StateEffect::CommandAcknowledged { .. })));
+    assert!(runtime.capability_probe().is_proven(Capability::QueueWrite));
+    assert!(!runtime
+        .capability_probe()
+        .is_proven(Capability::LiveControl));
+
+    runtime.close().expect("close handshake succeeds");
+    fs::remove_dir_all(&root).expect("isolated queue root is removed");
+}
+
+#[test]
+fn a_provisional_session_refuses_to_deliver_a_steer_entry() {
+    let root = isolated_root("queued-steer");
+    let mut runtime = runtime(None);
+    let mut content = MemoryContent::default();
+    let request = start_request(&runtime, &root, &mut content);
+    let start = runtime
+        .start(&request, &mut content)
+        .expect("ready creates the provisional session");
+    let session_id = start
+        .iter()
+        .find_map(|effect| match effect {
+            StateEffect::SessionUpserted { session } => Some(session.id.clone()),
+            _ => None,
+        })
+        .expect("ready publishes a session");
+    let body = content
+        .store(
+            ContentKind::PlainText,
+            Sensitivity::Sensitive,
+            b"must not steer",
+        )
+        .expect("queue body");
+    let entry = QueueEntry {
+        id: QueueEntryId::new("que_queued_steer"),
+        session_id,
+        position: 0,
+        intent: QueueIntent::SteerActiveTurn,
+        body,
+        state: QueueState::Pending,
+        editable: true,
+        created_at_ms: BASE_AT_MS,
+        updated_at_ms: BASE_AT_MS,
+    };
+
+    assert!(matches!(
+        runtime.deliver_queue_entry(&CommandId::new("cmd_queued_steer"), &entry, &mut content),
+        Err(RuntimeSessionError::CapabilityUnavailable)
+    ));
+
+    runtime.close().expect("close handshake succeeds");
+    fs::remove_dir_all(&root).expect("isolated steer root is removed");
 }

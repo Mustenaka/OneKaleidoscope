@@ -88,3 +88,11 @@ pub fn fixture_path() -> std::path::PathBuf {
         .join("sandbox")
         .join("real-sdk-simple-turn.jsonl")
 }
+
+pub fn auth_failure_fixture_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("sandbox")
+        .join("real-sdk-authentication-failure.jsonl")
+}

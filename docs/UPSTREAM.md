@@ -252,11 +252,16 @@ provisional-session and evidence semantics are defined by
 shared gate. Ignoring package scripts prevents install-time provider execution;
 the actual SDK bridge still runs only in explicit runtime/fixture commands.
 
-The committed Claude fixture is a real SDK run whose OAuth refresh failed. It
-is valid failure-path evidence, not a successful turn or permission/question
-acceptance claim. Its metadata fixes `expected_outcome = authentication_failure`
-and `acceptance_eligible = false`; fixture verification rejects any attempt to
-present it as success. See `docs/gates/T-112-evidence.md`.
+The committed Claude fixture is a real successful SDK-managed turn recorded
+with the pinned package. Its metadata fixes
+`expected_outcome = simple_turn_success` and `acceptance_eligible = true`;
+fixture verification requires ready, prompt acceptance, one consistent real
+session, SDK init, non-error assistant text and a terminal success result.
+The live acceptance probe separately verifies QuestionSet, permission allow
+and deny, interrupt, resume, discovery and non-empty history. Broker sessions
+force `permissionMode = default` and load no user/project setting sources, so
+local allow rules cannot bypass the structured permission callback. See
+`docs/gates/T-112-evidence.md`.
 
 ## Temporary offline Rust vendoring
 

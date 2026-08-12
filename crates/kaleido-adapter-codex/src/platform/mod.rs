@@ -68,7 +68,14 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    #[cfg(not(target_os = "windows"))]
     const CHILD_PID_TIMEOUT: Duration = Duration::from_secs(10);
+    // A cold PowerShell startup on hosted Windows runners can exceed ten
+    // seconds while the machine is under post-link load. This timeout only
+    // guards the test fixture's PID handshake; process-tree termination keeps
+    // its independent ten-second exit deadline below.
+    #[cfg(target_os = "windows")]
+    const CHILD_PID_TIMEOUT: Duration = Duration::from_secs(30);
     const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 
     struct LiveProcessTree {

@@ -462,6 +462,49 @@ fn second_session(fixture: &Fixture) -> Session {
 }
 
 #[test]
+fn a_provisional_broker_session_uses_its_project_binding_for_reachability() {
+    let mut fixture = scaffold(None);
+    let mut session = fixture
+        .store
+        .state()
+        .session(&fixture.session_id)
+        .expect("session exists")
+        .clone();
+    session.history_source = HistorySource {
+        kind: HistorySourceKind::None,
+        runtime_id: None,
+        evidence: CapabilityEvidence {
+            source: EvidenceSource::ObservedInTraffic,
+            observed_at_ms: NOW_MS,
+            note_ref: None,
+        },
+    };
+    session.binding_handle = None;
+    session.live_binding = LiveBinding::NotBound {
+        reason: LiveUnboundReason::NeverStarted,
+    };
+    fixture
+        .store
+        .apply(&StateEffect::SessionUpserted { session })
+        .expect("provisional session");
+
+    let canonical = fixture
+        .store
+        .state()
+        .session(&fixture.session_id)
+        .expect("provisional session remains indexed");
+    assert_ne!(canonical.status, SessionStatus::Offline);
+    let projection = fixture
+        .store
+        .projection(ProjectionName::InputQueue, Some(&fixture.session_id))
+        .expect("input queue projection");
+    let ProjectionPayload::InputQueue { view } = projection.payload else {
+        panic!("expected input queue projection");
+    };
+    assert!(view.writable);
+}
+
+#[test]
 fn a_repeated_command_is_reported_as_duplicate_and_appends_nothing() {
     let mut fixture = scaffold(None);
     let envelope = reply(&fixture, "first", "accept", None);

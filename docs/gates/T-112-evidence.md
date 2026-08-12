@@ -1,7 +1,7 @@
 # T-112 Claude Agent SDK evidence
 
-> 状态：**active evidence ledger；只有真实失败路径，不是成功验收**
-> 集成基线：`origin/main@c993d9f9bb115003e2ee69066c233ac47b7c52cc`
+> 状态：**真实 SDK managed-session 验收通过；移动端总门禁仍由 T-113 承接**
+> 集成基线：`origin/main@b54a12638cd044b277747d5fbc22627ad2adb016`
 > 记录日期：2026-08-11
 
 ## 1. 钉定上游与 bridge
@@ -29,12 +29,13 @@ cargo xtask claude-sidecar
 doc tests 与 fixtures verify。fixture 汇总为：
 
 ```text
-8 file(s), 368 record(s)
+9 file(s), 375 record(s)
 codex: 3, acp-claude: 1, opencode: 3,
-claude-sidecar: 1 file / 6 records, authentication-failure-only: 1
+claude-sidecar: 2 files / 13 records, acceptance: 1, authentication-failure-only: 1
 ```
 
-exact-commit Windows/macOS/Linux run 仍由 T-113 记录，不能用本地总门禁替代。
+`58e1e9d` 的 exact-commit Windows/macOS/Linux 与 Android run 已由 T-113 记录并成功；实体总格
+仍不能用本地或 hosted 自动化替代。
 
 focused reducer 测试已覆盖 structured QuestionSet frame；bridge prompt queue 只有在官方 SDK query
 消费 user message 后才发 `prompt_accepted`，adapter 再把它与本地 command、目标 canonical
@@ -51,25 +52,26 @@ Session 和唯一 RemoteCommand Turn 关联为 `PromptTurn`；interrupt receipt 
 1. sidecar `ready`（精确 cwd 与 nullable resume id）；
 2. SDK 消费 prompt 后的 `prompt_accepted`；
 3. 真实 `session_started` 与 typed SDK init event；
-4. typed provider assistant event：`error = authentication_failed`；
-5. typed terminal result：`is_error = true`。
+4. typed provider assistant event：非空 text block 且没有 error；
+5. typed terminal result：`subtype = success`、`is_error = false`。
 
-六条 frame 全部来自钉定 `0.3.226` 官方 SDK 的这次实际运行，经新版 bridge 当场转换；没有把旧
-raw SDK DTO fixture 手工改写为理想流量。运行仍得到同一 OAuth 失败语义，所以没有新增成功声明。
-
-运行环境 OAuth session 已过期且刷新失败。因此该 fixture 证明真实 bridge/SDK/session/auth failure
-路径，**不证明**成功模型 turn、工具成功、permission、QuestionSet、interrupt 或 resume。
-任何 reducer 单测 frame 都不能填补这个真实 provider 空缺。
+七条 frame 全部来自登录后的钉定 `0.3.226` 官方 SDK 实际运行，经 bridge 当场转换；没有把旧 raw
+SDK DTO fixture 手工改写为理想流量。配套 live probe 还在隔离临时目录真实完成成功 turn、
+QuestionSet 回答、permission allow、permission deny（并验证被拒文件没有创建）、interrupt receipt、
+同一 session resume、精确目录 discovery 与非空 history；临时目录在进程退出后删除。
 
 配套 metadata 固定：
 
 ```json
-{"capture":"real_provider","provider_version":"0.3.226","expected_outcome":"authentication_failure","acceptance_eligible":false}
+{"capture":"real_provider","provider_version":"0.3.226","expected_outcome":"simple_turn_success","acceptance_eligible":true}
 ```
 
-统一 fixture verifier 现在扫描该 sidecar fixture/metadata；缺 metadata、错误版本/预期或把
-`acceptance_eligible` 改成 true 都会失败；成功 result 变异、伪造 acceptance metadata、无效 JSON
-与密钥泄漏拒绝路径也已验证，因而真实 auth failure 不能被伪装成 provider success。
+同时保留真实 `real-sdk-authentication-failure.jsonl` 与配套 metadata；它来自同一钉定 SDK 的
+authentication failure，并保持 `acceptance_eligible=false`，不会冒充成功验收。统一 fixture verifier
+同时扫描成功与失败两类 sidecar fixture/metadata；缺 metadata、错误版本/预期、把成功 fixture 的
+`acceptance_eligible` 改成 false 或把 terminal success 变成 error 都会失败；无效 JSON 与密钥泄漏
+拒绝路径也继续覆盖。实际把 verifier 的 `is_error == false` 判断反转后，acceptance 测试变红；
+临时破坏 `authentication_failed` reducer 匹配时，真实失败 fixture 测试也实际变红；恢复后通过。
 
 ## 3. provisional Session 证据
 
@@ -94,19 +96,19 @@ Session。
 | 面 | 状态 | 证据/缺口 |
 |---|---|---|
 | official SDK typecheck / CI step | **通过（focused）** | pinned package/lockfile + `cargo xtask claude-sidecar`；已接入总 CI |
-| real failure fixture verification | **通过** | metadata `acceptance_eligible=false`，统一 verifier 覆盖 |
+| real success fixture verification | **通过** | metadata `acceptance_eligible=true`，统一 verifier 覆盖 |
 | provider-neutral bootstrap | **通过（本地真实进程）** | provisional Session 与 T-113 双 runtime clean shutdown |
-| discovery implementation | **focused 测试/类型通过** | official `listSessions()` metadata；尚无独立真实 discovery recording |
-| history read implementation | **focused 通过；provider 验收未通过** | official `getSessionMessages(sessionId, { dir, offset, limit<=100, includeSystemMessages:true })` 已接入；只接受同一精确 discovery cwd/session，非空结果才证明 `HistoryRead` |
-| no-credential history probe | **无可验收结果** | 对隔离 toy project 与当前 worktree 分别运行 exact-dir `listSessions(includeWorktrees=false, limit=1)`，均返回 0 session / 0 message；没有把空结果冒充 read 成功 |
+| discovery implementation | **通过** | official `listSessions()` metadata；live probe 已在精确目录列出刚创建的真实 session |
+| history read implementation | **通过** | official `getSessionMessages(sessionId, { dir, offset, limit<=100, includeSystemMessages:true })` 已接入；live probe 只接受同一精确 discovery cwd/session，并得到非空结果 |
+| real history read | **通过** | live probe 对刚创建的同一 exact-dir/session 执行 list + bounded history，得到非空官方消息页 |
 | discovered-session ownership | **focused 实现/测试通过** | `listSessions()` 结果为 UACP `ProviderManaged`：只表达公开 SDK 管理持久化与 structured list/resume，不冒充独立 CLI/GUI attach |
-| successful streaming turn | **未通过** | 真实 run 因 OAuth 过期失败 |
-| real permission allow/deny | **未通过** | callback 与 reducer 实现/测试不等于 provider 验收 |
-| real `AskUserQuestion` | **未通过** | official typed mapping 已实现，真实触发缺失 |
-| real interrupt | **未通过** | `activeQuery.interrupt()` 路径已实现，真实 receipt 缺失 |
-| real resume/recovery | **未通过** | `listSessions`/`resume` 路径已实现，真实重启恢复缺失 |
-| capability honesty | **部分通过** | provisional/auth failure 不提升未证能力；最终 Android 展示未验 |
-| `cargo xtask ci` | **最新集成候选本地通过** | 全入口 exit 0；真实 Claude success 空缺仍阻止 T-112 complete |
+| successful streaming turn | **通过** | committed real fixture + live probe terminal success |
+| real permission allow/deny | **通过** | 两条真实 tool request；allow 后隔离文件存在，deny 后目标文件不存在 |
+| real `AskUserQuestion` | **通过** | official typed QuestionSet request/result，单题单选回答后 turn success |
+| real interrupt | **通过** | `activeQuery.interrupt()` 返回结构化 receipt |
+| real resume/recovery | **通过** | 新 sidecar process 以同一 session id resume 并再次完成 turn |
+| capability honesty | **通过（provider 面）** | capability 只随真实 typed evidence 提升；最终 Android 展示仍由 T-113 验收 |
+| `cargo xtask ci` | **通过** | `58e1e9d` 本地总门禁与 Windows/macOS/Ubuntu exact workflow 全绿；Android workflow 同样成功 |
 
 ## 5. 解除条件
 
@@ -122,6 +124,6 @@ cargo test -p kaleido-adapter-claude                   10 passed
 方向守卫变异验证：临时把 `BridgeToHost` 拒绝条件反转后，
 `host_direction_and_changed_session_identity_are_rejected_before_projection` 实际失败；恢复后通过。
 
-随后仍需要在有效 Claude 认证环境、隔离 toy project 中补录并验证：successful streaming turn、tool、
-permission allow/deny、真实 QuestionSet、interrupt 与 resume。随后补齐 crash/malformed/duplicate
-acceptance 错误测试与变异记录。在此之前 T-112 与 R5 保持 active。
+本轮真实 Provider 命令为 `npm run record:real` 与 `npm run probe:real-acceptance`；后者输出
+`result=pass`，上述十项 evidence 全为 true。T-112 的 SDK managed-session 范围已闭合；三 Provider
+同驻与实体 Android 总格继续由 T-113 负责，OpenCode 上游漂移仍由 T-111 阻塞。

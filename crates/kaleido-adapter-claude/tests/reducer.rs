@@ -17,7 +17,7 @@ use kaleido_proto::effect::StateEffect;
 use kaleido_proto::turn::TurnStatus;
 use serde_json::{json, Value};
 
-use support::{fixture_path, reducer, MemoryContent, BASE_AT_MS};
+use support::{auth_failure_fixture_path, fixture_path, reducer, MemoryContent, BASE_AT_MS};
 
 fn frame(kind: &str, payload: Value, at_ms: i64) -> TranscriptFrame {
     TranscriptFrame::from_value(
@@ -86,7 +86,7 @@ fn ready_projects_an_unbound_broker_session_until_the_sdk_assigns_its_id() {
 }
 
 #[test]
-fn real_sdk_capture_reduces_to_session_agent_item_and_failed_turn() {
+fn real_sdk_capture_reduces_to_session_agent_item_and_completed_turn() {
     let raw = fs::read_to_string(fixture_path()).expect("real SDK fixture exists");
     let transcript = parse_transcript(&raw).expect("real SDK fixture parses");
     let mut reducer = reducer();
@@ -98,14 +98,38 @@ fn real_sdk_capture_reduces_to_session_agent_item_and_failed_turn() {
     assert!(effects
         .iter()
         .any(|effect| matches!(effect, StateEffect::SessionUpserted { .. })));
-    // The fixture is intentionally an authentication failure, but the typed
-    // assistant message is still projected as an agent item rather than
-    // discarded or replaced by a fabricated success string.
+    // The typed assistant message is projected from the real SDK capture,
+    // rather than replaced by a fabricated success string.
     assert!(effects.iter().any(|effect| matches!(
         effect,
         StateEffect::ItemUpserted { item }
             if matches!(item.body, kaleido_proto::turn::ItemBody::AgentMessage { .. })
     )));
+    let turn = effects.iter().rev().find_map(|effect| match effect {
+        StateEffect::TurnUpserted { turn } => Some(turn),
+        _ => None,
+    });
+    assert_eq!(turn.map(|value| value.status), Some(TurnStatus::Completed));
+    assert!(turn.is_some_and(|value| value.error.is_none()));
+    assert!(effects
+        .iter()
+        .all(|effect| effect.validate_for_log().is_ok()));
+    assert!(!reducer.capability_probe().is_proven(Capability::TurnSteer));
+    assert!(reducer.capability_probe().is_proven(Capability::TurnPrompt));
+}
+
+#[test]
+fn real_sdk_authentication_failure_projects_auth_required_without_prompt_capability() {
+    let raw = fs::read_to_string(auth_failure_fixture_path())
+        .expect("real SDK authentication-failure fixture exists");
+    let transcript =
+        parse_transcript(&raw).expect("real SDK authentication-failure fixture parses");
+    let mut reducer = reducer();
+    let mut content = MemoryContent::default();
+    let effects = reducer
+        .ingest(&transcript, &mut content)
+        .expect("authentication-failure capture reduces");
+
     let turn = effects.iter().rev().find_map(|effect| match effect {
         StateEffect::TurnUpserted { turn } => Some(turn),
         _ => None,
@@ -117,10 +141,6 @@ fn real_sdk_capture_reduces_to_session_agent_item_and_failed_turn() {
             .as_ref()
             .is_some_and(|error| error.code == kaleido_proto::error::ErrorCode::AuthRequired)
     }));
-    assert!(effects
-        .iter()
-        .all(|effect| effect.validate_for_log().is_ok()));
-    assert!(!reducer.capability_probe().is_proven(Capability::TurnSteer));
     assert_eq!(
         reducer
             .capability_probe()

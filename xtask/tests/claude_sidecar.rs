@@ -11,27 +11,42 @@ use xtask::fixtures::{verify_claude_sidecar_paths, FixtureVerifyError, Identity}
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 #[test]
-fn recorded_sdk_authentication_failure_is_verified_as_failure_only() -> TestResult {
+fn broker_bridge_does_not_inherit_user_or_project_permission_rules() -> TestResult {
+    let fixtures = repository_claude_fixtures()?;
+    let crate_root = fixtures
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| io::Error::other("Claude fixture root is malformed"))?;
+    let bridge = fs::read_to_string(crate_root.join("bridge").join("index.ts"))?;
+
+    assert!(bridge.contains("permissionMode: \"default\""));
+    assert!(bridge.contains("settingSources: []"));
+    Ok(())
+}
+
+#[test]
+fn recorded_sdk_success_is_verified_as_acceptance_evidence() -> TestResult {
     let fixtures = repository_claude_fixtures()?;
 
     let summary = verify_claude_sidecar_paths(&fixtures, &Identity::default())?;
 
-    assert_eq!(summary.files, 1);
-    assert_eq!(summary.records, 6);
+    assert_eq!(summary.files, 2);
+    assert_eq!(summary.records, 13);
+    assert_eq!(summary.acceptance_files, 1);
     assert_eq!(summary.auth_failure_files, 1);
     Ok(())
 }
 
 #[test]
-fn authentication_failure_metadata_cannot_claim_acceptance() -> TestResult {
+fn successful_capture_metadata_cannot_disclaim_acceptance() -> TestResult {
     let (_root, fixtures) = copied_repository_fixture()?;
     let metadata = fixtures
         .join("sandbox")
         .join("real-sdk-simple-turn.metadata.json");
     let original = fs::read_to_string(&metadata)?;
     let changed = original.replace(
-        "\"acceptance_eligible\": false",
         "\"acceptance_eligible\": true",
+        "\"acceptance_eligible\": false",
     );
     if changed == original {
         return Err(io::Error::other("metadata mutation did not change the fixture").into());
@@ -40,22 +55,22 @@ fn authentication_failure_metadata_cannot_claim_acceptance() -> TestResult {
 
     let error = verification_error(
         verify_claude_sidecar_paths(&fixtures, &Identity::default()),
-        "an authentication failure must never become acceptance evidence",
+        "successful evidence must not contradict its acceptance metadata",
     )?;
 
     assert!(error.issues().iter().any(|issue| {
-        issue.category == "authentication-failure fixture must not be acceptance eligible"
+        issue.category == "Claude fixture acceptance eligibility contradicts its expected outcome"
             && issue.pointer.as_deref() == Some("/acceptance_eligible")
     }));
     Ok(())
 }
 
 #[test]
-fn successful_result_cannot_pass_as_an_authentication_failure_capture() -> TestResult {
+fn terminal_error_cannot_pass_as_a_successful_capture() -> TestResult {
     let (_root, fixtures) = copied_repository_fixture()?;
     let capture = fixtures.join("sandbox").join("real-sdk-simple-turn.jsonl");
     let original = fs::read_to_string(&capture)?;
-    let changed = original.replacen("\"is_error\":true", "\"is_error\":false", 1);
+    let changed = original.replacen("\"is_error\":false", "\"is_error\":true", 1);
     if changed == original {
         return Err(io::Error::other("result mutation did not change the fixture").into());
     }
@@ -63,15 +78,15 @@ fn successful_result_cannot_pass_as_an_authentication_failure_capture() -> TestR
 
     let error = verification_error(
         verify_claude_sidecar_paths(&fixtures, &Identity::default()),
-        "a successful result must contradict failure-only metadata",
+        "a terminal error must contradict success metadata",
     )?;
 
     assert!(error.issues().iter().any(|issue| {
-        issue.category == "authentication-failure fixture contains a successful result"
-            && issue.pointer.as_deref() == Some("/payload/event/is_error")
+        issue.category == "Claude acceptance fixture contains authentication-failure evidence"
+            && issue.pointer.as_deref() == Some("/payload/event")
     }));
     assert!(error.issues().iter().any(|issue| {
-        issue.category == "Claude failure fixture is missing the terminal API-error result"
+        issue.category == "Claude acceptance fixture is missing the terminal success result"
     }));
     Ok(())
 }

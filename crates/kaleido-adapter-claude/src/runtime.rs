@@ -15,6 +15,7 @@ use kaleido_proto::host::ConnectionFaultReason;
 use kaleido_proto::ids::{
     CommandId, ProjectBindingId, ProjectId, ProviderRuntimeId, SessionId, TurnId,
 };
+use kaleido_proto::queue::{QueueEntry, QueueIntent, QueueState};
 use serde_json::{json, Value};
 
 use crate::error::ClaudeAdapterError;
@@ -604,9 +605,8 @@ impl ProviderRuntimeSession for ClaudeRuntimeSession {
             &format!("prompt|{turn_id}"),
             at_ms,
         ));
-        effects.push(StateEffect::CapabilitiesUpdated {
-            capabilities: self.reducer.capability_probe().to_capabilities(),
-        });
+        effects.push(self.reducer.publish_capabilities_effect());
+        effects.extend(self.reducer.refresh_live_binding(at_ms));
         Ok(effects)
     }
 
@@ -796,9 +796,76 @@ impl ProviderRuntimeSession for ClaudeRuntimeSession {
             &format!("interrupt|{}", turn_id.as_str()),
             at_ms,
         ));
-        effects.push(StateEffect::CapabilitiesUpdated {
-            capabilities: self.reducer.capability_probe().to_capabilities(),
-        });
+        effects.push(self.reducer.publish_capabilities_effect());
+        effects.extend(self.reducer.refresh_live_binding(at_ms));
+        Ok(effects)
+    }
+
+    fn deliver_queue_entry(
+        &mut self,
+        command_id: &CommandId,
+        entry: &QueueEntry,
+        content: &mut dyn ContentAccess,
+    ) -> Result<Vec<StateEffect>, RuntimeSessionError> {
+        self.require_started()?;
+        if entry.intent != QueueIntent::NewTurn
+            || self.reducer.session_id() != Some(&entry.session_id)
+        {
+            return Err(RuntimeSessionError::CapabilityUnavailable);
+        }
+        entry.body.ensure_sensitive("queue_entry.body")?;
+        let bytes = content.load(&entry.body).map_err(content_load_error)?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| RuntimeSessionError::ProtocolViolation {
+                detail: "the queued prompt body is not valid UTF-8".to_owned(),
+            })?
+            .to_owned();
+        self.next_turn = self.next_turn.saturating_add(1);
+        let raw_turn = format!("turn-{}", self.next_turn);
+        self.reducer.register_queued_prompt(&raw_turn, command_id);
+        if let Err(error) = self.send_command(
+            "prompt",
+            json!({ "turn_id": raw_turn.as_str(), "text": text }),
+        ) {
+            self.reducer.forget_local_prompt(&raw_turn);
+            return Err(error);
+        }
+        let mut effects = match self.await_kind("prompt_accepted", content) {
+            Ok(effects) => effects,
+            Err(error) => {
+                self.reducer.forget_local_prompt(&raw_turn);
+                return Err(error);
+            }
+        };
+        let turn_id = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                StateEffect::TurnUpserted { turn }
+                    if turn.session_id == entry.session_id
+                        && matches!(
+                            &turn.origin,
+                            kaleido_proto::turn::TurnOrigin::RemoteCommand {
+                                command_id: turn_command_id
+                            } if turn_command_id == command_id
+                        ) =>
+                {
+                    Some(turn.id.clone())
+                }
+                _ => None,
+            })
+            .next_back()
+            .ok_or(RuntimeSessionError::ProtocolViolation {
+                detail: "the queued prompt receipt produced no correlated turn".to_owned(),
+            })?;
+        let at_ms = self.absolute_at_ms();
+        let mut delivered = entry.clone();
+        delivered.state = QueueState::DeliveredAsNewTurn {
+            turn_id,
+            delivered_at_ms: at_ms,
+        };
+        delivered.editable = false;
+        delivered.updated_at_ms = at_ms;
+        effects.push(StateEffect::QueueEntryUpserted { entry: delivered });
         Ok(effects)
     }
 
