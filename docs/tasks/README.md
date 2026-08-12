@@ -9,6 +9,7 @@
 | [T-111](T-111.md) | R5 OpenCode REST/SSE、D-B11、生成类型、真实会话与恢复 | active；question fixture 通过，latest generated live 因 `/doc`/`/event` 漂移 blocked |
 | [T-113](T-113.md) | R5 多 provider hostd/移动端集成、跨平台 CI 与实体 Android 总门禁 | active；`58e1e9d` 自动化与 Claude 实体 Android 子格通过，受 T-111、三家同驻/实体总格阻塞 |
 | [T-115](T-115.md) | R4 自有 Ubuntu、真实 FCM、蜂窝与实体 arm64 release/physical gate | active |
+| [T-116](T-116.md) | R6 跨 Agent workflow、Artifact 交接、Android WorkflowBoard 与真实三步纵切 | active；任务定义已建立，实现尚未启动；不关闭 T-111/T-113/T-115 |
 
 ## 已完成
 

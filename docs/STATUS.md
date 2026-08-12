@@ -96,9 +96,11 @@ approval decline、90 秒 OEM 后台、外部 force-stop cursor 恢复与 durabl
 | 3 | [T-108](tasks/T-108.md) | Android Compose 项目/会话/实时/队列/Attention、冷启与断线恢复 |
 | 4 | [T-109](tasks/T-109.md) | 实体 arm64 Wi-Fi、硬件密钥、真实审批、OEM 后台、force-stop 与吊销最终门禁 |
 
-当前活动任务是 [T-111](tasks/T-111.md)、[T-113](tasks/T-113.md) 与
-[T-115](tasks/T-115.md)。T-115 只执行 R4 自有 Ubuntu、真实 FCM、蜂窝与实体 arm64
-release/physical gate，不继续扩展 R4 功能代码；T-111/T-113 继续承接 R5 的真实阻塞与未闭合总格。
+当前活动任务是 [T-111](tasks/T-111.md)、[T-113](tasks/T-113.md)、
+[T-115](tasks/T-115.md) 与 [T-116](tasks/T-116.md)。T-115 只执行 R4 自有 Ubuntu、真实 FCM、
+蜂窝与实体 arm64 release/physical gate，不继续扩展 R4 功能代码；T-111/T-113 继续承接 R5 的
+真实阻塞与未闭合总格。T-116 是 PR #12 合并后建立的 R6 独立任务卡，当前只有范围与门禁定义，
+尚未启动实现，也不改变前三张卡的 active 状态。
 
 截至 2026-08-11，T-110 的实现已闭合 ADR-0024、REMOTE_CONTROL 0.1、
 自有 iroh relay、复用 R3 pinned TLS 的公网数据面、FCM FID、逐 key cursor 恢复；本轮审核又
@@ -121,7 +123,7 @@ D-B11 → T-112 Claude SDK managed session → T-113 multi-runtime/移动端/跨
 |---|---|
 | R4 release gate / [T-115](tasks/T-115.md) | 自有 Ubuntu、真实 FCM、蜂窝/实体 arm64 全纵切与零 canary 验收 |
 | R5 / [T-111～T-114](tasks/README.md) | active；Claude managed-session、实体 Android 子格与 `58e1e9d` 自动化子门禁已通过；OpenCode generated live/D-B11 被同版本合同漂移阻塞，三家同驻/实体总格未验收 |
-| R6 | 跨 Agent workflow 执行器与手机 WorkflowBoard |
+| R6 / [T-116](tasks/T-116.md) | active；独立任务卡已建立，实现尚未启动；跨 Agent workflow 执行器与手机 WorkflowBoard |
 | R7 | 三家 CLI/GUI 六格真实验收 |
 | R8 | iOS 产品对齐 |
 | R9 | 路径安全、代码预览、Git、打包与发布硬化 |

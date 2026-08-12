@@ -172,6 +172,9 @@ capability 明示；`cargo xtask ci`、跨平台 CI 和实体 Android 纵切全�
 
 ## R6 — 跨 Agent 工作流
 
+状态：**active；[T-116](tasks/T-116.md) 已建立，实现尚未启动**。本里程碑可在 T-111、T-113、
+T-115 保持 active 的同时独立推进；R6 进展不得抹去或代替那些真实门禁。
+
 完成：
 
 - workflow DAG 与持久化；
