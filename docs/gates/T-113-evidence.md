@@ -107,14 +107,22 @@ R4 蜂窝/relay 门禁。
 
 ## 3. 本地总门禁
 
-父提交 `d39b5709716faecffbdc1ee6ca3a3bb7aa14c42b` 的完整 `cargo xtask ci` exit 0，包含 fmt、check-deps、lint-forbidden、clippy、
-`claude-sidecar`、workspace test 与 fixtures verify。fixture summary：
+提交 `58e1e9ddf90b17501553c8bdbf4c96ec4cf5d39e` 的完整本地 `cargo xtask ci` exit 0，
+包含 fmt、check-deps、lint-forbidden、clippy、`claude-sidecar`、workspace test、五个显式
+`xtask/tests` integration target 与 fixtures verify。fixture summary：
 
 ```text
-8 file(s), 369 record(s)
+9 file(s), 375 record(s)
 codex: 3, acp-claude: 1, opencode: 3,
-claude-sidecar: 1 file / 7 records, acceptance: 1, authentication-failure-only: 0
+claude-sidecar: 2 files / 13 records, acceptance: 1, authentication-failure-only: 1
 ```
+
+该提交修复了复核发现的三项门禁缺口：`cargo xtask ci` 不再漏跑 `xtask/tests` 的五个
+integration targets；Windows 外置构建根可显式选择任意绝对本地盘符，且无 `D:` 时使用可移植默认值；
+Claude 真实成功 fixture 与真实 authentication-failure fixture 同时保留，后者实际命中
+`AuthenticationRequired` / `AuthRequired` reducer 路径。测试计划临时漏掉 `schema_diff` 时，
+integration-target 守卫实际失败；临时破坏 `authentication_failed` 匹配时，真实失败 fixture reducer
+测试实际失败。两项变异恢复后完整本地总门禁通过。
 
 隔离安装精确 Codex `0.147.0` 后，`cargo xtask schema diff` exit 0：Codex `0.147.0`、OpenCode `1.18.16`、ACP schema `1.18.0`，
 共 288 JSON files，required-surface 内外 0 drift。该静态结果不能发现 T-111 真实 `/event` 违反
@@ -136,19 +144,18 @@ canonical pump 尚需最终真实 provider 重跑；Claude 本地 SDK input queu
 受影响的 Claude/state 全量测试与 Claude/state/hostd all-target Clippy，均通过，并由上述实体
 纵切验证最终产品路径。删除 project-binding runtime fallback 的实际变异使
 `a_provisional_broker_session_uses_its_project_binding_for_reachability` 变红为 `Offline`，恢复后通过。
-PR #12 的 exact-commit 全量结果最终由 `3393b3edf0527baefed514c34fe5fc257024f9c8`
-闭合，未沿用父提交绿灯。该提交只把 Windows hosted runner 上 PowerShell 子进程 PID 握手的
-测试超时从 10 秒放宽到 30 秒；进程树终止的独立 10 秒 deadline 未改变。它修复了
-`7ac048d8f2e9d2239f42ed48f2d613b03ec9e1ab` 的真实 Windows CI 失败，而没有放宽生产语义。
+PR #12 的最新 substantive code 候选为 `58e1e9ddf90b17501553c8bdbf4c96ec4cf5d39e`。
+它在既有 `3393b3e` Windows timeout 修复之上，恢复了被遗漏的全部 `xtask/tests` integration
+targets、移除 Windows 对 `D:` 的强制依赖，并让 Claude 成功/认证失败真实 fixture 并存。
 
 exact-commit 运行结果：
 
-- CI workflow：<https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31570832960>
-  - Windows：<https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31570832960/job/94032273786>
-  - macOS：<https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31570832960/job/94032273789>
-  - Ubuntu：<https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31570832960/job/94032273824>
-- Android CI workflow：<https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31570832927>
-  - Android API 35 (x86_64)：<https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31570832927/job/94032273832>
+- CI workflow：<https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31577478834>
+  - Windows：<https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31577478834/job/94052763728>
+  - macOS：<https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31577478834/job/94052763658>
+  - Ubuntu：<https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31577478834/job/94052763653>
+- Android CI workflow：<https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31577478837>
+  - Android API 35 (x86_64)：<https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31577478837/job/94052763790>
 
 上述四项均为 `success`。这只关闭 exact-SHA 跨平台/Android 自动化门禁；OpenCode live drift、
 三 Provider 同驻与 R4 蜂窝/relay 实体门禁仍保持未完成。
@@ -162,18 +169,18 @@ exact-commit 运行结果：
 | 三家 streaming/history/waiting-human/reconnect | **未通过** | Claude 已通过；OpenCode stable live/reconnect 仍 fail-closed |
 | Resume / queue / steer / interrupt contract | **Claude 实体 queue/resume 通过；总格未通过** | Claude NewTurn receipt + Attention decline + App force-stop cursor resume 已验；Steer 仍不伪造 |
 | host/provider crash 与 mobile cursor resume | **Claude App 冷启通过；provider crash/总格未通过** | Claude cursor 14→17；R3 Codex 历史证据不能自动覆盖其余 provider |
-| `cargo xtask ci` | **PR #12 exact commit CI 通过** | `3393b3e` 的 Windows/macOS/Ubuntu workflow 全绿；本地仍按阶段化门禁避免重复全量构建 |
+| `cargo xtask ci` | **PR #12 exact code commit CI 通过** | `58e1e9d` 的本地总门禁与 Windows/macOS/Ubuntu workflow 全绿；五个 xtask integration target 被实际执行 |
 | `cargo xtask schema diff` | **最新集成候选本地通过** | 精确 Codex `0.147.0`；288 JSON files、in/out surface 0 drift；OpenCode live contract drift 仍另行阻塞 |
 | Android clean build/lint/API 35 | **`fc896be` 本地通过** | 双 ABI AAR/APK/JVM/lint；native smoke 1/1；全量 18 completed / 0 failed，2 physical-only skipped |
-| Windows/macOS/Linux CI + Android CI | **`3393b3e` exact run 通过** | CI `31570832960` 三平台全绿；Android CI `31570832927` 全绿 |
+| Windows/macOS/Linux CI + Android CI | **`58e1e9d` exact run 通过** | CI `31577478834` 三平台全绿；Android CI `31577478837` 全绿 |
 | 实体 arm64 Android + 真实 Wi-Fi 三家纵切 | **Claude 子格通过；Codex/OpenCode/同驻未通过** | 真机、真 Wi-Fi、真 Claude SDK；无 emulator/mock/`adb reverse` |
 | R4 合并后蜂窝/relay 重跑 | **外部验收 pending** | R4 实现已进 `main`；T-115 的实体蜂窝/relay 门禁仍独立 pending |
 
 ## 5. 已知本地实现阻塞
 
-- `CapabilityProbe` 目前只能表达 `Supported` / `NotVerified`，尚未把断线、OAuth auth failure 与
-  明确 upstream block 映射为 `UnavailableOnThisConnection` / `AuthenticationRequired` /
-  `UpstreamBlocked`；
+- Claude `authentication_failed` 已由保留的真实失败 fixture 证明会映射为
+  `AuthenticationRequired` / `AuthRequired`；断线与明确 upstream block 的 connection-level
+  capability 分类仍需真实证据闭合；
 - Claude typed history read 已用真实新建 session 得到非空官方消息页；permission allow/deny、QuestionSet、
   interrupt 与新进程 resume 也已通过。discovered Session 使用 `ProviderManaged`，不冒充原生 CLI/GUI ownership；
 - OpenCode SSE 已按 event session 精确路由并按 event id 去重，但 provider reconnect 仍明确
@@ -182,11 +189,11 @@ exact-commit 运行结果：
 
 ## 6. 完成条件
 
-T-113 只有在 T-111 上游空缺闭合、三家同驻纵切、`cargo xtask ci`、跨平台
-CI exact commit runs 与实体 arm64 Android 真实 Wi-Fi 纵切全部通过后才能完成。
+自动化子门禁已经闭合。T-113 只有在 T-111 上游空缺闭合、三家同驻纵切、剩余真实
+错误/恢复/变异格与实体 arm64 Android 真实 Wi-Fi 纵切全部通过后才能完成。
 
-2026-08-12 复核 PR #12 的 `3393b3edf0527baefed514c34fe5fc257024f9c8`：Windows、macOS、Ubuntu 与
-Android API 35 四项均成功；对应 workflow 为 `31570832960` 与 `31570832927`。因此 exact-SHA
+2026-08-12 复核 PR #12 的 `58e1e9ddf90b17501553c8bdbf4c96ec4cf5d39e`：Windows、macOS、Ubuntu 与
+Android API 35 四项均成功；对应 workflow 为 `31577478834` 与 `31577478837`。因此 exact-SHA
 自动化子门禁已关闭，但 T-113 仍保持 active，不能据此跳过 OpenCode live drift、三 Provider 同驻、
 实体 arm64 三家纵切或 R4 蜂窝/relay 验收。R4 合并后还必须在最终 SHA 重跑蜂窝/relay；当前
 LAN 证据不等于公网恢复。

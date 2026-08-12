@@ -29,12 +29,13 @@ cargo xtask claude-sidecar
 doc tests 与 fixtures verify。fixture 汇总为：
 
 ```text
-8 file(s), 369 record(s)
+9 file(s), 375 record(s)
 codex: 3, acp-claude: 1, opencode: 3,
-claude-sidecar: 1 file / 7 records, acceptance: 1, authentication-failure-only: 0
+claude-sidecar: 2 files / 13 records, acceptance: 1, authentication-failure-only: 1
 ```
 
-exact-commit Windows/macOS/Linux run 仍由 T-113 记录，不能用本地总门禁替代。
+`58e1e9d` 的 exact-commit Windows/macOS/Linux 与 Android run 已由 T-113 记录并成功；实体总格
+仍不能用本地或 hosted 自动化替代。
 
 focused reducer 测试已覆盖 structured QuestionSet frame；bridge prompt queue 只有在官方 SDK query
 消费 user message 后才发 `prompt_accepted`，adapter 再把它与本地 command、目标 canonical
@@ -65,9 +66,12 @@ QuestionSet 回答、permission allow、permission deny（并验证被拒文件�
 {"capture":"real_provider","provider_version":"0.3.226","expected_outcome":"simple_turn_success","acceptance_eligible":true}
 ```
 
-统一 fixture verifier 现在扫描该 sidecar fixture/metadata；缺 metadata、错误版本/预期、把
+同时保留真实 `real-sdk-authentication-failure.jsonl` 与配套 metadata；它来自同一钉定 SDK 的
+authentication failure，并保持 `acceptance_eligible=false`，不会冒充成功验收。统一 fixture verifier
+同时扫描成功与失败两类 sidecar fixture/metadata；缺 metadata、错误版本/预期、把成功 fixture 的
 `acceptance_eligible` 改成 false 或把 terminal success 变成 error 都会失败；无效 JSON 与密钥泄漏
-拒绝路径也继续覆盖。实际把 verifier 的 `is_error == false` 判断反转后，acceptance 测试变红；恢复后通过。
+拒绝路径也继续覆盖。实际把 verifier 的 `is_error == false` 判断反转后，acceptance 测试变红；
+临时破坏 `authentication_failed` reducer 匹配时，真实失败 fixture 测试也实际变红；恢复后通过。
 
 ## 3. provisional Session 证据
 
@@ -94,8 +98,8 @@ Session。
 | official SDK typecheck / CI step | **通过（focused）** | pinned package/lockfile + `cargo xtask claude-sidecar`；已接入总 CI |
 | real success fixture verification | **通过** | metadata `acceptance_eligible=true`，统一 verifier 覆盖 |
 | provider-neutral bootstrap | **通过（本地真实进程）** | provisional Session 与 T-113 双 runtime clean shutdown |
-| discovery implementation | **focused 测试/类型通过** | official `listSessions()` metadata；尚无独立真实 discovery recording |
-| history read implementation | **focused 通过；provider 验收未通过** | official `getSessionMessages(sessionId, { dir, offset, limit<=100, includeSystemMessages:true })` 已接入；只接受同一精确 discovery cwd/session，非空结果才证明 `HistoryRead` |
+| discovery implementation | **通过** | official `listSessions()` metadata；live probe 已在精确目录列出刚创建的真实 session |
+| history read implementation | **通过** | official `getSessionMessages(sessionId, { dir, offset, limit<=100, includeSystemMessages:true })` 已接入；live probe 只接受同一精确 discovery cwd/session，并得到非空结果 |
 | real history read | **通过** | live probe 对刚创建的同一 exact-dir/session 执行 list + bounded history，得到非空官方消息页 |
 | discovered-session ownership | **focused 实现/测试通过** | `listSessions()` 结果为 UACP `ProviderManaged`：只表达公开 SDK 管理持久化与 structured list/resume，不冒充独立 CLI/GUI attach |
 | successful streaming turn | **通过** | committed real fixture + live probe terminal success |
@@ -104,7 +108,7 @@ Session。
 | real interrupt | **通过** | `activeQuery.interrupt()` 返回结构化 receipt |
 | real resume/recovery | **通过** | 新 sidecar process 以同一 session id resume 并再次完成 turn |
 | capability honesty | **通过（provider 面）** | capability 只随真实 typed evidence 提升；最终 Android 展示仍由 T-113 验收 |
-| `cargo xtask ci` | **待本分支最终 SHA 一次性总门禁** | focused provider/verifier 测试已通过，不重复冒充总门禁 |
+| `cargo xtask ci` | **通过** | `58e1e9d` 本地总门禁与 Windows/macOS/Ubuntu exact workflow 全绿；Android workflow 同样成功 |
 
 ## 5. 解除条件
 
@@ -122,4 +126,4 @@ cargo test -p kaleido-adapter-claude                   10 passed
 
 本轮真实 Provider 命令为 `npm run record:real` 与 `npm run probe:real-acceptance`；后者输出
 `result=pass`，上述十项 evidence 全为 true。T-112 的 SDK managed-session 范围已闭合；三 Provider
-同驻、实体 Android 与 exact-commit CI 继续由 T-113 负责，OpenCode 上游漂移仍由 T-111 阻塞。
+同驻与实体 Android 总格继续由 T-113 负责，OpenCode 上游漂移仍由 T-111 阻塞。

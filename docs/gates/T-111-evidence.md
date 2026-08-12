@@ -146,4 +146,4 @@ REST snapshot + 新 SSE tail 不能证明输入无 gap。
 - 先取得与真实 `/event` 一致、可生成且可审查的上游合同，或上游修复同版本 `/doc`；禁止手写绕过；
 - permission allow/deny、active abort、强制 SSE 断线/重连的真实 provider 证据；
 - success/refusal/unknown/reconnect/duplicate/gap 的完整会失败测试与记录的变异红灯；
-- T-113 的跨平台 CI 与实体 Android 总门禁。
+- T-113 的 Codex/OpenCode、三家同驻与实体 Android 总门禁。

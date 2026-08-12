@@ -1,6 +1,6 @@
 # OneKaleidoscope 当前状态
 
-> 生效：2026-08-11
+> 生效：2026-08-12
 > 进度基线：R3 / T-109 实体 arm64 Android 最终门禁通过；提交 SHA 与本机证据见
 > [T-109 门禁结果](gates/T-109-result.md)。R4 功能实现已由 PR #11 进入 `main`，最终公网
 > release/physical acceptance 由 T-115 独立承接；R5 正把旧基线上的 provider 实现集成到该主线。
@@ -21,18 +21,20 @@ R5 / T-111、T-113 仍为 active；T-112 Claude managed-session 与 T-114 共享
 
 Agent 数据只来自公开结构化协议；PTY/TUI/ANSI 抓屏仍被禁止。
 
-R5 当前分支已经落地 OpenCode 生成型 REST/SSE adapter、Claude 官方 Agent SDK sidecar、
+R5 的 PR #12 已经落地 OpenCode 生成型 REST/SSE adapter、Claude 官方 Agent SDK sidecar、
 provider-neutral multi-runtime hostd 与 UACP `0.5.0` QuestionSet/scoped runtime ack 合同。
 真实 OpenCode `1.18.16` question fixture 已通过，但最新 generated product live probe 暴露同版本
 `/doc` 与 `/event` 的 timestamp 类型冲突及未声明 heartbeat，adapter fail-closed，实时/恢复与 D-B11
-仍被阻塞；Claude SDK `0.3.226` 已有真实成功 fixture 与 live acceptance probe，覆盖成功 turn、
-permission allow/deny、QuestionSet、interrupt、resume、discovery 与非空 history。最新 R4/R5 集成候选的 `cargo xtask ci` 已完整通过；
+仍被阻塞；Claude SDK `0.3.226` 已有真实成功与 authentication-failure fixture，以及 live acceptance
+probe，覆盖成功 turn、permission allow/deny、QuestionSet、interrupt、resume、discovery 与非空
+history。PR #12 的最新代码候选 `58e1e9d` 已完整通过本地 `cargo xtask ci`；
 用隔离安装的精确 Codex `0.147.0` 跑 schema diff，288 个 JSON 文件面内/面外均 0 drift。Android
 双 ABI/UniFFI clean AAR/APK/lint/JVM 与 API 35 instrumentation 已在 `fc896be` 通过；全量设备测试
 18 completed / 0 failed，2 个实体专用门禁在模拟器阶段按设计 skipped。随后 `c929a85` 已在实体
 arm64 Android + 真实 Wi-Fi 上闭合 Claude provisional 首轮 NewTurn、真实审批 decline、七投影、
-断线重连与 force-stop 后 cursor 14→17 冷启恢复；没有使用 `adb reverse`。exact-commit 跨平台 CI
-仍待完成，Codex/OpenCode 与三 provider 同驻实体总格仍 blocked。
+断线重连与 force-stop 后 cursor 14→17 冷启恢复；没有使用 `adb reverse`。`58e1e9d` 的
+Windows/macOS/Ubuntu CI `31577478834` 与 Android CI `31577478837` 均成功，自动化子门禁已闭合；
+Codex/OpenCode 与三 provider 同驻实体总格仍 blocked。
 
 R3 的三条旧前置已全部解除：
 
@@ -94,8 +96,9 @@ approval decline、90 秒 OEM 后台、外部 force-stop cursor 恢复与 durabl
 | 3 | [T-108](tasks/T-108.md) | Android Compose 项目/会话/实时/队列/Attention、冷启与断线恢复 |
 | 4 | [T-109](tasks/T-109.md) | 实体 arm64 Wi-Fi、硬件密钥、真实审批、OEM 后台、force-stop 与吊销最终门禁 |
 
-当前活动任务是 [T-115](tasks/T-115.md)：只执行 R4 自有 Ubuntu、真实 FCM、蜂窝与
-实体 arm64 release/physical gate；不继续扩展 R4 功能代码。
+当前活动任务是 [T-111](tasks/T-111.md)、[T-113](tasks/T-113.md) 与
+[T-115](tasks/T-115.md)。T-115 只执行 R4 自有 Ubuntu、真实 FCM、蜂窝与实体 arm64
+release/physical gate，不继续扩展 R4 功能代码；T-111/T-113 继续承接 R5 的真实阻塞与未闭合总格。
 
 截至 2026-08-11，T-110 的实现已闭合 ADR-0024、REMOTE_CONTROL 0.1、
 自有 iroh relay、复用 R3 pinned TLS 的公网数据面、FCM FID、逐 key cursor 恢复；本轮审核又
@@ -117,7 +120,7 @@ D-B11 → T-112 Claude SDK managed session → T-113 multi-runtime/移动端/跨
 | 里程碑 | 内容 |
 |---|---|
 | R4 release gate / [T-115](tasks/T-115.md) | 自有 Ubuntu、真实 FCM、蜂窝/实体 arm64 全纵切与零 canary 验收 |
-| R5 / [T-111～T-114](tasks/README.md) | active；Claude managed-session 与实体 Android 子格已通过；OpenCode generated live/D-B11 被同版本合同漂移阻塞，三家同驻与 exact-commit CI 未验收 |
+| R5 / [T-111～T-114](tasks/README.md) | active；Claude managed-session、实体 Android 子格与 `58e1e9d` 自动化子门禁已通过；OpenCode generated live/D-B11 被同版本合同漂移阻塞，三家同驻/实体总格未验收 |
 | R6 | 跨 Agent workflow 执行器与手机 WorkflowBoard |
 | R7 | 三家 CLI/GUI 六格真实验收 |
 | R8 | iOS 产品对齐 |

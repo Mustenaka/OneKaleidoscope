@@ -57,5 +57,5 @@ androidTest source 与 JVM tests；`fc896be` 的 clean AAR/APK/lint/JVM 和 API 
 
 ## 4. R5 仍未完成的外部门禁
 
-T-114 共享合同卡已完成，但 T-113 的 exact-commit 跨平台 CI 与实体 arm64 Android 三 provider
-纵切仍未通过；`adb devices -l` 为空。它们继续阻止 R5 完成，但不反向抹去本卡本地合同门禁。
+T-114 共享合同卡已完成；T-113 的 exact-commit 自动化子门禁已在 `58e1e9d` 关闭，但实体 arm64
+Android 三 provider 纵切仍未通过。后者继续阻止 R5 完成，但不反向抹去本卡本地合同门禁。

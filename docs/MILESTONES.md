@@ -1,6 +1,6 @@
 # MILESTONES — 重新定基线后的实施顺序
 
-> 生效：2026-08-10（R3 最终门禁后更新）
+> 生效：2026-08-12（PR #12 自动化子门禁后更新）
 > 原 M1 与 T-001～T-014 已冻结/撤销。R0～R3 已完成，R1 携带的 UB-R1-S 已由
 > [T-102](tasks/T-102.md) 解除；R4 功能实现已进入 `main`，release/physical acceptance 由
 > T-115 承接；独立 R5 provider 工作仍为 active。R5 不得把 LAN/provider 进展冒充 R4
@@ -160,10 +160,11 @@ NAT 20 轮测试属于性能与容量数据，不再决定 relay 是否开发，
 - `c929a85` 已在实体 arm64 Android + 真实 Wi-Fi 上完成 Claude provisional 首轮 NewTurn、
   真实 approval decline、七投影、断线重连与外部 force-stop 后 cursor 14→17 冷启恢复；全程
   未使用 emulator/mock/`adb reverse`，该证据只关闭 Claude 的实体子格；
+- PR #12 最新代码候选 `58e1e9d` 已通过完整本地 `cargo xtask ci`，并在 CI `31577478834`
+  的 Windows/macOS/Ubuntu 与 Android CI `31577478837` 全部成功；这只关闭自动化子门禁。
 
 仍未通过：OpenCode `/doc`/`/event` 漂移解除与实时/恢复/其余真实动作矩阵、Codex/OpenCode
-实体子格、三家同驻、exact-commit Windows/macOS/Linux + Android CI，以及
-R4 合并后的公网重跑。
+实体子格、三家同驻，以及 R4 合并后的公网重跑。
 
 最终门禁：三家各完成真实流式 turn、历史、等待人工、断线恢复；缺失能力由 runtime
 capability 明示；`cargo xtask ci`、跨平台 CI 和实体 Android 纵切全部有 exact commit 证据。
