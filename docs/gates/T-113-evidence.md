@@ -2,7 +2,7 @@
 
 > 状态：**active；Claude 实体 Android 纵切通过，三 Provider 最终门禁未通过**
 > 集成基线：`origin/main@b54a12638cd044b277747d5fbc22627ad2adb016`
-> 记录日期：2026-08-11
+> 记录日期：2026-08-12
 
 ## 1. provider-neutral host composition
 
@@ -136,7 +136,22 @@ canonical pump 尚需最终真实 provider 重跑；Claude 本地 SDK input queu
 受影响的 Claude/state 全量测试与 Claude/state/hostd all-target Clippy，均通过，并由上述实体
 纵切验证最终产品路径。删除 project-binding runtime fallback 的实际变异使
 `a_provisional_broker_session_uses_its_project_binding_for_reachability` 变红为 `Offline`，恢复后通过。
-exact-commit 全量结果交由 PR CI，不能沿用父提交绿灯。
+PR #12 的 exact-commit 全量结果最终由 `3393b3edf0527baefed514c34fe5fc257024f9c8`
+闭合，未沿用父提交绿灯。该提交只把 Windows hosted runner 上 PowerShell 子进程 PID 握手的
+测试超时从 10 秒放宽到 30 秒；进程树终止的独立 10 秒 deadline 未改变。它修复了
+`7ac048d8f2e9d2239f42ed48f2d613b03ec9e1ab` 的真实 Windows CI 失败，而没有放宽生产语义。
+
+exact-commit 运行结果：
+
+- CI workflow：<https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31570832960>
+  - Windows：<https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31570832960/job/94032273786>
+  - macOS：<https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31570832960/job/94032273789>
+  - Ubuntu：<https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31570832960/job/94032273824>
+- Android CI workflow：<https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31570832927>
+  - Android API 35 (x86_64)：<https://github.com/Mustenaka/OneKaleidoscope/actions/runs/31570832927/job/94032273832>
+
+上述四项均为 `success`。这只关闭 exact-SHA 跨平台/Android 自动化门禁；OpenCode live drift、
+三 Provider 同驻与 R4 蜂窝/relay 实体门禁仍保持未完成。
 
 ## 4. 总门禁
 
@@ -147,10 +162,10 @@ exact-commit 全量结果交由 PR CI，不能沿用父提交绿灯。
 | 三家 streaming/history/waiting-human/reconnect | **未通过** | Claude 已通过；OpenCode stable live/reconnect 仍 fail-closed |
 | Resume / queue / steer / interrupt contract | **Claude 实体 queue/resume 通过；总格未通过** | Claude NewTurn receipt + Attention decline + App force-stop cursor resume 已验；Steer 仍不伪造 |
 | host/provider crash 与 mobile cursor resume | **Claude App 冷启通过；provider crash/总格未通过** | Claude cursor 14→17；R3 Codex 历史证据不能自动覆盖其余 provider |
-| `cargo xtask ci` | **父提交 `d39b570` 本地通过** | `c929a85` 仅定向回归/Clippy/实体纵切；exact-commit 全量等待 PR CI |
+| `cargo xtask ci` | **PR #12 exact commit CI 通过** | `3393b3e` 的 Windows/macOS/Ubuntu workflow 全绿；本地仍按阶段化门禁避免重复全量构建 |
 | `cargo xtask schema diff` | **最新集成候选本地通过** | 精确 Codex `0.147.0`；288 JSON files、in/out surface 0 drift；OpenCode live contract drift 仍另行阻塞 |
 | Android clean build/lint/API 35 | **`fc896be` 本地通过** | 双 ABI AAR/APK/JVM/lint；native smoke 1/1；全量 18 completed / 0 failed，2 physical-only skipped |
-| Windows/macOS/Linux CI + Android CI | **`9791c40` 的 PR #12 exact run 未通过总门禁** | Windows/macOS success；Ubuntu job 未完成且 workflow `31504076560` 已 cancelled；Android CI 未在该 SHA 运行，仍不能标绿 |
+| Windows/macOS/Linux CI + Android CI | **`3393b3e` exact run 通过** | CI `31570832960` 三平台全绿；Android CI `31570832927` 全绿 |
 | 实体 arm64 Android + 真实 Wi-Fi 三家纵切 | **Claude 子格通过；Codex/OpenCode/同驻未通过** | 真机、真 Wi-Fi、真 Claude SDK；无 emulator/mock/`adb reverse` |
 | R4 合并后蜂窝/relay 重跑 | **外部验收 pending** | R4 实现已进 `main`；T-115 的实体蜂窝/relay 门禁仍独立 pending |
 
@@ -168,11 +183,13 @@ exact-commit 全量结果交由 PR CI，不能沿用父提交绿灯。
 ## 6. 完成条件
 
 T-113 只有在 T-111 上游空缺闭合、三家同驻纵切、`cargo xtask ci`、跨平台
-CI exact commit runs 与实体 arm64 Android 真实 Wi-Fi 纵切全部通过后才能完成。2026-08-12
-审计 PR #12 的 `9791c408b27b1ce211e9593c57679254d9e02391`：Windows/macOS success，Ubuntu
-job 未完成且 workflow `31504076560` 已 cancelled，所以不能把这次 run 记为 exact-SHA 三平台绿灯。
-R4 合并后还必须
-在最终 SHA 重跑蜂窝/relay；当前 LAN 证据不等于公网恢复。
+CI exact commit runs 与实体 arm64 Android 真实 Wi-Fi 纵切全部通过后才能完成。
+
+2026-08-12 复核 PR #12 的 `3393b3edf0527baefed514c34fe5fc257024f9c8`：Windows、macOS、Ubuntu 与
+Android API 35 四项均成功；对应 workflow 为 `31570832960` 与 `31570832927`。因此 exact-SHA
+自动化子门禁已关闭，但 T-113 仍保持 active，不能据此跳过 OpenCode live drift、三 Provider 同驻、
+实体 arm64 三家纵切或 R4 蜂窝/relay 验收。R4 合并后还必须在最终 SHA 重跑蜂窝/relay；当前
+LAN 证据不等于公网恢复。
 
 ## 7. 零构建外部预检
 
